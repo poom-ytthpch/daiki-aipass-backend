@@ -51,7 +51,56 @@ type Usage struct {
 	TotalTokens  int64 `json:"totalTokens"`
 }
 
+type AdminStats struct {
+	Users       int64 `json:"users"`
+	Pending     int64 `json:"pending"`
+	Approved    int64 `json:"approved"`
+	Suspended   int64 `json:"suspended"`
+	Rejected    int64 `json:"rejected"`
+	TotalTokens int64 `json:"totalTokens"`
+	Requests    int64 `json:"requests"`
+}
+
+type AdminUserUsageRow struct {
+	Subject      string     `json:"subject"`
+	Email        string     `json:"email"`
+	DisplayName  string     `json:"displayName"`
+	Status       string     `json:"status"`
+	LastLoginAt  *time.Time `json:"lastLoginAt,omitempty"`
+	InputTokens  int64      `json:"inputTokens"`
+	OutputTokens int64      `json:"outputTokens"`
+	TotalTokens  int64      `json:"totalTokens"`
+	Requests     int64      `json:"requests"`
+}
+
 func New(db *pgxpool.Pool) *Store { return &Store{DB: db} }
+
+func (s *Store) AdminStats(ctx context.Context) (AdminStats, error) {
+	var out AdminStats
+	err := s.DB.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE status='pending'),count(*) FILTER (WHERE status='approved'),count(*) FILTER (WHERE status='suspended'),count(*) FILTER (WHERE status='rejected') FROM app_users`).Scan(&out.Users, &out.Pending, &out.Approved, &out.Suspended, &out.Rejected)
+	if err != nil {
+		return out, err
+	}
+	err = s.DB.QueryRow(ctx, `SELECT COALESCE(sum(total_tokens),0),count(*) FROM usage_ledger WHERE status='completed'`).Scan(&out.TotalTokens, &out.Requests)
+	return out, err
+}
+
+func (s *Store) AdminUserUsage(ctx context.Context) ([]AdminUserUsageRow, error) {
+	rows, err := s.DB.Query(ctx, `SELECT u.subject,u.email,u.display_name,u.status,u.last_login_at,COALESCE(sum(l.input_tokens) FILTER (WHERE l.status='completed'),0),COALESCE(sum(l.output_tokens) FILTER (WHERE l.status='completed'),0),COALESCE(sum(l.total_tokens) FILTER (WHERE l.status='completed'),0),count(l.request_id) FILTER (WHERE l.status='completed') FROM app_users u LEFT JOIN usage_ledger l ON l.user_subject=u.subject GROUP BY u.subject,u.email,u.display_name,u.status,u.last_login_at ORDER BY COALESCE(sum(l.total_tokens) FILTER (WHERE l.status='completed'),0) DESC,u.created_at DESC LIMIT 500`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []AdminUserUsageRow{}
+	for rows.Next() {
+		var x AdminUserUsageRow
+		if err := rows.Scan(&x.Subject, &x.Email, &x.DisplayName, &x.Status, &x.LastLoginAt, &x.InputTokens, &x.OutputTokens, &x.TotalTokens, &x.Requests); err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
 func (s *Store) Migrate(ctx context.Context) error {
 	if s == nil || s.DB == nil {
 		return errors.New("store unavailable")

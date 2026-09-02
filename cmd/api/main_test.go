@@ -72,3 +72,32 @@ func TestPrincipalScope(t *testing.T) {
 		t.Fatal("unexpected admin scope")
 	}
 }
+
+func TestConfiguredAdminEmail(t *testing.T) {
+	a := &app{cfg: config{AdminEmail: "admin@example.com"}}
+	if !a.isConfiguredAdmin(claims{Email: "Admin@Example.com", EmailVerified: true}) {
+		t.Fatal("configured admin email should match case-insensitively")
+	}
+	if a.isConfiguredAdmin(claims{Email: "user@example.com", EmailVerified: true}) {
+		t.Fatal("non-admin email must not be treated as configured admin")
+	}
+	if a.isConfiguredAdmin(claims{Email: "admin@example.com", EmailVerified: false}) {
+		t.Fatal("unverified email must never receive configured-admin privileges")
+	}
+}
+
+func TestAdminOnlyAcceptsConfiguredAdminEmail(t *testing.T) {
+	a := &app{cfg: config{AdminEmail: "admin@example.com", ClientID: "daiki-web"}}
+	r := httptest.NewRequest(http.MethodGet, "/v1/admin/summary", nil)
+	var c claims
+	c.Email = "admin@example.com"
+	c.EmailVerified = true
+	ctx := context.WithValue(r.Context(), claimsKey, c)
+	ctx = context.WithValue(ctx, appUserKey, store.User{Status: "approved"})
+	ctx = context.WithValue(ctx, principalKey, principal{AuthKind: "oidc"})
+	w := httptest.NewRecorder()
+	a.adminOnly(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })).ServeHTTP(w, r.WithContext(ctx))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("configured admin should pass adminOnly, got %d", w.Code)
+	}
+}

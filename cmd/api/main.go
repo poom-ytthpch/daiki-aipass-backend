@@ -38,6 +38,7 @@ type config struct {
 	LiteLLMBase, LiteLLMKey               string
 	DatabaseURL, RedisAddr                string
 	AllowedOrigins                        []string
+	AdminEmail                            string
 	LocalLLMBase                          string
 	PendingChatTokenLimit                 int64
 	PendingChatRequestsPerHour            int
@@ -60,6 +61,7 @@ type claims struct {
 	Sub               string `json:"sub"`
 	Name              string `json:"name"`
 	Email             string `json:"email"`
+	EmailVerified     bool   `json:"email_verified"`
 	PreferredUsername string `json:"preferred_username"`
 	RealmAccess       struct {
 		Roles []string `json:"roles"`
@@ -104,7 +106,7 @@ func loadConfig() config {
 		KeycloakAdminUser: getenv("KEYCLOAK_ADMIN_USER", "admin"), KeycloakAdminPass: os.Getenv("KEYCLOAK_ADMIN_PASSWORD"),
 		LiteLLMBase: getenv("LITELLM_BASE_URL", "http://litellm.daiki-ai-passport.svc.cluster.local:4000"), LiteLLMKey: os.Getenv("LITELLM_MASTER_KEY"),
 		DatabaseURL: os.Getenv("DATABASE_URL"), RedisAddr: getenv("REDIS_ADDR", "daiki-redis.daiki-ai-passport.svc.cluster.local:6379"),
-		AllowedOrigins: splitCSV(getenv("ALLOWED_ORIGINS", "https://ai.infra.local")), LocalLLMBase: getenv("LOCAL_LLM_BASE_URL", "http://10.90.0.11:8000/v1"),
+		AllowedOrigins: splitCSV(getenv("ALLOWED_ORIGINS", "https://ai.infra.local")), AdminEmail: strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))), LocalLLMBase: getenv("LOCAL_LLM_BASE_URL", "http://10.90.0.11:8000/v1"),
 		PendingChatTokenLimit: int64(getenvInt("PENDING_CHAT_TOKEN_LIMIT", 8000)), PendingChatRequestsPerHour: getenvInt("PENDING_CHAT_REQUESTS_PER_HOUR", 10),
 		PendingChatMinIntervalSeconds: getenvInt("PENDING_CHAT_MIN_INTERVAL_SECONDS", 30), PendingChatMaxCompletionTokens: getenvInt("PENDING_CHAT_MAX_COMPLETION_TOKENS", 512),
 	}
@@ -158,6 +160,7 @@ func main() {
 			r.Route("/admin", func(r chi.Router) {
 				r.Use(a.adminOnly)
 				r.Get("/summary", a.adminSummary)
+				r.Get("/usage", a.adminUsage)
 				r.Get("/queues", a.adminQueues)
 				r.Get("/users", a.adminUsers)
 				r.Post("/users", a.createUser)
@@ -254,6 +257,13 @@ func (a *app) auth(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "identity store unavailable"})
 			return
 		}
+		if a.isConfiguredAdmin(c) && u.Status != "approved" {
+			if approved, approveErr := a.store.SetUserStatus(r.Context(), "system:admin-email", c.Sub, "approved"); approveErr == nil {
+				u = approved
+			} else {
+				slog.Warn("configured admin auto-approval failed", "error", approveErr)
+			}
+		}
 		ctx := context.WithValue(r.Context(), claimsKey, c)
 		ctx = context.WithValue(ctx, appUserKey, u)
 		ctx = context.WithValue(ctx, principalKey, principal{AuthKind: "oidc"})
@@ -267,6 +277,9 @@ func roles(c claims, client string) []string {
 		out = append(out, x.Roles...)
 	}
 	return out
+}
+func (a *app) isConfiguredAdmin(c claims) bool {
+	return a.cfg.AdminEmail != "" && c.EmailVerified && strings.EqualFold(strings.TrimSpace(c.Email), a.cfg.AdminEmail)
 }
 func hasRole(c claims, client string, want ...string) bool {
 	for _, r := range roles(c, client) {
@@ -289,7 +302,7 @@ func (a *app) adminOnly(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API requires interactive OIDC"})
 			return
 		}
-		if !hasRole(current(r), a.cfg.ClientID, "ai-admin", "admin") {
+		if !hasRole(current(r), a.cfg.ClientID, "ai-admin", "admin") && !a.isConfiguredAdmin(current(r)) {
 			writeJSON(w, 403, map[string]string{"error": "admin role required"})
 			return
 		}
@@ -325,7 +338,7 @@ func (a *app) ready(w http.ResponseWriter, r *http.Request) {
 func (a *app) me(w http.ResponseWriter, r *http.Request) {
 	c := current(r)
 	u, _ := currentUser(r)
-	out := map[string]any{"sub": c.Sub, "name": first(c.Name, c.PreferredUsername, c.Email, c.Sub), "email": c.Email, "roles": roles(c, a.cfg.ClientID), "status": u.Status, "authProvider": u.AuthProvider, "createdAt": u.CreatedAt, "approvedAt": u.ApprovedAt, "authKind": currentPrincipal(r).AuthKind, "apiKeyId": currentPrincipal(r).APIKeyID}
+	out := map[string]any{"sub": c.Sub, "name": first(c.Name, c.PreferredUsername, c.Email, c.Sub), "email": c.Email, "roles": roles(c, a.cfg.ClientID), "status": u.Status, "authProvider": u.AuthProvider, "createdAt": u.CreatedAt, "approvedAt": u.ApprovedAt, "authKind": currentPrincipal(r).AuthKind, "apiKeyId": currentPrincipal(r).APIKeyID, "isAdmin": a.isConfiguredAdmin(c) || hasRole(c, a.cfg.ClientID, "ai-admin", "admin")}
 	if u.Status == "pending" {
 		out["pendingChatPolicy"] = map[string]any{"model": "fast", "tokenLimitPerDay": a.cfg.PendingChatTokenLimit, "requestsPerHour": a.cfg.PendingChatRequestsPerHour, "minIntervalSeconds": a.cfg.PendingChatMinIntervalSeconds, "maxCompletionTokens": a.cfg.PendingChatMaxCompletionTokens, "textOnly": true}
 	}
@@ -631,6 +644,8 @@ func probe(ctx context.Context, c *http.Client, name, u string) map[string]any {
 	s := "ready"
 	if resp.StatusCode >= 500 {
 		s = "down"
+	} else if resp.StatusCode >= 400 {
+		s = "degraded"
 	}
 	return map[string]any{"name": name, "status": s, "latencyMs": time.Since(start).Milliseconds()}
 }
@@ -648,6 +663,19 @@ func (a *app) adminQueues(w http.ResponseWriter, r *http.Request) {
 }
 func (a *app) adminSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	services := []map[string]any{probe(ctx, a.http, "Keycloak", strings.TrimRight(a.cfg.KeycloakBase, "/")+"/health/ready"), probe(ctx, a.http, "LiteLLM", strings.TrimRight(a.cfg.LiteLLMBase, "/")+"/health/liveliness"), probe(ctx, a.http, "Local LLM", strings.TrimRight(a.cfg.LocalLLMBase, "/")+"/models")}
-	writeJSON(w, 200, map[string]any{"services": services, "localLlmRequired": false})
+	services := []map[string]any{probe(ctx, a.http, "Keycloak", strings.TrimRight(a.cfg.KeycloakBase, "/")+"/realms/"+a.cfg.KeycloakRealm+"/.well-known/openid-configuration"), probe(ctx, a.http, "LiteLLM", strings.TrimRight(a.cfg.LiteLLMBase, "/")+"/health/liveliness"), probe(ctx, a.http, "Local LLM", strings.TrimRight(a.cfg.LocalLLMBase, "/")+"/models")}
+	stats, err := a.store.AdminStats(ctx)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "admin summary unavailable"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"services": services, "localLlmRequired": false, "users": stats.Users, "pending": stats.Pending, "approved": stats.Approved, "suspended": stats.Suspended, "rejected": stats.Rejected, "totalTokens": stats.TotalTokens, "requests": stats.Requests})
+}
+func (a *app) adminUsage(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.store.AdminUserUsage(r.Context())
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "admin usage unavailable"})
+		return
+	}
+	writeJSON(w, 200, rows)
 }
