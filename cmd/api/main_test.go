@@ -1,0 +1,74 @@
+package main
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
+)
+
+func TestRolesAndAdmin(t *testing.T) {
+	var c claims
+	c.RealmAccess.Roles = []string{"ai-user"}
+	c.ResourceAccess = map[string]struct {
+		Roles []string `json:"roles"`
+	}{"daiki-web": {Roles: []string{"ai-admin"}}}
+	if !hasRole(c, "daiki-web", "ai-admin") {
+		t.Fatal("expected ai-admin role")
+	}
+	if hasRole(c, "daiki-web", "missing") {
+		t.Fatal("unexpected role")
+	}
+}
+
+func TestFirst(t *testing.T) {
+	if got := first("", "Daiki", "fallback"); got != "Daiki" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestReservationTokensUsesRequestedCompletionBudget(t *testing.T) {
+	got := reservationTokens([]byte(`{"messages":[{"role":"user","content":"hello"}],"max_tokens":512}`))
+	if got < 512 {
+		t.Fatalf("reservation %d must include output budget", got)
+	}
+}
+
+func TestQuotaWindowDay(t *testing.T) {
+	now := time.Date(2026, 9, 2, 10, 30, 0, 0, time.UTC)
+	start, reset := quotaWindow(store.Policy{IntervalKind: "day"}, now)
+	if start.Hour() != 0 || reset == nil || !reset.Equal(time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("unexpected window %v %v", start, reset)
+	}
+}
+
+func TestAPIKeySecretIsHashedAndPrefixed(t *testing.T) {
+	id, raw, prefix, hash, err := newAPIKeySecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(id, "key_") || !strings.HasPrefix(raw, "dk_") {
+		t.Fatalf("unexpected key format id=%q raw-prefix=%q", id, raw[:3])
+	}
+	if prefix == raw || len(prefix) > 12 {
+		t.Fatalf("prefix must be bounded and non-secret: %q", prefix)
+	}
+	if hash != apiKeyHash(raw) || strings.Contains(hash, raw) {
+		t.Fatal("API key hash mismatch")
+	}
+}
+
+func TestPrincipalScope(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/v1/chat", nil)
+	ctx := context.WithValue(r.Context(), principalKey, principal{AuthKind: "api_key", Scopes: []string{"inference"}})
+	if !hasPrincipalScope(r.WithContext(ctx), "inference") {
+		t.Fatal("expected inference scope")
+	}
+	if hasPrincipalScope(r.WithContext(ctx), "admin") {
+		t.Fatal("unexpected admin scope")
+	}
+}

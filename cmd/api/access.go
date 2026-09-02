@@ -1,0 +1,458 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
+)
+
+const appUserKey ctxKey = "app-user"
+const principalKey ctxKey = "principal"
+
+type principal struct {
+	AuthKind string
+	APIKeyID string
+	Scopes   []string
+}
+
+type quotaDecision struct {
+	CounterKey string     `json:"-"`
+	Mode       string     `json:"mode"`
+	Limit      *int64     `json:"limit,omitempty"`
+	Used       int64      `json:"used"`
+	Remaining  *int64     `json:"remaining,omitempty"`
+	ResetAt    *time.Time `json:"resetAt,omitempty"`
+	Interval   string     `json:"interval"`
+}
+
+func currentUser(r *http.Request) (store.User, bool) {
+	u, ok := r.Context().Value(appUserKey).(store.User)
+	return u, ok
+}
+func currentPrincipal(r *http.Request) principal {
+	p, _ := r.Context().Value(principalKey).(principal)
+	return p
+}
+
+func hasPrincipalScope(r *http.Request, want string) bool {
+	p := currentPrincipal(r)
+	if p.AuthKind != "api_key" {
+		return true
+	}
+	for _, scope := range p.Scopes {
+		if scope == "*" || scope == want {
+			return true
+		}
+	}
+	return false
+}
+
+func requirePrincipalScope(scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !hasPrincipalScope(r, scope) {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "api key scope required", "scope": scope})
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func identityProvider(c claims) string {
+	// Keycloak does not guarantee one provider claim across all IdPs. Keep the
+	// durable value generic until the realm mapper exposes a stable provider id.
+	return "keycloak"
+}
+
+func (a *app) approvalRequired(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, ok := currentUser(r)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "application identity unavailable"})
+			return
+		}
+		if u.Status != "approved" {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "access_not_approved", "status": u.Status})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func quotaWindow(p store.Policy, now time.Time) (time.Time, *time.Time) {
+	var start time.Time
+	var reset *time.Time
+	switch p.IntervalKind {
+	case "hour":
+		start = now.Truncate(time.Hour)
+		r := start.Add(time.Hour)
+		reset = &r
+	case "day":
+		start = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		r := start.AddDate(0, 0, 1)
+		reset = &r
+	case "week":
+		d := (int(now.Weekday()) + 6) % 7
+		base := now.AddDate(0, 0, -d)
+		start = time.Date(base.Year(), base.Month(), base.Day(), 0, 0, 0, 0, time.UTC)
+		r := start.AddDate(0, 0, 7)
+		reset = &r
+	case "month":
+		start = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+		r := start.AddDate(0, 1, 0)
+		reset = &r
+	case "rolling", "custom":
+		seconds := int64(3600)
+		if p.IntervalSeconds != nil {
+			seconds = *p.IntervalSeconds
+		}
+		start = now.Add(-time.Duration(seconds) * time.Second)
+		r := now.Add(time.Duration(seconds) * time.Second)
+		reset = &r
+	default:
+		start = time.Unix(0, 0).UTC()
+	}
+	return start, reset
+}
+
+func policyAllowsModel(p store.Policy, alias string) bool {
+	if len(p.AllowedModels) == 0 {
+		return true
+	}
+	var allowed []string
+	if json.Unmarshal(p.AllowedModels, &allowed) != nil || len(allowed) == 0 {
+		return true
+	}
+	for _, model := range allowed {
+		if model == "*" || model == alias {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *app) quotaFor(r *http.Request) (quotaDecision, store.Policy, error) {
+	c := current(r)
+	principal := currentPrincipal(r)
+	if u, ok := currentUser(r); ok && u.Status == "pending" {
+		p := a.pendingQuotaPolicy()
+		start, reset := quotaWindow(p, time.Now().UTC())
+		uUsage, err := a.store.UsageSummaryForUser(r.Context(), c.Sub, start)
+		if err != nil {
+			return quotaDecision{}, p, err
+		}
+		remaining := *p.TokenLimit - uUsage.TotalTokens
+		if remaining < 0 {
+			remaining = 0
+		}
+		return quotaDecision{Mode: p.QuotaMode, Limit: p.TokenLimit, Used: uUsage.TotalTokens, Remaining: &remaining, ResetAt: reset, Interval: p.IntervalKind, CounterKey: "user:" + c.Sub}, p, nil
+	}
+	p, _, err := a.store.PolicyForPrincipal(r.Context(), c.Sub, principal.APIKeyID, roles(c, a.cfg.ClientID))
+	if err != nil {
+		return quotaDecision{}, p, err
+	}
+	if p.QuotaMode == "" {
+		p.QuotaMode = "unlimited"
+	}
+	if p.IntervalKind == "" {
+		p.IntervalKind = "lifetime"
+	}
+	counterKey := "user:" + c.Sub
+	if p.ScopeType == "api_key" && principal.APIKeyID != "" {
+		counterKey = "api_key:" + principal.APIKeyID
+	}
+	d := quotaDecision{Mode: p.QuotaMode, Limit: p.TokenLimit, Interval: p.IntervalKind, CounterKey: counterKey}
+	if p.QuotaMode == "unlimited" || p.TokenLimit == nil {
+		return d, p, nil
+	}
+	start, reset := quotaWindow(p, time.Now().UTC())
+	var u store.Usage
+	if p.ScopeType == "api_key" && principal.APIKeyID != "" {
+		u, err = a.store.UsageSummaryForAPIKey(r.Context(), principal.APIKeyID, start)
+	} else {
+		u, err = a.store.UsageSummaryForUser(r.Context(), c.Sub, start)
+	}
+	if err != nil {
+		return quotaDecision{}, p, err
+	}
+	d.Used = u.TotalTokens
+	remaining := *p.TokenLimit - u.TotalTokens
+	if remaining < 0 {
+		remaining = 0
+	}
+	d.Remaining = &remaining
+	d.ResetAt = reset
+	return d, p, nil
+}
+
+func reservationTokens(body []byte) int64 {
+	var payload struct {
+		MaxTokens           int64 `json:"max_tokens"`
+		MaxCompletionTokens int64 `json:"max_completion_tokens"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	out := payload.MaxCompletionTokens
+	if out <= 0 {
+		out = payload.MaxTokens
+	}
+	if out <= 0 {
+		out = 2048
+	}
+	// Conservative prompt estimate until tokenizer-aware routing is introduced.
+	prompt := int64(len(body)/4 + 256)
+	if prompt > 16000 {
+		prompt = 16000
+	}
+	return prompt + out
+}
+
+func (a *app) reserveQuota(ctx context.Context, requestID string, d quotaDecision, amount int64) error {
+	if d.Mode == "unlimited" || d.Limit == nil || a.redis == nil {
+		return nil
+	}
+	key := "quota:pending:" + d.CounterKey
+	reservationKey := "quota:reservation:" + requestID
+	// Redis tracks only in-flight reservations. Durable completed usage stays in
+	// PostgreSQL, so fixed and rolling windows can always be rebuilt accurately.
+	script := `local pending=tonumber(redis.call('GET',KEYS[1]) or '0'); local amount=tonumber(ARGV[1]); local lim=tonumber(ARGV[2]); local durable=tonumber(ARGV[3]); if durable+pending+amount>lim then return -1 end; redis.call('INCRBY',KEYS[1],amount); redis.call('EXPIRE',KEYS[1],3600); redis.call('SET',KEYS[2],amount,'EX',3600); return pending+amount`
+	v, err := a.redis.Eval(ctx, script, []string{key, reservationKey}, amount, *d.Limit, d.Used).Int64()
+	if err != nil {
+		return err
+	}
+	if v < 0 {
+		return fmt.Errorf("quota exhausted")
+	}
+	return nil
+}
+
+func (a *app) releaseReservation(ctx context.Context, requestID string, d quotaDecision, reserved int64) {
+	if d.Mode == "unlimited" || d.Limit == nil || a.redis == nil {
+		return
+	}
+	key := "quota:pending:" + d.CounterKey
+	script := `local pending=tonumber(redis.call('GET',KEYS[1]) or '0'); local amount=tonumber(ARGV[1]); local next=pending-amount; if next<=0 then redis.call('DEL',KEYS[1]) else redis.call('SET',KEYS[1],next,'EX',3600) end; redis.call('DEL',KEYS[2]); return math.max(next,0)`
+	_, _ = a.redis.Eval(ctx, script, []string{key, "quota:reservation:" + requestID}, reserved).Result()
+}
+
+func parseUsagePayload(body []byte) store.Usage {
+	var x struct {
+		Usage struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			TotalTokens      int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(body, &x) != nil {
+		return store.Usage{}
+	}
+	return store.Usage{InputTokens: x.Usage.PromptTokens, OutputTokens: x.Usage.CompletionTokens, TotalTokens: x.Usage.TotalTokens}
+}
+
+func (a *app) adminUsers(w http.ResponseWriter, r *http.Request) {
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	users, err := a.store.Users(r.Context(), status)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "users unavailable"})
+		return
+	}
+	writeJSON(w, 200, users)
+}
+
+func (a *app) adminUserStatus(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Status string `json:"status"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid body"})
+		return
+	}
+	u, err := a.store.SetUserStatus(r.Context(), current(r).Sub, chi.URLParam(r, "subject"), in.Status)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, u)
+}
+
+func (a *app) adminUserQuota(w http.ResponseWriter, r *http.Request) {
+	subject := chi.URLParam(r, "subject")
+	if subject == "" {
+		writeJSON(w, 400, map[string]string{"error": "missing subject"})
+		return
+	}
+	if r.Method == http.MethodGet {
+		p, found, err := a.store.PolicyForUser(r.Context(), subject, nil)
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": "quota unavailable"})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"policy": p, "configured": found})
+		return
+	}
+	var p store.Policy
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&p) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid body"})
+		return
+	}
+	out, err := a.store.UpsertUserPolicy(r.Context(), current(r).Sub, subject, p)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (a *app) adminAPIKeys(w http.ResponseWriter, r *http.Request) {
+	keys, err := a.store.APIKeys(r.Context())
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "api keys unavailable"})
+		return
+	}
+	writeJSON(w, 200, keys)
+}
+
+func (a *app) createAPIKey(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name         string     `json:"name"`
+		OwnerSubject string     `json:"ownerSubject"`
+		Scopes       []string   `json:"scopes"`
+		ExpiresAt    *time.Time `json:"expiresAt"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid body"})
+		return
+	}
+	actor := current(r).Sub
+	if strings.TrimSpace(in.OwnerSubject) == "" {
+		in.OwnerSubject = actor
+	}
+	if strings.TrimSpace(in.Name) == "" {
+		in.Name = "developer-key"
+	}
+	if len(in.Scopes) == 0 {
+		in.Scopes = []string{"inference"}
+	}
+	id, raw, prefix, hash, err := newAPIKeySecret()
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "key generation failed"})
+		return
+	}
+	key, err := a.store.CreateAPIKey(r.Context(), actor, store.APIKey{ID: id, OwnerSubject: in.OwnerSubject, Name: in.Name, KeyPrefix: prefix, Scopes: in.Scopes, ExpiresAt: in.ExpiresAt}, hash)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "api key creation failed"})
+		return
+	}
+	writeJSON(w, 201, map[string]any{"apiKey": key, "key": raw})
+}
+
+func (a *app) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
+	if err := a.store.RevokeAPIKey(r.Context(), current(r).Sub, chi.URLParam(r, "id")); err != nil {
+		writeJSON(w, 404, map[string]string{"error": "api key not found"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *app) adminAPIKeyQuota(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeJSON(w, 400, map[string]string{"error": "missing api key id"})
+		return
+	}
+	if r.Method == http.MethodGet {
+		p, found, err := a.store.PolicyForPrincipal(r.Context(), "", id, nil)
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": "quota unavailable"})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"policy": p, "configured": found})
+		return
+	}
+	var p store.Policy
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&p) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid body"})
+		return
+	}
+	out, err := a.store.UpsertPolicy(r.Context(), current(r).Sub, "api_key", id, p)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (a *app) chatAccess(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, ok := currentUser(r)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "application identity unavailable"})
+			return
+		}
+		switch u.Status {
+		case "approved":
+			next.ServeHTTP(w, r)
+		case "pending":
+			if currentPrincipal(r).AuthKind != "oidc" {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "pending_chat_requires_interactive_login"})
+				return
+			}
+			next.ServeHTTP(w, r)
+		case "suspended", "rejected":
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "access_not_approved", "status": u.Status})
+		default:
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "access_not_approved", "status": u.Status})
+		}
+	})
+}
+
+func (a *app) enforcePendingChatRate(ctx context.Context, subject string) (time.Duration, error) {
+	if a.redis == nil {
+		return 0, fmt.Errorf("pending chat rate limiter unavailable")
+	}
+	now := time.Now().UTC()
+	hourKey := "pending-chat:hour:" + subject
+	lastKey := "pending-chat:last:" + subject
+	script := `local now=tonumber(ARGV[1]); local minGap=tonumber(ARGV[2]); local hourly=tonumber(ARGV[3]); local last=tonumber(redis.call('GET',KEYS[2]) or '0'); if last>0 and now-last<minGap then return -(minGap-(now-last)) end; local count=tonumber(redis.call('GET',KEYS[1]) or '0'); if count>=hourly then local ttl=redis.call('TTL',KEYS[1]); if ttl<1 then ttl=3600 end; return -ttl end; count=redis.call('INCR',KEYS[1]); if count==1 then redis.call('EXPIRE',KEYS[1],3600) end; redis.call('SET',KEYS[2],now,'EX',3600); return count`
+	result, err := a.redis.Eval(ctx, script, []string{hourKey, lastKey}, now.Unix(), a.cfg.PendingChatMinIntervalSeconds, a.cfg.PendingChatRequestsPerHour).Int64()
+	if err != nil {
+		return 0, err
+	}
+	if result < 0 {
+		return time.Duration(-result) * time.Second, fmt.Errorf("pending chat rate limit exceeded")
+	}
+	return 0, nil
+}
+
+func (a *app) restrictPendingChat(body []byte) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("invalid chat payload")
+	}
+	encoded := string(body)
+	if strings.Contains(encoded, `"image_url"`) || strings.Contains(encoded, `"input_image"`) {
+		return nil, fmt.Errorf("pending accounts support text chat only")
+	}
+	payload["model"] = "fast"
+	delete(payload, "max_tokens")
+	payload["max_completion_tokens"] = a.cfg.PendingChatMaxCompletionTokens
+	return json.Marshal(payload)
+}
+
+func (a *app) pendingQuotaPolicy() store.Policy {
+	limit := a.cfg.PendingChatTokenLimit
+	return store.Policy{
+		ScopeType:     "user",
+		ScopeID:       "pending-chat",
+		QuotaMode:     "limited",
+		TokenLimit:    &limit,
+		IntervalKind:  "day",
+		AllowedModels: json.RawMessage(`["fast"]`),
+	}
+}
