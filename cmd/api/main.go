@@ -39,6 +39,7 @@ type config struct {
 	DatabaseURL, RedisAddr                string
 	AllowedOrigins                        []string
 	AdminEmail                            string
+	AppBaseURL                            string
 	LocalLLMBase                          string
 	PendingChatTokenLimit                 int64
 	PendingChatRequestsPerHour            int
@@ -106,7 +107,7 @@ func loadConfig() config {
 		KeycloakAdminUser: getenv("KEYCLOAK_ADMIN_USER", "admin"), KeycloakAdminPass: os.Getenv("KEYCLOAK_ADMIN_PASSWORD"),
 		LiteLLMBase: getenv("LITELLM_BASE_URL", "http://litellm.daiki-ai-passport.svc.cluster.local:4000"), LiteLLMKey: os.Getenv("LITELLM_MASTER_KEY"),
 		DatabaseURL: os.Getenv("DATABASE_URL"), RedisAddr: getenv("REDIS_ADDR", "daiki-redis.daiki-ai-passport.svc.cluster.local:6379"),
-		AllowedOrigins: splitCSV(getenv("ALLOWED_ORIGINS", "https://ai.infra.local")), AdminEmail: strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))), LocalLLMBase: getenv("LOCAL_LLM_BASE_URL", "http://10.90.0.11:8000/v1"),
+		AllowedOrigins: splitCSV(getenv("ALLOWED_ORIGINS", "https://ai.infra.local")), AdminEmail: strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))), AppBaseURL: strings.TrimRight(getenv("APP_BASE_URL", "https://daiki-aipass.matchchemical.co"), "/"), LocalLLMBase: getenv("LOCAL_LLM_BASE_URL", "http://10.90.0.11:8000/v1"),
 		PendingChatTokenLimit: int64(getenvInt("PENDING_CHAT_TOKEN_LIMIT", 8000)), PendingChatRequestsPerHour: getenvInt("PENDING_CHAT_REQUESTS_PER_HOUR", 10),
 		PendingChatMinIntervalSeconds: getenvInt("PENDING_CHAT_MIN_INTERVAL_SECONDS", 30), PendingChatMaxCompletionTokens: getenvInt("PENDING_CHAT_MAX_COMPLETION_TOKENS", 512),
 	}
@@ -154,6 +155,7 @@ func main() {
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/health/live", a.live)
 		r.Get("/health/ready", a.ready)
+		r.Post("/auth/password-reset", a.passwordReset)
 		r.Group(func(r chi.Router) {
 			r.Use(a.auth)
 			r.Get("/me", a.me)
@@ -212,6 +214,73 @@ func bearer(r *http.Request) string {
 	}
 	return ""
 }
+func (a *app) passwordReset(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Email string `json:"email"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in) != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+	// Always return the same response to avoid account enumeration.
+	defer writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "If an account exists for that email, a password reset link has been sent."})
+	if email == "" || !strings.Contains(email, "@") || len(email) > 254 {
+		return
+	}
+	if a.redis != nil {
+		key := "password-reset:" + fmt.Sprintf("%x", sha256.Sum256([]byte(email)))
+		count, err := a.redis.Incr(r.Context(), key).Result()
+		if err != nil {
+			slog.Warn("password reset rate limit unavailable", "error", err)
+			return
+		}
+		if count == 1 {
+			_ = a.redis.Expire(r.Context(), key, 15*time.Minute).Err()
+		}
+		if count > 3 {
+			return
+		}
+	}
+	tok, err := a.kcAdminToken(r.Context())
+	if err != nil {
+		slog.Warn("password reset keycloak token failed", "error", err)
+		return
+	}
+	usersURL := fmt.Sprintf("%s/admin/realms/%s/users?email=%s&exact=true", strings.TrimRight(a.cfg.KeycloakBase, "/"), a.cfg.KeycloakRealm, url.QueryEscape(email))
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, usersURL, nil)
+	req.Header.Set("authorization", "Bearer "+tok)
+	resp, err := a.http.Do(req)
+	if err != nil {
+		slog.Warn("password reset user lookup failed", "error", err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return
+	}
+	var users []struct {
+		ID string `json:"id"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&users) != nil || len(users) != 1 || users[0].ID == "" {
+		return
+	}
+	actionsURL := fmt.Sprintf("%s/admin/realms/%s/users/%s/execute-actions-email?client_id=%s&redirect_uri=%s&lifespan=900", strings.TrimRight(a.cfg.KeycloakBase, "/"), a.cfg.KeycloakRealm, url.PathEscape(users[0].ID), url.QueryEscape(a.cfg.ClientID), url.QueryEscape(a.cfg.AppBaseURL+"/login"))
+	body, _ := json.Marshal([]string{"UPDATE_PASSWORD"})
+	req, _ = http.NewRequestWithContext(r.Context(), http.MethodPut, actionsURL, strings.NewReader(string(body)))
+	req.Header.Set("authorization", "Bearer "+tok)
+	req.Header.Set("content-type", "application/json")
+	resp2, err := a.http.Do(req)
+	if err != nil {
+		slog.Warn("password reset email dispatch failed", "error", err)
+		return
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	if resp2.StatusCode >= 300 {
+		slog.Warn("password reset email dispatch rejected", "status", resp2.StatusCode)
+	}
+}
+
 func (a *app) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := bearer(r)

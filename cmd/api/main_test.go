@@ -101,3 +101,17 @@ func TestAdminOnlyAcceptsConfiguredAdminEmail(t *testing.T) {
 		t.Fatalf("configured admin should pass adminOnly, got %d", w.Code)
 	}
 }
+
+func TestPasswordResetHidesInvalidEmail(t *testing.T) {
+	a := &app{}
+	r := httptest.NewRequest(http.MethodPost, "/v1/auth/password-reset", strings.NewReader(`{"email":"not-an-email"}`))
+	r.Header.Set("content-type", "application/json")
+	w := httptest.NewRecorder()
+	a.passwordReset(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected generic 200 response, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "If an account exists") {
+		t.Fatalf("expected enumeration-safe generic response: %s", w.Body.String())
+	}
+}
