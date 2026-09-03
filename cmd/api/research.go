@@ -209,6 +209,9 @@ func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, 
 	q.Set("format", "json")
 	q.Set("language", "all")
 	q.Set("safesearch", "1")
+	// Use engines verified to return usable JSON results from this deployment.
+	// Avoid engines that routinely return CAPTCHA/429 responses from datacenter IPs.
+	q.Set("engines", "bing,google,yep")
 	u.RawQuery = q.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
