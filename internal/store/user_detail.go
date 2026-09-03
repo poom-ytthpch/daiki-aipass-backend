@@ -87,8 +87,7 @@ func (s *Store) UsageTotalsForUser(ctx context.Context, subject string, since ti
 }
 
 func (s *Store) UsageSeriesForUser(ctx context.Context, subject, period, timezone string, since time.Time) ([]UsageBucket, error) {
-	unit := "day"
-	format := "YYYY-MM-DD"
+	var unit, format string
 	switch period {
 	case "day":
 		unit, format = "hour", "HH24:00"

@@ -92,7 +92,7 @@ func (a *app) uploadAttachment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "missing file"})
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if hdr.Size > maxAttachmentBytes {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "file exceeds 25 MiB limit"})
 		return
@@ -204,7 +204,7 @@ func (a *app) downloadAttachment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "attachment content missing"})
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	w.Header().Set("Content-Type", rec.MediaType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename=%q`, rec.Name))
 	w.Header().Set("Cache-Control", "private, max-age=60")

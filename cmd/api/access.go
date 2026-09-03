@@ -546,7 +546,7 @@ func (a *app) adminUserDetail(w http.ResponseWriter, r *http.Request) {
 		period = "month"
 	}
 	now := time.Now().UTC()
-	seriesSince := now.AddDate(0, -1, 0)
+	var seriesSince time.Time
 	switch period {
 	case "day":
 		seriesSince = now.Add(-24 * time.Hour)

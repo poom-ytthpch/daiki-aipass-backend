@@ -52,14 +52,15 @@ type config struct {
 }
 
 type app struct {
-	cfg      config
-	verifier *oidc.IDTokenVerifier
-	http     *http.Client
-	redis    *redis.Client
-	db       *pgxpool.Pool
-	store    *store.Store
-	router   *inference.Router
-	queue    *inference.Queue
+	cfg           config
+	verifier      *oidc.IDTokenVerifier
+	http          *http.Client
+	inferenceHTTP *http.Client
+	redis         *redis.Client
+	db            *pgxpool.Pool
+	store         *store.Store
+	router        *inference.Router
+	queue         *inference.Queue
 }
 
 type claims struct {
@@ -125,7 +126,7 @@ func main() {
 	defer cancel()
 	cfg := loadConfig()
 	keySet := oidc.NewRemoteKeySet(context.Background(), cfg.JWKSURL)
-	a := &app{cfg: cfg, verifier: oidc.NewVerifier(cfg.PublicIssuer, keySet, &oidc.Config{SkipClientIDCheck: true}), http: &http.Client{Timeout: 15 * time.Second}, router: inference.NewRouter(getenv("MODEL_FAST", "qwen-local"), getenv("MODEL_BALANCED", "qwen-local"), getenv("MODEL_DEEP", "qwen-local"), getenv("MODEL_VISION", "qwen-local"))}
+	a := &app{cfg: cfg, verifier: oidc.NewVerifier(cfg.PublicIssuer, keySet, &oidc.Config{SkipClientIDCheck: true}), http: &http.Client{Timeout: 15 * time.Second}, inferenceHTTP: &http.Client{Timeout: time.Duration(getenvInt("INFERENCE_HTTP_TIMEOUT_SECONDS", 300)) * time.Second}, router: inference.NewRouter(getenv("MODEL_FAST", "qwen-local"), getenv("MODEL_BALANCED", "qwen-local"), getenv("MODEL_DEEP", "qwen-local"), getenv("MODEL_VISION", "qwen-local"))}
 	if cfg.RedisAddr != "" {
 		a.redis = redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 		a.queue = inference.NewQueue(a.redis, inference.QueueConfig{
@@ -544,7 +545,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if a.cfg.LiteLLMKey != "" {
 		req.Header.Set("authorization", "Bearer "+a.cfg.LiteLLMKey)
 	}
-	resp, err := a.http.Do(req)
+	resp, err := a.inferenceHTTP.Do(req)
 	if err != nil {
 		a.releaseReservation(r.Context(), requestID, decision, reserved)
 		status := "failed"
