@@ -49,6 +49,9 @@ type config struct {
 	PendingChatRequestsPerHour            int
 	PendingChatMinIntervalSeconds         int
 	PendingChatMaxCompletionTokens        int
+	SearXNGBase                           string
+	WebResearchMaxResults                 int
+	WebResearchFetchPages                 int
 }
 
 type app struct {
@@ -118,6 +121,7 @@ func loadConfig() config {
 		AllowedOrigins: splitCSV(getenv("ALLOWED_ORIGINS", "https://ai.infra.local")), AdminEmail: strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))), AppBaseURL: strings.TrimRight(getenv("APP_BASE_URL", "https://daiki-aipass.matchchemical.co"), "/"), GoogleClientID: strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_ID")), GoogleClientSecret: strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_SECRET")), GmailOAuthRedirectURI: getenv("GMAIL_OAUTH_REDIRECT_URI", "https://daiki-aipass.matchchemical.co/api/admin/integrations/gmail/callback"), TokenEncryptionKey: strings.TrimSpace(os.Getenv("TOKEN_ENCRYPTION_KEY")), LocalLLMBase: getenv("LOCAL_LLM_BASE_URL", "http://10.90.0.11:8000/v1"),
 		PendingChatTokenLimit: int64(getenvInt("PENDING_CHAT_TOKEN_LIMIT", 8000)), PendingChatRequestsPerHour: getenvInt("PENDING_CHAT_REQUESTS_PER_HOUR", 10),
 		PendingChatMinIntervalSeconds: getenvInt("PENDING_CHAT_MIN_INTERVAL_SECONDS", 30), PendingChatMaxCompletionTokens: getenvInt("PENDING_CHAT_MAX_COMPLETION_TOKENS", 512),
+		SearXNGBase: getenv("SEARXNG_BASE_URL", "http://searxng:8080"), WebResearchMaxResults: getenvInt("WEB_RESEARCH_MAX_RESULTS", 5), WebResearchFetchPages: getenvInt("WEB_RESEARCH_FETCH_PAGES", 3),
 	}
 }
 
@@ -425,6 +429,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, 400, map[string]string{"error": "invalid body"})
 		return
 	}
+	body, researchMeta, researchErr := a.enrichChatWithResearch(r.Context(), body)
+	if researchErr != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": researchErr.Error(), "research": researchMeta})
+		return
+	}
 	if u, ok := currentUser(r); ok && u.Status == "pending" {
 		body, err = a.restrictPendingChat(body)
 		if err != nil {
@@ -505,6 +514,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	requestMeta["resolvedAlias"] = route.ResolvedAlias
 	requestMeta["physicalModel"] = route.PhysicalModel
 	requestMeta["workload"] = string(route.Workload)
+	requestMeta["research"] = researchMeta
 	_ = a.store.MergeUsageMetadata(r.Context(), requestID, requestMeta)
 	principalID := "user:" + c.Sub
 	if currentPrincipal(r).APIKeyID != "" {
