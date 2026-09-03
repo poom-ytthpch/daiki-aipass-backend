@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -113,5 +114,34 @@ func TestPasswordResetHidesInvalidEmail(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "If an account exists") {
 		t.Fatalf("expected enumeration-safe generic response: %s", w.Body.String())
+	}
+}
+
+func TestGmailRefreshTokenEncryptionRoundTrip(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	a := &app{cfg: config{TokenEncryptionKey: base64.StdEncoding.EncodeToString(key)}}
+	enc, err := a.encryptSecret("refresh-token-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enc == "refresh-token-secret" || strings.Contains(enc, "refresh-token-secret") {
+		t.Fatal("encrypted token leaked plaintext")
+	}
+	got, err := a.decryptSecret(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "refresh-token-secret" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestGmailRefreshTokenEncryptionRejectsWeakKey(t *testing.T) {
+	a := &app{cfg: config{TokenEncryptionKey: base64.StdEncoding.EncodeToString([]byte("short"))}}
+	if _, err := a.encryptSecret("secret"); err == nil {
+		t.Fatal("expected invalid key error")
 	}
 }
