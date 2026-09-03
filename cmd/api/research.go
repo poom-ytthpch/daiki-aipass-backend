@@ -105,6 +105,33 @@ func shouldAutoResearch(q string) bool {
 	return false
 }
 
+func isWebCapabilityQuestion(q string) bool {
+	q = strings.ToLower(strings.TrimSpace(q))
+	if q == "" {
+		return false
+	}
+	thaiWeb := strings.Contains(q, "internet") || strings.Contains(q, "อินเทอร์เน็ต") || strings.Contains(q, "เว็บ") || strings.Contains(q, "ออนไลน์")
+	if thaiWeb {
+		for _, k := range []string{"เข้าได้ไหม", "เข้าได้มั้ย", "เข้าได้ยัง", "เข้าได้หรือยัง", "เข้าถึงได้ไหม", "เข้าถึงได้มั้ย", "เข้าถึงได้ยัง", "ใช้ได้ไหม", "ใช้ได้มั้ย", "ใช้ได้ยัง"} {
+			if strings.Contains(q, k) {
+				return true
+			}
+		}
+		if strings.Contains(q, "เข้า") && (strings.Contains(q, "ได้ไหม") || strings.Contains(q, "ได้มั้ย") || strings.Contains(q, "ได้ยัง") || strings.Contains(q, "ได้หรือยัง")) {
+			return true
+		}
+	}
+	englishWeb := strings.Contains(q, "internet") || strings.Contains(q, "web") || strings.Contains(q, "online")
+	if englishWeb {
+		for _, k := range []string{"can you access", "do you have access", "do you have internet", "is web access working", "does web access work", "can daiki access", "can you browse", "can you search the web"} {
+			if strings.Contains(q, k) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, researchMetadata, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -115,11 +142,18 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 	query := lastUserText(payload)
 	meta := researchMetadata{Mode: mode, Query: query}
 
-	useWeb := mode == "web" || (mode == "auto" && shouldAutoResearch(query))
+	useWeb := mode == "web" || (mode == "auto" && (shouldAutoResearch(query) || isWebCapabilityQuestion(query)))
 	var sources []researchSource
 	if useWeb && query != "" {
+		searchQuery := query
+		if isWebCapabilityQuestion(query) {
+			// Capability questions are poor search queries. Probe the configured
+			// public-web path with a stable benign query so success/failure reflects
+			// Daiki's backend research capability instead of search relevance.
+			searchQuery = "OpenAI official website"
+		}
 		var err error
-		sources, err = a.webResearch(ctx, query)
+		sources, err = a.webResearch(ctx, searchQuery)
 		if err != nil {
 			meta.Error = err.Error()
 			if mode == "web" {

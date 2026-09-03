@@ -40,6 +40,23 @@ func TestAutoResearchSignals(t *testing.T) {
 	}
 }
 
+func TestWebCapabilityQuestion(t *testing.T) {
+	for _, q := range []string{
+		"ตอนนี้เข้า internet ได้ยัง",
+		"Daiki เข้าถึงเว็บได้ไหม",
+		"does web access work?",
+	} {
+		if !isWebCapabilityQuestion(q) {
+			t.Fatalf("expected web capability intent for %q", q)
+		}
+	}
+	for _, q := range []string{"explain how the internet works", "เขียนเว็บด้วย React"} {
+		if isWebCapabilityQuestion(q) {
+			t.Fatalf("did not expect capability intent for %q", q)
+		}
+	}
+}
+
 func TestLastUserText(t *testing.T) {
 	payload := map[string]any{"messages": []any{
 		map[string]any{"role": "system", "content": "rules"},
