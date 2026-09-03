@@ -502,6 +502,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if requestID == "" {
 		requestID = fmt.Sprintf("req-%d", time.Now().UnixNano())
 	}
+	w.Header().Set("x-daiki-request-id", requestID)
 	c := current(r)
 	if err := a.reserveQuota(r.Context(), requestID, decision, reserved); err != nil {
 		status := http.StatusServiceUnavailable
@@ -649,6 +650,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		if copyErr != nil || r.Context().Err() != nil {
 			status = "cancelled"
 			usage = store.Usage{}
+			slog.Warn("chat stream interrupted", "request_id", requestID, "copy_error", copyErr, "context_error", r.Context().Err(), "research_used", researchMeta.Used, "research_sources", len(researchMeta.Sources), "model", route.PhysicalModel)
 		} else if resp.StatusCode >= 400 {
 			status = "failed"
 			usage = store.Usage{}
