@@ -440,6 +440,13 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		return
 	}
 	body, researchMeta, researchErr := a.enrichChatWithResearch(r.Context(), body)
+	chatRunID := strings.TrimSpace(r.Header.Get("x-daiki-chat-run-id"))
+	if chatRunID != "" && a.store != nil {
+		_ = a.store.UpdateChatRunActivity(context.Background(), chatRunID, map[string]any{
+			"phase":    "thinking",
+			"research": safeRunResearchActivity(researchMeta),
+		})
+	}
 	if researchErr != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": researchErr.Error(), "research": researchMeta})
 		return
@@ -511,6 +518,9 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		requestID = fmt.Sprintf("req-%d", time.Now().UnixNano())
 	}
 	w.Header().Set("x-daiki-request-id", requestID)
+	if chatRunID != "" && a.store != nil {
+		_ = a.store.UpdateChatRunActivity(context.Background(), chatRunID, map[string]any{"requestId": requestID})
+	}
 	c := current(r)
 	if err := a.reserveQuota(r.Context(), requestID, decision, reserved); err != nil {
 		status := http.StatusServiceUnavailable

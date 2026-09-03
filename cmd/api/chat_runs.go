@@ -189,6 +189,7 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 	payload := map[string]any{"model": session.ModelAlias, "researchMode": run.ResearchMode, "thinkingMode": run.ThinkingMode, "messages": payloadMessages, "attachmentIds": attachmentIDs, "stream": false}
 	raw, _ := json.Marshal(payload)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat", bytes.NewReader(raw)).WithContext(ctx)
+	req.Header.Set("x-daiki-chat-run-id", run.ID)
 	req = req.WithContext(context.WithValue(req.Context(), claimsKey, identity.Claims))
 	req = req.WithContext(context.WithValue(req.Context(), appUserKey, identity.User))
 	req = req.WithContext(context.WithValue(req.Context(), principalKey, identity.Principal))
@@ -247,6 +248,22 @@ func (a *app) failBackgroundRun(run store.ChatRun, started time.Time, message, r
 	activity := map[string]any{"phase": "failed", "durationMs": time.Since(started).Milliseconds()}
 	_, err := a.store.FailChatRun(context.Background(), run.OwnerSubject, run.ID, requestID, message, activity)
 	return err
+}
+
+func safeRunResearchActivity(meta researchMetadata) map[string]any {
+	out := map[string]any{"mode": meta.Mode, "query": meta.Query, "used": meta.Used, "error": meta.Error}
+	if len(meta.Sources) > 0 {
+		sources := make([]map[string]any, 0, min(len(meta.Sources), 8))
+		for _, source := range meta.Sources {
+			sources = append(sources, map[string]any{
+				"index": source.Index, "title": source.Title, "url": source.URL, "engine": source.Engine,
+				"snippet": clipText(strings.TrimSpace(source.Snippet), 280),
+			})
+		}
+		out["sources"] = sources
+		out["sourceCount"] = len(sources)
+	}
+	return out
 }
 
 func (a *app) chatRunActivity(ctx context.Context, requestID string, headers http.Header, started, ended time.Time, prompt, completion, reasoning, total int64) map[string]any {
