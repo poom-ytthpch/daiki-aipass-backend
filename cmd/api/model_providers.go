@@ -1,0 +1,537 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
+)
+
+type providerInput struct {
+	Name         string `json:"name"`
+	ProviderType string `json:"providerType"`
+	BaseURL      string `json:"baseUrl"`
+	APIKey       string `json:"apiKey"`
+	Enabled      *bool  `json:"enabled,omitempty"`
+}
+
+type discoveredModel struct {
+	ID string `json:"id"`
+}
+
+func normalizeProviderType(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "vllm", "lmstudio", "ollama":
+		return v
+	default:
+		return ""
+	}
+}
+
+func normalizeProviderBase(providerType, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("base URL is required")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil {
+		return "", errors.New("base URL must be an http(s) URL without credentials")
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") || host == "metadata.google.internal" || host == "metadata.google" {
+		return "", errors.New("loopback and metadata endpoints are not allowed")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
+			return "", errors.New("loopback, link-local and multicast endpoints are not allowed")
+		}
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.Path = strings.TrimRight(u.Path, "/")
+	if providerType == "ollama" && strings.HasSuffix(u.Path, "/v1") {
+		u.Path = strings.TrimSuffix(u.Path, "/v1")
+	}
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func providerDiscoveryURL(p store.ModelProvider) string {
+	base := strings.TrimRight(p.BaseURL, "/")
+	if p.ProviderType == "ollama" {
+		return base + "/api/tags"
+	}
+	if strings.HasSuffix(base, "/v1") {
+		return base + "/models"
+	}
+	return base + "/v1/models"
+}
+func providerLiteLLMBase(p store.ModelProvider) string {
+	base := strings.TrimRight(p.BaseURL, "/")
+	if p.ProviderType == "ollama" {
+		return strings.TrimSuffix(base, "/v1")
+	}
+	if strings.HasSuffix(base, "/v1") {
+		return base
+	}
+	return base + "/v1"
+}
+func providerLiteLLMModel(p store.ModelProvider, upstream string) string {
+	if p.ProviderType == "ollama" {
+		return "ollama/" + upstream
+	}
+	return "openai/" + upstream
+}
+
+func (a *app) providerAPIKey(p store.ModelProvider) (string, error) {
+	if p.EncryptedAPIKey == "" {
+		return "", nil
+	}
+	return a.decryptScopedSecret("model-provider:"+p.ID+":api-key", p.EncryptedAPIKey)
+}
+
+func providerIPAllowed(ip net.IP) bool {
+	return ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsMulticast()
+}
+
+func safeProviderHTTPClient(ctx context.Context, rawURL string) (*http.Client, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return nil, fmt.Errorf("provider host resolution failed")
+	}
+	for _, ip := range ips {
+		if !providerIPAllowed(ip) {
+			return nil, fmt.Errorf("provider host resolves to a blocked address")
+		}
+	}
+	selected := ips[0].String()
+	dialer := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{Proxy: nil, DialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
+		h, p, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		if !strings.EqualFold(h, host) {
+			return nil, fmt.Errorf("provider redirect host is not allowed")
+		}
+		return dialer.DialContext(dialCtx, network, net.JoinHostPort(selected, p))
+	}}
+	return &http.Client{Timeout: 10 * time.Second, Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return errors.New("provider redirects are not allowed")
+	}}, nil
+}
+
+func (a *app) discoverProvider(ctx context.Context, p store.ModelProvider) ([]discoveredModel, time.Duration, error) {
+	if _, err := normalizeProviderBase(p.ProviderType, p.BaseURL); err != nil {
+		return nil, 0, err
+	}
+	apiKey, err := a.providerAPIKey(p)
+	if err != nil {
+		return nil, 0, err
+	}
+	client, err := safeProviderHTTPClient(ctx, p.BaseURL)
+	if err != nil {
+		return nil, 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, providerDiscoveryURL(p), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	if apiKey != "" {
+		req.Header.Set("authorization", "Bearer "+apiKey)
+	}
+	started := time.Now()
+	resp, err := client.Do(req)
+	latency := time.Since(started)
+	if err != nil {
+		return nil, latency, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return nil, latency, fmt.Errorf("provider returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	out := []discoveredModel{}
+	if p.ProviderType == "ollama" {
+		var payload struct {
+			Models []struct {
+				Name  string `json:"name"`
+				Model string `json:"model"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
+			return nil, latency, err
+		}
+		for _, m := range payload.Models {
+			id := first(m.Model, m.Name)
+			if id != "" {
+				out = append(out, discoveredModel{ID: id})
+			}
+		}
+	} else {
+		var payload struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
+			return nil, latency, err
+		}
+		for _, m := range payload.Data {
+			if m.ID != "" {
+				out = append(out, discoveredModel{ID: m.ID})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, latency, nil
+}
+
+func providerPublic(p store.ModelProvider) store.ModelProvider { p.EncryptedAPIKey = ""; return p }
+
+func (a *app) adminModelProviders(w http.ResponseWriter, r *http.Request) {
+	providers, err := a.store.ModelProviders(r.Context())
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "provider registry unavailable"})
+		return
+	}
+	models, err := a.store.ProviderModels(r.Context(), "")
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "provider model registry unavailable"})
+		return
+	}
+	aliases, err := a.store.ModelAliases(r.Context())
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "alias registry unavailable"})
+		return
+	}
+	for i := range providers {
+		providers[i] = providerPublic(providers[i])
+	}
+	writeJSON(w, 200, map[string]any{"providers": providers, "models": models, "aliases": aliases})
+}
+
+func (a *app) adminSaveModelProvider(w http.ResponseWriter, r *http.Request) {
+	var in providerInput
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&in); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid provider payload"})
+		return
+	}
+	typ := normalizeProviderType(in.ProviderType)
+	if typ == "" {
+		writeJSON(w, 400, map[string]string{"error": "providerType must be vllm, lmstudio, or ollama"})
+		return
+	}
+	base, err := normalizeProviderBase(typ, in.BaseURL)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	name := strings.TrimSpace(in.Name)
+	if name == "" || len(name) > 80 {
+		writeJSON(w, 400, map[string]string{"error": "name is required and must be <= 80 characters"})
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		tok, e := randomURLToken(9)
+		if e != nil {
+			writeJSON(w, 500, map[string]string{"error": "unable to create provider id"})
+			return
+		}
+		id = "prov_" + tok
+	}
+	enabled := true
+	if in.Enabled != nil {
+		enabled = *in.Enabled
+	}
+	encrypted := ""
+	if strings.TrimSpace(in.APIKey) != "" {
+		encrypted, err = a.encryptScopedSecret("model-provider:"+id+":api-key", strings.TrimSpace(in.APIKey))
+		if err != nil {
+			writeJSON(w, 503, map[string]string{"error": "provider secret encryption unavailable"})
+			return
+		}
+	}
+	saved, err := a.store.UpsertModelProvider(r.Context(), store.ModelProvider{ID: id, Name: name, ProviderType: typ, BaseURL: base, EncryptedAPIKey: encrypted, Enabled: enabled})
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "unable to save provider"})
+		return
+	}
+	models, latency, testErr := a.discoverProvider(r.Context(), saved)
+	status, msg := "ok", fmt.Sprintf("Connected · %d models · %dms", len(models), latency.Milliseconds())
+	if testErr != nil {
+		status = "error"
+		msg = testErr.Error()
+	}
+	_ = a.store.SetProviderTest(r.Context(), id, status, msg)
+	saved.LastTestStatus = status
+	saved.LastTestMessage = msg
+	syncStatus := "not-needed"
+	if testErr == nil {
+		if syncErr := a.syncProviderModels(r.Context(), saved); syncErr != nil {
+			syncStatus = "error"
+			msg += " · LiteLLM sync failed: " + syncErr.Error()
+		} else {
+			syncStatus = "ok"
+		}
+	}
+	writeJSON(w, 200, map[string]any{"provider": providerPublic(saved), "models": models, "test": map[string]any{"status": status, "message": msg}, "syncStatus": syncStatus})
+}
+
+func (a *app) adminTestModelProvider(w http.ResponseWriter, r *http.Request) {
+	p, err := a.store.ModelProvider(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, 404, map[string]string{"error": "provider not found"})
+		return
+	}
+	models, latency, testErr := a.discoverProvider(r.Context(), p)
+	if testErr != nil {
+		_ = a.store.SetProviderTest(r.Context(), p.ID, "error", testErr.Error())
+		writeJSON(w, 502, map[string]any{"ok": false, "error": testErr.Error(), "latencyMs": latency.Milliseconds()})
+		return
+	}
+	msg := fmt.Sprintf("Connected · %d models · %dms", len(models), latency.Milliseconds())
+	_ = a.store.SetProviderTest(r.Context(), p.ID, "ok", msg)
+	writeJSON(w, 200, map[string]any{"ok": true, "models": models, "latencyMs": latency.Milliseconds()})
+}
+func (a *app) adminDiscoverProviderModels(w http.ResponseWriter, r *http.Request) {
+	a.adminTestModelProvider(w, r)
+}
+
+func (a *app) litellmAdmin(ctx context.Context, method, path string, payload any) (map[string]any, int, error) {
+	var body io.Reader
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		body = strings.NewReader(string(b))
+	}
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(a.cfg.LiteLLMBase, "/")+path, body)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("authorization", "Bearer "+a.cfg.LiteLLMKey)
+	if payload != nil {
+		req.Header.Set("content-type", "application/json")
+	}
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	out := map[string]any{}
+	_ = json.Unmarshal(raw, &out)
+	if resp.StatusCode >= 300 {
+		return out, resp.StatusCode, fmt.Errorf("LiteLLM HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return out, resp.StatusCode, nil
+}
+
+func (a *app) providerLiteLLMParams(p store.ModelProvider, upstream string) (map[string]any, error) {
+	providerKey, err := a.providerAPIKey(p)
+	if err != nil {
+		return nil, err
+	}
+	params := map[string]any{"model": providerLiteLLMModel(p, upstream), "api_base": providerLiteLLMBase(p), "timeout": 300}
+	if providerKey != "" {
+		params["api_key"] = providerKey
+	} else if p.ProviderType != "ollama" {
+		params["api_key"] = "not-needed"
+	}
+	return params, nil
+}
+
+func (a *app) syncProviderModels(ctx context.Context, p store.ModelProvider) error {
+	models, err := a.store.ProviderModels(ctx, p.ID)
+	if err != nil {
+		return err
+	}
+	for _, m := range models {
+		if m.Status != "active" || m.LiteLLMModelID == "" {
+			continue
+		}
+		params, err := a.providerLiteLLMParams(p, m.UpstreamModel)
+		if err != nil {
+			return err
+		}
+		_, _, err = a.litellmAdmin(ctx, http.MethodPost, "/model/update", map[string]any{"model_info": map[string]any{"id": m.LiteLLMModelID}, "litellm_params": params})
+		if err != nil {
+			_ = a.store.SetProviderModelState(ctx, m.ID, "error", "", err.Error())
+			return fmt.Errorf("update %s: %w", m.LiteLLMModelName, err)
+		}
+		_ = a.store.SetProviderModelState(ctx, m.ID, "active", "", "")
+	}
+	return nil
+}
+
+func (a *app) adminRegisterProviderModel(w http.ResponseWriter, r *http.Request) {
+	p, err := a.store.ModelProvider(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, 404, map[string]string{"error": "provider not found"})
+		return
+	}
+	var in struct {
+		UpstreamModel    string `json:"upstreamModel"`
+		LiteLLMModelName string `json:"litellmModelName"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid model payload"})
+		return
+	}
+	upstream := strings.TrimSpace(in.UpstreamModel)
+	if upstream == "" || len(upstream) > 180 {
+		writeJSON(w, 400, map[string]string{"error": "upstreamModel is required"})
+		return
+	}
+	name := strings.TrimSpace(in.LiteLLMModelName)
+	if name == "" {
+		name = p.ID + ":" + strings.ReplaceAll(upstream, " ", "-")
+	}
+	if len(name) > 220 {
+		writeJSON(w, 400, map[string]string{"error": "litellmModelName too long"})
+		return
+	}
+	idToken, e := randomURLToken(9)
+	if e != nil {
+		writeJSON(w, 500, map[string]string{"error": "unable to create model id"})
+		return
+	}
+	modelID := "pmodel_" + idToken
+	rec, err := a.store.UpsertProviderModel(r.Context(), store.ProviderModel{ID: modelID, ProviderID: p.ID, UpstreamModel: upstream, LiteLLMModelName: name, Status: "pending"})
+	if err != nil {
+		writeJSON(w, 409, map[string]string{"error": "model already registered or name conflicts"})
+		return
+	}
+	params, paramErr := a.providerLiteLLMParams(p, upstream)
+	if paramErr != nil {
+		writeJSON(w, 503, map[string]string{"error": "provider secret unavailable"})
+		return
+	}
+	result, _, regErr := a.litellmAdmin(r.Context(), http.MethodPost, "/model/new", map[string]any{"model_name": name, "litellm_params": params, "model_info": map[string]any{"provider": "daiki-" + p.ProviderType, "provider_id": p.ID}})
+	if regErr != nil {
+		_ = a.store.SetProviderModelState(r.Context(), rec.ID, "error", "", regErr.Error())
+		writeJSON(w, 502, map[string]any{"error": "LiteLLM registration failed", "detail": regErr.Error(), "model": rec})
+		return
+	}
+	litellmID := ""
+	if v, ok := result["model_id"].(string); ok {
+		litellmID = v
+	}
+	if litellmID == "" {
+		if mi, ok := result["model_info"].(map[string]any); ok {
+			if v, ok := mi["id"].(string); ok {
+				litellmID = v
+			}
+		}
+	}
+	if litellmID == "" {
+		if v, ok := result["id"].(string); ok {
+			litellmID = v
+		}
+	}
+	_ = a.store.SetProviderModelState(r.Context(), rec.ID, "active", litellmID, "")
+	rec.Status = "active"
+	rec.LiteLLMModelID = litellmID
+	writeJSON(w, 200, map[string]any{"model": rec, "litellm": result})
+}
+
+func (a *app) adminDeleteProviderModel(w http.ResponseWriter, r *http.Request) {
+	m, err := a.store.ProviderModel(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, 404, map[string]string{"error": "model not found"})
+		return
+	}
+	if m.LiteLLMModelID != "" {
+		if _, _, err := a.litellmAdmin(r.Context(), http.MethodPost, "/model/delete", map[string]any{"id": m.LiteLLMModelID}); err != nil {
+			writeJSON(w, 502, map[string]string{"error": "LiteLLM delete failed", "detail": err.Error()})
+			return
+		}
+	}
+	_ = a.store.DeleteAliasesForModel(r.Context(), m.LiteLLMModelName)
+	if err := a.store.DeleteProviderModel(r.Context(), m.ID); err != nil {
+		writeJSON(w, 503, map[string]string{"error": "unable to delete model"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+func (a *app) adminDeleteModelProvider(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	models, _ := a.store.ProviderModels(r.Context(), id)
+	for _, m := range models {
+		if m.LiteLLMModelID != "" {
+			if _, _, err := a.litellmAdmin(r.Context(), http.MethodPost, "/model/delete", map[string]any{"id": m.LiteLLMModelID}); err != nil {
+				writeJSON(w, 502, map[string]string{"error": "remove provider models from LiteLLM first", "detail": err.Error()})
+				return
+			}
+		}
+		_ = a.store.DeleteAliasesForModel(r.Context(), m.LiteLLMModelName)
+	}
+	if err := a.store.DeleteModelProvider(r.Context(), id); err != nil {
+		writeJSON(w, 503, map[string]string{"error": "unable to delete provider"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+func (a *app) adminModelAliases(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.store.ModelAliases(r.Context())
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "alias registry unavailable"})
+		return
+	}
+	writeJSON(w, 200, rows)
+}
+func (a *app) adminSetModelAlias(w http.ResponseWriter, r *http.Request) {
+	alias := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "alias")))
+	if alias != "fast" && alias != "balanced" && alias != "deep" && alias != "vision" {
+		writeJSON(w, 400, map[string]string{"error": "unsupported alias"})
+		return
+	}
+	var in struct {
+		LiteLLMModelName string `json:"litellmModelName"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&in) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid alias payload"})
+		return
+	}
+	model := strings.TrimSpace(in.LiteLLMModelName)
+	models, err := a.store.ProviderModels(r.Context(), "")
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "model registry unavailable"})
+		return
+	}
+	found := false
+	for _, m := range models {
+		if m.LiteLLMModelName == model && m.Status == "active" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeJSON(w, 400, map[string]string{"error": "alias target must be an active registered model"})
+		return
+	}
+	saved, err := a.store.SetModelAlias(r.Context(), alias, model, current(r).Sub)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "unable to save alias"})
+		return
+	}
+	writeJSON(w, 200, saved)
+}

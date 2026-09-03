@@ -115,3 +115,37 @@ CREATE TABLE IF NOT EXISTS password_reset_tokens (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS password_reset_tokens_expiry_idx ON password_reset_tokens (expires_at) WHERE used_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS model_providers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    provider_type TEXT NOT NULL CHECK (provider_type IN ('vllm','lmstudio','ollama')),
+    base_url TEXT NOT NULL,
+    encrypted_api_key TEXT NOT NULL DEFAULT '',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    last_test_status TEXT NOT NULL DEFAULT 'unknown',
+    last_test_message TEXT NOT NULL DEFAULT '',
+    last_test_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS provider_models (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES model_providers(id) ON DELETE CASCADE,
+    upstream_model TEXT NOT NULL,
+    litellm_model_name TEXT NOT NULL UNIQUE,
+    litellm_model_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','active','error','disabled')),
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(provider_id, upstream_model)
+);
+
+CREATE TABLE IF NOT EXISTS model_aliases (
+    alias TEXT PRIMARY KEY CHECK (alias IN ('fast','balanced','deep','vision')),
+    litellm_model_name TEXT NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

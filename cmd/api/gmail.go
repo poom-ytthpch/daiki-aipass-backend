@@ -65,7 +65,7 @@ func (a *app) encryptionAEAD() (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-func (a *app) encryptSecret(raw string) (string, error) {
+func (a *app) encryptScopedSecret(scope, raw string) (string, error) {
 	aead, err := a.encryptionAEAD()
 	if err != nil {
 		return "", err
@@ -74,12 +74,12 @@ func (a *app) encryptSecret(raw string) (string, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	sealed := aead.Seal(nil, nonce, []byte(raw), []byte("daiki:gmail:refresh-token:v1"))
+	sealed := aead.Seal(nil, nonce, []byte(raw), []byte("daiki:"+scope+":v1"))
 	payload := append(nonce, sealed...)
 	return base64.RawURLEncoding.EncodeToString(payload), nil
 }
 
-func (a *app) decryptSecret(encoded string) (string, error) {
+func (a *app) decryptScopedSecret(scope, encoded string) (string, error) {
 	aead, err := a.encryptionAEAD()
 	if err != nil {
 		return "", err
@@ -88,13 +88,19 @@ func (a *app) decryptSecret(encoded string) (string, error) {
 	if err != nil || len(payload) <= aead.NonceSize() {
 		return "", errors.New("invalid encrypted token")
 	}
-	raw, err := aead.Open(nil, payload[:aead.NonceSize()], payload[aead.NonceSize():], []byte("daiki:gmail:refresh-token:v1"))
+	raw, err := aead.Open(nil, payload[:aead.NonceSize()], payload[aead.NonceSize():], []byte("daiki:"+scope+":v1"))
 	if err != nil {
 		return "", err
 	}
 	return string(raw), nil
 }
 
+func (a *app) encryptSecret(raw string) (string, error) {
+	return a.encryptScopedSecret("gmail:refresh-token", raw)
+}
+func (a *app) decryptSecret(encoded string) (string, error) {
+	return a.decryptScopedSecret("gmail:refresh-token", encoded)
+}
 func (a *app) gmailAuthorize(w http.ResponseWriter, r *http.Request) {
 	if a.redis == nil || a.cfg.GoogleClientID == "" || a.cfg.GoogleClientSecret == "" || a.cfg.AdminEmail == "" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "gmail oauth is not configured"})

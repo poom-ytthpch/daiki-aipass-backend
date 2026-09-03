@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -198,5 +199,75 @@ func TestTokenForClient(t *testing.T) {
 	}
 	if tokenForClient(claims{AuthorizedParty: "other", Audience: []any{"account"}}, "daiki-web") {
 		t.Fatal("unexpected client match")
+	}
+}
+
+func TestNormalizeProviderBase(t *testing.T) {
+	cases := []struct {
+		typ, raw, want string
+		ok             bool
+	}{
+		{"vllm", "http://10.90.0.11:8000", "http://10.90.0.11:8000", true},
+		{"lmstudio", "http://10.90.0.12:1234/v1/", "http://10.90.0.12:1234/v1", true},
+		{"ollama", "http://10.90.0.13:11434/v1", "http://10.90.0.13:11434", true},
+		{"vllm", "http://127.0.0.1:8000", "", false},
+		{"vllm", "http://169.254.169.254/latest", "", false},
+		{"vllm", "ftp://10.0.0.2", "", false},
+	}
+	for _, tc := range cases {
+		got, err := normalizeProviderBase(tc.typ, tc.raw)
+		if tc.ok && (err != nil || got != tc.want) {
+			t.Fatalf("normalize %q got=%q err=%v want=%q", tc.raw, got, err, tc.want)
+		}
+		if !tc.ok && err == nil {
+			t.Fatalf("expected %q to be rejected, got %q", tc.raw, got)
+		}
+	}
+}
+
+func TestProviderScopedSecretIsolation(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	a := &app{cfg: config{TokenEncryptionKey: base64.StdEncoding.EncodeToString(key)}}
+	enc, err := a.encryptScopedSecret("model-provider:prov_a:api-key", "provider-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := a.decryptScopedSecret("model-provider:prov_a:api-key", enc); err != nil || got != "provider-secret" {
+		t.Fatalf("round trip failed got=%q err=%v", got, err)
+	}
+	if _, err := a.decryptScopedSecret("model-provider:prov_b:api-key", enc); err == nil {
+		t.Fatal("secret must not decrypt under another provider scope")
+	}
+}
+
+func TestProviderLiteLLMMapping(t *testing.T) {
+	v := store.ModelProvider{ProviderType: "vllm", BaseURL: "http://10.90.0.11:8000"}
+	if got := providerLiteLLMBase(v); got != "http://10.90.0.11:8000/v1" {
+		t.Fatalf("unexpected vllm base %q", got)
+	}
+	if got := providerLiteLLMModel(v, "Qwen/Qwen3"); got != "openai/Qwen/Qwen3" {
+		t.Fatalf("unexpected vllm model %q", got)
+	}
+	o := store.ModelProvider{ProviderType: "ollama", BaseURL: "http://10.90.0.13:11434"}
+	if got := providerLiteLLMModel(o, "qwen3:8b"); got != "ollama/qwen3:8b" {
+		t.Fatalf("unexpected ollama model %q", got)
+	}
+}
+
+func TestProviderIPAllowed(t *testing.T) {
+	allowed := []string{"10.90.0.11", "192.168.1.20", "8.8.8.8"}
+	for _, raw := range allowed {
+		if !providerIPAllowed(net.ParseIP(raw)) {
+			t.Fatalf("expected %s to be allowed", raw)
+		}
+	}
+	blocked := []string{"127.0.0.1", "0.0.0.0", "169.254.169.254", "224.0.0.1"}
+	for _, raw := range blocked {
+		if providerIPAllowed(net.ParseIP(raw)) {
+			t.Fatalf("expected %s to be blocked", raw)
+		}
 	}
 }

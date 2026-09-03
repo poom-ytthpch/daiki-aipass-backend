@@ -11,7 +11,7 @@ func TestRouterKeepsPhysicalModelServerSide(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if route.Alias != "fast" || route.PhysicalModel != "physical-fast" || route.Workload != WorkloadFast {
+	if route.Alias != "fast" || route.ResolvedAlias != "fast" || route.PhysicalModel != "physical-fast" || route.Workload != WorkloadFast {
 		t.Fatalf("unexpected route %#v", route)
 	}
 	var payload map[string]any
@@ -33,14 +33,14 @@ func TestRouterAutoDeepAndVision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deep.Workload != WorkloadDeep || deep.PhysicalModel != "d" {
+	if deep.Workload != WorkloadDeep || deep.ResolvedAlias != "deep" || deep.PhysicalModel != "d" {
 		t.Fatalf("expected deep route %#v", deep)
 	}
 	vision, _, err := r.RouteChat([]byte(`{"model":"auto","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,x"}}]}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if vision.Workload != WorkloadVision || vision.PhysicalModel != "v" {
+	if vision.Workload != WorkloadVision || vision.ResolvedAlias != "vision" || vision.PhysicalModel != "v" {
 		t.Fatalf("expected vision route %#v", vision)
 	}
 }

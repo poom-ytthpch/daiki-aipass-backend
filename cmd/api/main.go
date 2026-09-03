@@ -170,6 +170,16 @@ func main() {
 			r.Route("/admin", func(r chi.Router) {
 				r.Use(a.adminOnly)
 				r.Get("/summary", a.adminSummary)
+				r.Get("/model-providers", a.adminModelProviders)
+				r.Post("/model-providers", a.adminSaveModelProvider)
+				r.Put("/model-providers/{id}", a.adminSaveModelProvider)
+				r.Delete("/model-providers/{id}", a.adminDeleteModelProvider)
+				r.Post("/model-providers/{id}/test", a.adminTestModelProvider)
+				r.Get("/model-providers/{id}/discover", a.adminDiscoverProviderModels)
+				r.Post("/model-providers/{id}/models", a.adminRegisterProviderModel)
+				r.Delete("/provider-models/{id}", a.adminDeleteProviderModel)
+				r.Get("/model-aliases", a.adminModelAliases)
+				r.Put("/model-aliases/{alias}", a.adminSetModelAlias)
 				r.Get("/integrations/gmail", a.gmailIntegrationStatus)
 				r.Post("/integrations/gmail/authorize", a.gmailAuthorize)
 				r.Post("/integrations/gmail/callback", a.gmailCallback)
@@ -422,6 +432,18 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		w.Header().Set("x-daiki-access-mode", "pending-chat")
 	}
 	route, upstreamBody, err := a.router.RouteChat(body)
+	if err == nil && a.store != nil && route.ResolvedAlias != "" {
+		if alias, aliasErr := a.store.ModelAlias(r.Context(), route.ResolvedAlias); aliasErr == nil && alias.LiteLLMModelName != "" {
+			var dynamicPayload map[string]any
+			if json.Unmarshal(upstreamBody, &dynamicPayload) == nil {
+				dynamicPayload["model"] = alias.LiteLLMModelName
+				if rewritten, marshalErr := json.Marshal(dynamicPayload); marshalErr == nil {
+					upstreamBody = rewritten
+					route.PhysicalModel = alias.LiteLLMModelName
+				}
+			}
+		}
+	}
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return

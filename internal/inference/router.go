@@ -19,6 +19,7 @@ const (
 
 type Route struct {
 	Alias         string   `json:"alias"`
+	ResolvedAlias string   `json:"resolvedAlias"`
 	Workload      Workload `json:"workload"`
 	PhysicalModel string   `json:"-"`
 	Priority      int      `json:"priority"`
@@ -121,5 +122,5 @@ func (r *Router) RouteChat(body []byte) (Route, []byte, error) {
 	if err != nil {
 		return Route{}, nil, err
 	}
-	return Route{Alias: alias, Workload: workload, PhysicalModel: physical, Priority: priority}, rewritten, nil
+	return Route{Alias: alias, ResolvedAlias: resolved, Workload: workload, PhysicalModel: physical, Priority: priority}, rewritten, nil
 }
