@@ -172,6 +172,7 @@ func main() {
 		r.Group(func(r chi.Router) {
 			r.Use(a.auth)
 			r.Get("/me", a.me)
+			r.Get("/capabilities", a.smartCapabilities)
 			r.Get("/attachments", a.listAttachments)
 			r.Post("/attachments", a.uploadAttachment)
 			r.Get("/attachments/{id}", a.downloadAttachment)
@@ -457,6 +458,12 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	skills := selectSmartSkills(body)
+	body, err = applySmartSkills(body, skills)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "unable to prepare smart skills"})
+		return
+	}
 	route, upstreamBody, err := a.router.RouteChat(body)
 	if err == nil && a.store != nil && route.ResolvedAlias != "" {
 		if alias, aliasErr := a.store.ModelAlias(r.Context(), route.ResolvedAlias); aliasErr == nil && alias.LiteLLMModelName != "" {
@@ -473,9 +480,6 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
-	}
-	if stream {
-		upstreamBody = ensureStreamUsage(upstreamBody)
 	}
 	decision, policy, err := a.quotaFor(r)
 	if err != nil {
@@ -508,6 +512,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		return
 	}
 	requestMeta := usageRequestMetadata(body, currentPrincipal(r).AuthKind, currentPrincipal(r).APIKeyID)
+	skillIDs := make([]string, 0, len(skills))
+	for _, skill := range skills {
+		skillIDs = append(skillIDs, skill.ID)
+	}
+	requestMeta["skills"] = skillIDs
 	if len(attachments) > 0 {
 		requestMeta["attachments"] = attachments
 	}
@@ -547,13 +556,35 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		return
 	}
 	defer ticket.Release(context.Background())
+	toolUsage := store.Usage{}
+	toolNames := []string{}
+	if shouldEnableSmartTools(body) {
+		plannedBody, usedTools, plannerUsage, planErr := a.runSmartToolLoop(r.Context(), c.Sub, upstreamBody)
+		toolUsage = plannerUsage
+		toolNames = usedTools
+		if plannerUsage.TotalTokens > 0 || len(toolNames) > 0 {
+			_ = a.store.MergeUsageMetadata(r.Context(), requestID, map[string]any{"tools": toolNames, "toolPlannerTokens": plannerUsage.TotalTokens})
+		}
+		if planErr != nil {
+			slog.Warn("smart tool planning skipped", "request_id", requestID, "error", planErr)
+		} else {
+			upstreamBody = plannedBody
+		}
+	}
+	if stream {
+		upstreamBody = ensureStreamUsage(upstreamBody)
+	}
 	w.Header().Set("x-daiki-model-alias", route.Alias)
+	w.Header().Set("x-daiki-skills", strings.Join(skillIDs, ","))
+	if len(toolNames) > 0 {
+		w.Header().Set("x-daiki-tools", strings.Join(toolNames, ","))
+	}
 	w.Header().Set("x-daiki-workload", string(route.Workload))
 	w.Header().Set("x-daiki-queue-wait-ms", fmt.Sprint(ticket.AcquiredAt.Sub(ticket.EnqueuedAt).Milliseconds()))
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, strings.TrimRight(a.cfg.LiteLLMBase, "/")+path, strings.NewReader(string(upstreamBody)))
 	if err != nil {
 		a.releaseReservation(r.Context(), requestID, decision, reserved)
-		_ = a.store.FinishUsage(r.Context(), requestID, "failed", store.Usage{})
+		_ = a.store.FinishUsage(r.Context(), requestID, "failed", toolUsage)
 		writeJSON(w, 500, map[string]string{"error": "request construction failed"})
 		return
 	}
@@ -568,7 +599,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		if r.Context().Err() != nil {
 			status = "cancelled"
 		}
-		_ = a.store.FinishUsage(context.Background(), requestID, status, store.Usage{})
+		_ = a.store.FinishUsage(context.Background(), requestID, status, toolUsage)
 		writeJSON(w, 502, map[string]string{"error": "LiteLLM unavailable"})
 		return
 	}
@@ -605,6 +636,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 			actual = reserved
 			usage.TotalTokens = actual
 		}
+		usage = addUsage(usage, toolUsage)
 		_ = a.store.MergeUsageMetadata(context.Background(), requestID, usageResponseMetadata(capture.Bytes()))
 		_ = a.store.FinishUsage(context.Background(), requestID, status, usage)
 		a.releaseReservation(context.Background(), requestID, decision, reserved)
@@ -614,7 +646,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if readErr != nil {
 		a.releaseReservation(r.Context(), requestID, decision, reserved)
-		_ = a.store.FinishUsage(r.Context(), requestID, "failed", store.Usage{})
+		_ = a.store.FinishUsage(r.Context(), requestID, "failed", toolUsage)
 		writeJSON(w, 502, map[string]string{"error": "invalid LiteLLM response"})
 		return
 	}
@@ -631,6 +663,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if resp.StatusCode >= 400 {
 		ledgerStatus = "failed"
 	}
+	usage = addUsage(usage, toolUsage)
 	_ = a.store.MergeUsageMetadata(r.Context(), requestID, usageResponseMetadata(responseBody))
 	_ = a.store.FinishUsage(r.Context(), requestID, ledgerStatus, usage)
 	a.releaseReservation(r.Context(), requestID, decision, reserved)

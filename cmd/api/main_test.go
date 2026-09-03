@@ -338,3 +338,37 @@ func TestChatSessionInputNormalization(t *testing.T) {
 		t.Fatalf("physical model must not become a session alias: %q", got)
 	}
 }
+
+func TestSmartSkillSelectionForSmallModel(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"ช่วย debug TypeScript API แล้วสรุปสาเหตุให้หน่อย"}]}`)
+	sk := selectSmartSkills(body)
+	if len(sk) == 0 || sk[0].ID != "coding" {
+		t.Fatalf("skills=%v", sk)
+	}
+	prepared, err := applySmartSkills(body, sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(prepared, []byte("small 4B model")) || !bytes.Contains(prepared, []byte("Skill Coding")) {
+		t.Fatalf("prepared prompt missing orchestration: %s", prepared)
+	}
+	if bytes.Contains(prepared, []byte(`"metadata"`)) {
+		t.Fatal("local orchestration metadata must not be sent upstream")
+	}
+}
+
+func TestSmartToolTriggerAndCalculator(t *testing.T) {
+	if !shouldEnableSmartTools([]byte(`{"messages":[{"role":"user","content":"คำนวณ (1250*7.5)/100 ให้หน่อย"}]}`)) {
+		t.Fatal("calculator request should enable smart tools")
+	}
+	v, err := evalExpression("(1250*7.5)/100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 93.75 {
+		t.Fatalf("value=%v", v)
+	}
+	if _, err := evalExpression("1/0"); err == nil {
+		t.Fatal("division by zero must fail")
+	}
+}
