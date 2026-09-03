@@ -22,6 +22,7 @@ type ChatMessage struct {
 	Role          string    `json:"role"`
 	Content       string    `json:"content"`
 	AttachmentIDs []string  `json:"attachmentIds"`
+	RunID         *string   `json:"runId,omitempty"`
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
@@ -75,7 +76,7 @@ func (s *Store) DeleteChatSession(ctx context.Context, owner, id string) error {
 }
 
 func (s *Store) ChatMessages(ctx context.Context, owner, sessionID string) ([]ChatMessage, error) {
-	rows, err := s.DB.Query(ctx, `SELECT m.id,m.session_id,m.role,m.content,m.attachment_ids,m.created_at FROM chat_messages m JOIN chat_sessions s ON s.id=m.session_id WHERE m.session_id=$1 AND s.owner_subject=$2 ORDER BY m.created_at ASC,m.id ASC`, sessionID, owner)
+	rows, err := s.DB.Query(ctx, `SELECT m.id,m.session_id,m.role,m.content,m.attachment_ids,m.run_id,m.created_at FROM chat_messages m JOIN chat_sessions s ON s.id=m.session_id WHERE m.session_id=$1 AND s.owner_subject=$2 ORDER BY m.created_at ASC,m.id ASC`, sessionID, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +84,7 @@ func (s *Store) ChatMessages(ctx context.Context, owner, sessionID string) ([]Ch
 	out := []ChatMessage{}
 	for rows.Next() {
 		var m ChatMessage
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.AttachmentIDs, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.AttachmentIDs, &m.RunID, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -93,6 +94,35 @@ func (s *Store) ChatMessages(ctx context.Context, owner, sessionID string) ([]Ch
 
 func (s *Store) AddChatMessage(ctx context.Context, owner, sessionID, role, content string, attachmentIDs []string) (ChatMessage, error) {
 	var m ChatMessage
-	err := s.DB.QueryRow(ctx, `WITH owned AS (SELECT id FROM chat_sessions WHERE id=$1 AND owner_subject=$2), ins AS (INSERT INTO chat_messages(session_id,role,content,attachment_ids) SELECT id,$3,$4,$5 FROM owned RETURNING id,session_id,role,content,attachment_ids,created_at), touch AS (UPDATE chat_sessions SET updated_at=now() WHERE id IN (SELECT id FROM owned)) SELECT id,session_id,role,content,attachment_ids,created_at FROM ins`, sessionID, owner, role, content, attachmentIDs).Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.AttachmentIDs, &m.CreatedAt)
+	err := s.DB.QueryRow(ctx, `WITH owned AS (SELECT id FROM chat_sessions WHERE id=$1 AND owner_subject=$2), ins AS (INSERT INTO chat_messages(session_id,role,content,attachment_ids) SELECT id,$3,$4,$5 FROM owned RETURNING id,session_id,role,content,attachment_ids,run_id,created_at), touch AS (UPDATE chat_sessions SET updated_at=now() WHERE id IN (SELECT id FROM owned)) SELECT id,session_id,role,content,attachment_ids,run_id,created_at FROM ins`, sessionID, owner, role, content, attachmentIDs).Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.AttachmentIDs, &m.RunID, &m.CreatedAt)
 	return m, err
+}
+
+func (s *Store) AddChatMessageForRun(ctx context.Context, owner, sessionID, role, content string, attachmentIDs []string, runID string) (ChatMessage, error) {
+	var m ChatMessage
+	err := s.DB.QueryRow(ctx, `WITH owned AS (SELECT id FROM chat_sessions WHERE id=$1 AND owner_subject=$2), ins AS (INSERT INTO chat_messages(session_id,role,content,attachment_ids,run_id) SELECT id,$3,$4,$5,$6 FROM owned RETURNING id,session_id,role,content,attachment_ids,run_id,created_at), touch AS (UPDATE chat_sessions SET updated_at=now() WHERE id IN (SELECT id FROM owned)) SELECT id,session_id,role,content,attachment_ids,run_id,created_at FROM ins`, sessionID, owner, role, content, attachmentIDs, runID).Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.AttachmentIDs, &m.RunID, &m.CreatedAt)
+	return m, err
+}
+
+func (s *Store) EditUserChatMessageAndTruncate(ctx context.Context, owner, sessionID string, messageID int64, content string) (ChatMessage, error) {
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	defer tx.Rollback(ctx)
+	var m ChatMessage
+	err = tx.QueryRow(ctx, `UPDATE chat_messages m SET content=$4 WHERE m.id=$3 AND m.session_id=$1 AND m.role='user' AND EXISTS(SELECT 1 FROM chat_sessions s WHERE s.id=$1 AND s.owner_subject=$2) RETURNING m.id,m.session_id,m.role,m.content,m.attachment_ids,m.run_id,m.created_at`, sessionID, owner, messageID, content).Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.AttachmentIDs, &m.RunID, &m.CreatedAt)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM chat_messages WHERE session_id=$1 AND id>$2`, sessionID, messageID); err != nil {
+		return ChatMessage{}, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE chat_sessions SET updated_at=now() WHERE id=$1`, sessionID); err != nil {
+		return ChatMessage{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return ChatMessage{}, err
+	}
+	return m, nil
 }

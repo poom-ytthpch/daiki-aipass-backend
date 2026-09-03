@@ -183,3 +183,25 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS chat_messages_session_created_idx ON chat_messages (session_id, created_at ASC, id ASC);
+
+
+CREATE TABLE IF NOT EXISTS chat_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    owner_subject TEXT NOT NULL REFERENCES app_users(subject) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','paused','completed','failed','cancelled')),
+    research_mode TEXT NOT NULL DEFAULT 'auto',
+    thinking_mode TEXT NOT NULL DEFAULT 'medium',
+    request_id TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    activity JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS chat_runs_session_created_idx ON chat_runs(session_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS chat_runs_owner_status_idx ON chat_runs(owner_subject,status,updated_at DESC);
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS run_id TEXT;
+CREATE INDEX IF NOT EXISTS chat_messages_run_idx ON chat_messages(run_id) WHERE run_id IS NOT NULL;

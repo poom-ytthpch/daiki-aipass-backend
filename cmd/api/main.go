@@ -155,6 +155,9 @@ func main() {
 			if err := a.store.Migrate(ctx); err != nil {
 				panic(fmt.Errorf("database schema migration failed: %w", err))
 			}
+			if err := a.store.RecoverInterruptedChatRuns(ctx); err != nil {
+				slog.Warn("chat run recovery failed", "error", err)
+			}
 			defer db.Close()
 		} else {
 			slog.Warn("postgres disabled", "error", err)
@@ -184,6 +187,10 @@ func main() {
 			r.Patch("/chat-sessions/{id}", a.updateChatSession)
 			r.Delete("/chat-sessions/{id}", a.deleteChatSession)
 			r.Post("/chat-sessions/{id}/messages", a.addChatMessage)
+			r.Patch("/chat-sessions/{id}/messages/{messageID}", a.editChatMessage)
+			r.Get("/chat-sessions/{id}/runs/latest", a.latestChatRun)
+			r.Get("/chat-runs/{runID}", a.getChatRun)
+			r.Patch("/chat-runs/{runID}", a.controlChatRun)
 			r.Route("/admin", func(r chi.Router) {
 				r.Use(a.adminOnly)
 				r.Get("/summary", a.adminSummary)
@@ -225,6 +232,7 @@ func main() {
 				r.Use(requirePrincipalScope("inference"))
 				r.Post("/chat", a.chat)
 				r.Post("/chat/stream", a.chatStream)
+				r.Post("/chat-sessions/{id}/runs", a.startChatRun)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(a.approvalRequired)

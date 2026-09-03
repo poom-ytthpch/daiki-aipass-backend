@@ -71,7 +71,12 @@ func (a *app) getChatSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 503, map[string]string{"error": "chat history unavailable"})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"session": x, "messages": ms})
+	runs, runErr := a.store.ChatRuns(r.Context(), current(r).Sub, id)
+	if runErr != nil {
+		writeJSON(w, 503, map[string]string{"error": "chat runs unavailable"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"session": x, "messages": ms, "runs": runs})
 }
 func (a *app) updateChatSession(w http.ResponseWriter, r *http.Request) {
 	var in struct {
