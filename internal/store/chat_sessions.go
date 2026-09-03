@@ -93,12 +93,18 @@ func (s *Store) ChatMessages(ctx context.Context, owner, sessionID string) ([]Ch
 }
 
 func (s *Store) AddChatMessage(ctx context.Context, owner, sessionID, role, content string, attachmentIDs []string) (ChatMessage, error) {
+	if attachmentIDs == nil {
+		attachmentIDs = []string{}
+	}
 	var m ChatMessage
 	err := s.DB.QueryRow(ctx, `WITH owned AS (SELECT id FROM chat_sessions WHERE id=$1 AND owner_subject=$2), ins AS (INSERT INTO chat_messages(session_id,role,content,attachment_ids) SELECT id,$3,$4,$5 FROM owned RETURNING id,session_id,role,content,attachment_ids,run_id,created_at), touch AS (UPDATE chat_sessions SET updated_at=now() WHERE id IN (SELECT id FROM owned)) SELECT id,session_id,role,content,attachment_ids,run_id,created_at FROM ins`, sessionID, owner, role, content, attachmentIDs).Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.AttachmentIDs, &m.RunID, &m.CreatedAt)
 	return m, err
 }
 
 func (s *Store) AddChatMessageForRun(ctx context.Context, owner, sessionID, role, content string, attachmentIDs []string, runID string) (ChatMessage, error) {
+	if attachmentIDs == nil {
+		attachmentIDs = []string{}
+	}
 	var m ChatMessage
 	err := s.DB.QueryRow(ctx, `WITH owned AS (SELECT id FROM chat_sessions WHERE id=$1 AND owner_subject=$2), ins AS (INSERT INTO chat_messages(session_id,role,content,attachment_ids,run_id) SELECT id,$3,$4,$5,$6 FROM owned RETURNING id,session_id,role,content,attachment_ids,run_id,created_at), touch AS (UPDATE chat_sessions SET updated_at=now() WHERE id IN (SELECT id FROM owned)) SELECT id,session_id,role,content,attachment_ids,run_id,created_at FROM ins`, sessionID, owner, role, content, attachmentIDs, runID).Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.AttachmentIDs, &m.RunID, &m.CreatedAt)
 	return m, err

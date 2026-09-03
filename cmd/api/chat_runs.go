@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -237,7 +238,8 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 		return a.failBackgroundRun(run, started, "empty model response", requestID)
 	}
 	activity := a.chatRunActivity(context.Background(), requestID, rr.Header(), started, time.Now(), out.Usage.PromptTokens, out.Usage.CompletionTokens, out.Usage.Details.ReasoningTokens, out.Usage.TotalTokens)
-	if _, err = a.store.AddChatMessageForRun(context.Background(), run.OwnerSubject, run.SessionID, "assistant", answer, nil, run.ID); err != nil {
+	if _, err = a.store.AddChatMessageForRun(context.Background(), run.OwnerSubject, run.SessionID, "assistant", answer, []string{}, run.ID); err != nil {
+		slog.Error("background run answer persistence failed", "run_id", run.ID, "request_id", requestID, "error", err)
 		return a.failBackgroundRun(run, started, "unable to save answer", requestID)
 	}
 	_, err = a.store.CompleteChatRun(context.Background(), run.OwnerSubject, run.ID, requestID, answer, activity)
