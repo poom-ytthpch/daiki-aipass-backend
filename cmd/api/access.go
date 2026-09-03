@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -259,6 +260,9 @@ func parseUsagePayload(body []byte) store.Usage {
 }
 
 func (a *app) adminUsers(w http.ResponseWriter, r *http.Request) {
+	if err := a.syncKeycloakUsers(r.Context()); err != nil {
+		slog.Warn("keycloak user reconciliation failed", "error", err)
+	}
 	status := strings.TrimSpace(r.URL.Query().Get("status"))
 	users, err := a.store.Users(r.Context(), status)
 	if err != nil {

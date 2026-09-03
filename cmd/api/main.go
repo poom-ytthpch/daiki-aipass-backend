@@ -736,6 +736,43 @@ func (a *app) keycloakJSON(ctx context.Context, method, path string, body any) (
 	return a.http.Do(req)
 }
 
+func (a *app) syncKeycloakUsers(ctx context.Context) error {
+	if a.store == nil {
+		return errors.New("identity store unavailable")
+	}
+	resp, err := a.keycloakJSON(ctx, http.MethodGet, "/users?max=500", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("keycloak user listing status %d", resp.StatusCode)
+	}
+	var users []struct {
+		ID        string `json:"id"`
+		Username  string `json:"username"`
+		Email     string `json:"email"`
+		FirstName string `json:"firstName"`
+		LastName  string `json:"lastName"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&users); err != nil {
+		return err
+	}
+	for _, u := range users {
+		if strings.TrimSpace(u.ID) == "" {
+			continue
+		}
+		email := strings.TrimSpace(first(u.Email, u.Username))
+		name := strings.TrimSpace(strings.TrimSpace(u.FirstName) + " " + strings.TrimSpace(u.LastName))
+		if name == "" {
+			name = first(u.Username, email, u.ID)
+		}
+		if _, err := a.store.UpsertIdentity(ctx, u.ID, email, name, "keycloak"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (a *app) setKeycloakRealmRoles(ctx context.Context, userID string, desired []string) error {
 	managed := map[string]bool{"ai-user": true, "ai-admin": true}
 	roleByName := map[string]map[string]any{}

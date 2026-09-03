@@ -116,6 +116,13 @@ func (s *Store) UpsertLogin(ctx context.Context, subject, email, name, provider 
 	row := s.DB.QueryRow(ctx, `INSERT INTO app_users(subject,email,display_name,auth_provider,roles,last_login_at) VALUES($1,$2,$3,$4,$5,now()) ON CONFLICT(subject) DO UPDATE SET email=EXCLUDED.email,display_name=EXCLUDED.display_name,auth_provider=EXCLUDED.auth_provider,roles=EXCLUDED.roles,last_login_at=now(),updated_at=now() RETURNING subject,email,display_name,auth_provider,status,roles,created_at,updated_at,last_login_at,approved_by,approved_at`, subject, email, name, provider, roles)
 	return scanUser(row)
 }
+func (s *Store) UpsertIdentity(ctx context.Context, subject, email, name, provider string) (User, error) {
+	if provider == "" {
+		provider = "keycloak"
+	}
+	row := s.DB.QueryRow(ctx, `INSERT INTO app_users(subject,email,display_name,auth_provider) VALUES($1,$2,$3,$4) ON CONFLICT(subject) DO UPDATE SET email=EXCLUDED.email,display_name=CASE WHEN EXCLUDED.display_name<>'' THEN EXCLUDED.display_name ELSE app_users.display_name END,updated_at=now() RETURNING subject,email,display_name,auth_provider,status,roles,created_at,updated_at,last_login_at,approved_by,approved_at`, subject, email, name, provider)
+	return scanUser(row)
+}
 func (s *Store) User(ctx context.Context, subject string) (User, error) {
 	return scanUser(s.DB.QueryRow(ctx, `SELECT subject,email,display_name,auth_provider,status,roles,created_at,updated_at,last_login_at,approved_by,approved_at FROM app_users WHERE subject=$1`, subject))
 }
