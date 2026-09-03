@@ -248,9 +248,12 @@ func (a *app) releaseReservation(ctx context.Context, requestID string, d quotaD
 func parseUsagePayload(body []byte) store.Usage {
 	var x struct {
 		Usage struct {
-			PromptTokens     int64 `json:"prompt_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
-			TotalTokens      int64 `json:"total_tokens"`
+			PromptTokens            int64 `json:"prompt_tokens"`
+			CompletionTokens        int64 `json:"completion_tokens"`
+			TotalTokens             int64 `json:"total_tokens"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int64 `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &x) != nil {

@@ -372,3 +372,88 @@ func TestSmartToolTriggerAndCalculator(t *testing.T) {
 		t.Fatal("division by zero must fail")
 	}
 }
+
+func TestThinkingModeAppliesBudgetAndRemovesInternalField(t *testing.T) {
+	body, profile, err := applyThinkingMode([]byte(`{"model":"auto","thinkingMode":"high","messages":[{"role":"user","content":"solve this"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Mode != "high" || profile.ReasoningBudget != 1536 || profile.MaxCompletionTokens != 4096 {
+		t.Fatalf("unexpected profile %#v", profile)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := payload["thinkingMode"]; exists {
+		t.Fatal("thinkingMode must not be forwarded")
+	}
+	if payload["reasoning_effort"] != "high" {
+		t.Fatalf("unexpected reasoning effort %#v", payload["reasoning_effort"])
+	}
+	if payload["max_completion_tokens"] != float64(4096) {
+		t.Fatalf("unexpected completion budget %#v", payload["max_completion_tokens"])
+	}
+}
+
+func TestTokenEstimateIncludesThinkingBudget(t *testing.T) {
+	p := thinkingProfileFor("medium")
+	e := estimateTokens([]byte(`{"messages":[{"role":"user","content":"hello"}]}`), p)
+	if e.ThinkingBudget != 768 || e.CompletionBudget != 2560 {
+		t.Fatalf("unexpected estimate %#v", e)
+	}
+	if e.TotalBudget != e.InputTokens+e.CompletionBudget {
+		t.Fatalf("total mismatch %#v", e)
+	}
+}
+
+func TestCopySSEWithUsageStripsPrivateReasoningButKeepsReasoningTokens(t *testing.T) {
+	input := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private steps\",\"content\":\"answer\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30,\"completion_tokens_details\":{\"reasoning_tokens\":12}}}\n\n" +
+		"data: [DONE]\n\n"
+	var out bytes.Buffer
+	usage, err := copySSEWithUsage(&out, strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "private steps") || strings.Contains(out.String(), "reasoning_content") {
+		t.Fatalf("private reasoning leaked in stream: %s", out.String())
+	}
+	if !strings.Contains(out.String(), "answer") || !strings.Contains(out.String(), "reasoning_tokens") {
+		t.Fatalf("answer or token accounting was removed: %s", out.String())
+	}
+	if usage.TotalTokens != 30 {
+		t.Fatalf("usage lost: %#v", usage)
+	}
+	if got := reasoningTokensFromPayload(out.Bytes()); got != 12 {
+		t.Fatalf("reasoning token metadata got %d want 12", got)
+	}
+}
+
+func TestThinkingOffDoesNotSendUnsupportedReasoningEffort(t *testing.T) {
+	body, profile, err := applyThinkingMode([]byte(`{"model":"auto","thinkingMode":"off","messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Mode != "off" || profile.ReasoningBudget != 0 {
+		t.Fatalf("unexpected off profile %#v", profile)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := payload["reasoning_effort"]; exists {
+		t.Fatalf("off mode must omit reasoning_effort: %#v", payload["reasoning_effort"])
+	}
+}
+
+func TestTokenEstimateRespectsLowerCompletionCap(t *testing.T) {
+	p := thinkingProfileFor("high")
+	e := estimateTokens([]byte(`{"messages":[{"role":"user","content":"hello"}],"max_completion_tokens":512}`), p)
+	if e.CompletionBudget != 512 || e.ThinkingBudget != 512 || e.VisibleBudget != 0 {
+		t.Fatalf("lower policy cap must win over high thinking profile: %#v", e)
+	}
+	if e.TotalBudget != e.InputTokens+512 {
+		t.Fatalf("unexpected capped total %#v", e)
+	}
+}

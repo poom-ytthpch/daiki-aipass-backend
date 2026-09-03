@@ -53,11 +53,49 @@ func usageRequestMetadata(body []byte, authKind, apiKeyID string) map[string]any
 }
 
 func usageResponseMetadata(body []byte) map[string]any {
-	return map[string]any{
+	meta := map[string]any{
 		"responseSizeBytes": len(body),
 		"responsePayload":   safePayloadSnapshot(body),
 		"toolsUsed":         responseToolNames(body),
 	}
+	if reasoning := reasoningTokensFromPayload(body); reasoning > 0 {
+		meta["reasoningTokens"] = reasoning
+	}
+	return meta
+}
+
+func reasoningTokensFromPayload(body []byte) int64 {
+	parse := func(raw []byte) int64 {
+		var x struct {
+			Usage struct {
+				CompletionTokensDetails struct {
+					ReasoningTokens int64 `json:"reasoning_tokens"`
+				} `json:"completion_tokens_details"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(raw, &x) == nil {
+			return x.Usage.CompletionTokensDetails.ReasoningTokens
+		}
+		return 0
+	}
+	if n := parse(body); n > 0 {
+		return n
+	}
+	var found int64
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		raw := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(raw) == 0 || bytes.Equal(raw, []byte("[DONE]")) {
+			continue
+		}
+		if n := parse(raw); n > 0 {
+			found = n
+		}
+	}
+	return found
 }
 
 func safePayloadSnapshot(body []byte) any {

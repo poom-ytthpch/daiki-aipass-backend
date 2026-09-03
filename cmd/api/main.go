@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -435,6 +436,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": researchErr.Error(), "research": researchMeta})
 		return
 	}
+	body, thinkingProfile, err := applyThinkingMode(body)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "unable to apply thinking mode"})
+		return
+	}
 	if u, ok := currentUser(r); ok && u.Status == "pending" {
 		body, err = a.restrictPendingChat(body)
 		if err != nil {
@@ -464,6 +470,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, 400, map[string]string{"error": "unable to prepare smart skills"})
 		return
 	}
+	tokenEstimate := estimateTokens(body, thinkingProfile)
 	route, upstreamBody, err := a.router.RouteChat(body)
 	if err == nil && a.store != nil && route.ResolvedAlias != "" {
 		if alias, aliasErr := a.store.ModelAlias(r.Context(), route.ResolvedAlias); aliasErr == nil && alias.LiteLLMModelName != "" {
@@ -524,6 +531,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	requestMeta["physicalModel"] = route.PhysicalModel
 	requestMeta["workload"] = string(route.Workload)
 	requestMeta["research"] = researchMeta
+	requestMeta["thinking"] = map[string]any{"mode": thinkingProfile.Mode, "reasoningBudget": thinkingProfile.ReasoningBudget, "maxCompletionTokens": thinkingProfile.MaxCompletionTokens, "estimate": tokenEstimate}
 	_ = a.store.MergeUsageMetadata(r.Context(), requestID, requestMeta)
 	principalID := "user:" + c.Sub
 	if currentPrincipal(r).APIKeyID != "" {
@@ -589,6 +597,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		w.Header().Set("x-daiki-tools", strings.Join(toolNames, ","))
 	}
 	w.Header().Set("x-daiki-workload", string(route.Workload))
+	w.Header().Set("x-daiki-thinking-mode", thinkingProfile.Mode)
+	w.Header().Set("x-daiki-token-estimate-input", fmt.Sprint(tokenEstimate.InputTokens))
+	w.Header().Set("x-daiki-token-estimate-thinking", fmt.Sprint(tokenEstimate.ThinkingBudget))
+	w.Header().Set("x-daiki-token-estimate-output", fmt.Sprint(tokenEstimate.VisibleBudget))
+	w.Header().Set("x-daiki-token-estimate-total", fmt.Sprint(tokenEstimate.TotalBudget))
 	w.Header().Set("x-daiki-queue-wait-ms", fmt.Sprint(ticket.AcquiredAt.Sub(ticket.EnqueuedAt).Milliseconds()))
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, strings.TrimRight(a.cfg.LiteLLMBase, "/")+path, strings.NewReader(string(upstreamBody)))
 	if err != nil {
@@ -660,6 +673,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		return
 	}
 	usage := parseUsagePayload(responseBody)
+	responseBody = sanitizeReasoningJSON(responseBody)
 	actual := usage.TotalTokens
 	if actual == 0 && resp.StatusCode < 400 {
 		actual = reserved
@@ -698,15 +712,52 @@ func ensureStreamUsage(body []byte) []byte {
 	return out
 }
 
+func stripPrivateReasoning(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, value := range x {
+			normalized := strings.ToLower(strings.ReplaceAll(k, "-", "_"))
+			switch normalized {
+			case "reasoning_content", "reasoning_text", "chain_of_thought":
+				continue
+			}
+			out[k] = stripPrivateReasoning(value)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i := range x {
+			out[i] = stripPrivateReasoning(x[i])
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func sanitizeReasoningJSON(data []byte) []byte {
+	if !bytes.Contains(data, []byte("reasoning_content")) && !bytes.Contains(data, []byte("reasoning_text")) && !bytes.Contains(data, []byte("chain_of_thought")) {
+		return data
+	}
+	var payload any
+	if json.Unmarshal(data, &payload) != nil {
+		return data
+	}
+	out, err := json.Marshal(stripPrivateReasoning(payload))
+	if err != nil {
+		return data
+	}
+	return out
+}
+
 func copySSEWithUsage(dst io.Writer, src io.Reader) (store.Usage, error) {
 	reader := bufio.NewReaderSize(src, 64<<10)
 	var usage store.Usage
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			if _, writeErr := dst.Write(line); writeErr != nil {
-				return usage, writeErr
-			}
+			outLine := line
 			trimmed := strings.TrimSpace(string(line))
 			if strings.HasPrefix(trimmed, "data:") {
 				data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
@@ -715,7 +766,18 @@ func copySSEWithUsage(dst io.Writer, src io.Reader) (store.Usage, error) {
 					if parsed.TotalTokens > 0 || parsed.InputTokens > 0 || parsed.OutputTokens > 0 {
 						usage = parsed
 					}
+					sanitized := sanitizeReasoningJSON([]byte(data))
+					if !bytes.Equal(sanitized, []byte(data)) {
+						ending := "\n"
+						if bytes.HasSuffix(line, []byte("\r\n")) {
+							ending = "\r\n"
+						}
+						outLine = []byte("data: " + string(sanitized) + ending)
+					}
 				}
+			}
+			if _, writeErr := dst.Write(outLine); writeErr != nil {
+				return usage, writeErr
 			}
 		}
 		if err != nil {
