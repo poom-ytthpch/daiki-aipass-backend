@@ -108,6 +108,31 @@ func TestPublicIPGuard(t *testing.T) {
 	}
 }
 
+func TestResearchRankingAndRelevanceForAIPassport(t *testing.T) {
+	query := "thai ai passport"
+	officialURL := "https://aipass.go.th/"
+	officialTitle := "ยินดีต้อนรับสู่ ไทย เอไอ พาส"
+	officialContent := "TH-AI Passport ลงทะเบียนสำหรับคนไทย"
+	secondaryURL := "https://example.com/th-ai-passport"
+	secondaryTitle := "วิธีลงทะเบียน TH-AI Passport"
+	secondaryContent := "ข้อมูล TH-AI Passport"
+	unrelatedURL := "https://thaiembassy.org/thai-passport"
+	unrelatedTitle := "Thai Passport"
+	unrelatedContent := "Instruction for obtaining e-passport"
+
+	if !researchResultRelevant(query, officialTitle, officialURL, officialContent) {
+		t.Fatal("official AI Passport result must remain relevant")
+	}
+	if researchResultRelevant(query, unrelatedTitle, unrelatedURL, unrelatedContent) {
+		t.Fatal("generic Thai passport result without AI signal must be filtered")
+	}
+	officialRank := researchResultRank(query, officialTitle, officialURL, officialContent, 0.5)
+	secondaryRank := researchResultRank(query, secondaryTitle, secondaryURL, secondaryContent, 4.0)
+	if officialRank <= secondaryRank {
+		t.Fatalf("official source should outrank secondary source: official=%v secondary=%v", officialRank, secondaryRank)
+	}
+}
+
 func TestInternetCapabilityQuestionDoesNotTriggerDateTimeTool(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"ตอนนี้เข้า internet ได้ยัง"}]}`)
 	if shouldEnableSmartTools(body) {
