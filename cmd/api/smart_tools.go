@@ -55,7 +55,7 @@ func shouldEnableSmartTools(body []byte) bool {
 	if text == "" {
 		return false
 	}
-	for _, word := range []string{"calculate", "calculation", "percent", "percentage", "คำนวณ", "คิดเลข", "เปอร์เซ็นต์", "กี่โมง", "วันนี้", "ตอนนี้", "วันที่", "current time", "current date", "time now", "my file", "my files", "uploaded", "attachment", "search file", "read file", "find in", "ไฟล์", "เอกสาร", "โฟลเดอร์", "ค้นใน", "อ่านไฟล์"} {
+	for _, word := range []string{"calculate", "calculation", "percent", "percentage", "คำนวณ", "คิดเลข", "เปอร์เซ็นต์", "กี่โมง", "เวลาเท่าไหร่", "ตอนนี้กี่โมง", "วันนี้วันที่", "วันที่เท่าไหร่", "วันอะไร", "current time", "current date", "time now", "date today", "my file", "my files", "uploaded", "attachment", "search file", "read file", "find in", "ไฟล์", "เอกสาร", "โฟลเดอร์", "ค้นใน", "อ่านไฟล์"} {
 		if strings.Contains(text, word) {
 			return true
 		}
@@ -143,7 +143,7 @@ func (a *app) postLiteLLMJSON(ctx context.Context, body []byte) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	buf := new(bytes.Buffer)
 	if _, err := buf.ReadFrom(resp.Body); err != nil {
 		return nil, err

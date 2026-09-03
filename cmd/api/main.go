@@ -558,7 +558,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	defer ticket.Release(context.Background())
 	toolUsage := store.Usage{}
 	toolNames := []string{}
-	if shouldEnableSmartTools(body) {
+	if !researchMeta.Used && shouldEnableSmartTools(body) {
 		plannedBody, usedTools, plannerUsage, planErr := a.runSmartToolLoop(r.Context(), c.Sub, upstreamBody)
 		toolUsage = plannerUsage
 		toolNames = usedTools
@@ -573,6 +573,15 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	}
 	if stream {
 		upstreamBody = ensureStreamUsage(upstreamBody)
+	}
+	if researchMeta.Used {
+		w.Header().Set("x-daiki-research-used", "true")
+		w.Header().Set("x-daiki-research-sources", strconv.Itoa(len(researchMeta.Sources)))
+		w.Header().Set("x-daiki-research-mode", researchMeta.Mode)
+	} else {
+		w.Header().Set("x-daiki-research-used", "false")
+		w.Header().Set("x-daiki-research-sources", "0")
+		w.Header().Set("x-daiki-research-mode", researchMeta.Mode)
 	}
 	w.Header().Set("x-daiki-model-alias", route.Alias)
 	w.Header().Set("x-daiki-skills", strings.Join(skillIDs, ","))

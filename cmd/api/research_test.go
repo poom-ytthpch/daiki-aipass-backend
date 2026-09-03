@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -87,5 +88,33 @@ func TestPublicIPGuard(t *testing.T) {
 		if !publicIP(net.ParseIP(raw)) {
 			t.Fatalf("public address blocked: %s", raw)
 		}
+	}
+}
+
+func TestInternetCapabilityQuestionDoesNotTriggerDateTimeTool(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"ตอนนี้เข้า internet ได้ยัง"}]}`)
+	if shouldEnableSmartTools(body) {
+		t.Fatal("internet capability question must not trigger unrelated date/time tool planning")
+	}
+}
+
+func TestApplySmartSkillsMergesExistingResearchSystemMessage(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"WEB RESEARCH STATUS: SUCCEEDED"},{"role":"user","content":"ตอนนี้เข้า internet ได้ยัง"}]}`)
+	out, err := applySmartSkills(body, []smartSkill{{ID: "problem-solving", Name: "Problem Solving", Prompt: "be careful"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	messages, _ := payload["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("expected one merged system message + user, got %d", len(messages))
+	}
+	first, _ := messages[0].(map[string]any)
+	content, _ := first["content"].(string)
+	if !strings.Contains(content, "WEB RESEARCH STATUS: SUCCEEDED") || !strings.Contains(content, "small 4B model") {
+		t.Fatalf("merged system context missing research or smart prompt: %q", content)
 	}
 }
