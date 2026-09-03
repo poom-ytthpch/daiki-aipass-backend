@@ -529,6 +529,24 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if currentPrincipal(r).APIKeyID != "" {
 		principalID = "api_key:" + currentPrincipal(r).APIKeyID
 	}
+	if researchMeta.Used && shouldUseExtractiveResearchAnswer(researchMeta.Query) {
+		answer := renderResearchEvidenceAnswer(researchMeta)
+		w.Header().Set("x-daiki-research-used", "true")
+		w.Header().Set("x-daiki-research-sources", strconv.Itoa(len(researchMeta.Sources)))
+		w.Header().Set("x-daiki-research-mode", researchMeta.Mode)
+		w.Header().Set("x-daiki-research-answer-mode", "extractive")
+		w.Header().Set("x-daiki-model-alias", route.Alias)
+		w.Header().Set("x-daiki-skills", strings.Join(skillIDs, ","))
+		_ = a.store.MergeUsageMetadata(r.Context(), requestID, map[string]any{
+			"researchAnswerMode":   "extractive",
+			"researchModelSkipped": true,
+			"tools":                []string{"web_search"},
+		})
+		_ = a.store.FinishUsage(r.Context(), requestID, "completed", store.Usage{})
+		a.releaseReservation(r.Context(), requestID, decision, reserved)
+		writeSyntheticChatResponse(w, stream, route.PhysicalModel, answer)
+		return
+	}
 	if a.queue == nil {
 		a.releaseReservation(r.Context(), requestID, decision, reserved)
 		_ = a.store.FinishUsage(r.Context(), requestID, "failed", store.Usage{})

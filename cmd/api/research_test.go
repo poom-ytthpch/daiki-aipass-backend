@@ -133,6 +133,46 @@ func TestResearchRankingAndRelevanceForAIPassport(t *testing.T) {
 	}
 }
 
+func TestExtractiveResearchIntent(t *testing.T) {
+	for _, q := range []string{
+		"ค้นหาข้อมูล thai ai passport",
+		"หาข้อมูล OpenAI",
+		"search for current LiteLLM docs",
+		"find information about Qwen",
+	} {
+		if !shouldUseExtractiveResearchAnswer(q) {
+			t.Fatalf("expected extractive research answer for %q", q)
+		}
+	}
+	for _, q := range []string{
+		"ค้นหาข้อมูล thai ai passport แล้วสรุป",
+		"วิเคราะห์ข่าว AI ล่าสุด",
+		"compare current vLLM and Ollama",
+	} {
+		if shouldUseExtractiveResearchAnswer(q) {
+			t.Fatalf("did not expect extractive-only answer for synthesis query %q", q)
+		}
+	}
+}
+
+func TestRenderResearchEvidencePrefersOfficialSources(t *testing.T) {
+	meta := researchMetadata{Query: "ค้นหาข้อมูล thai ai passport", Sources: []researchSource{
+		{Index: 1, Title: "TH-AI Passport", URL: "https://aipass.go.th/", Snippet: "ลงทะเบียนผ่านเว็บไซต์ aipass.go.th"},
+		{Index: 2, Title: "Secondary", URL: "https://example.com/article", Snippet: "secondary claim that should be omitted when official evidence exists"},
+		{Index: 3, Title: "ข้อมูลโครงการ — TH-AI Passport", URL: "https://aipass.go.th/about", Snippet: "ส่งเสริมให้คนไทยเข้าถึง Generative AI"},
+	}}
+	answer := renderResearchEvidenceAnswer(meta)
+	if !strings.Contains(answer, "https://aipass.go.th/") || !strings.Contains(answer, "https://aipass.go.th/about") {
+		t.Fatalf("official evidence missing: %q", answer)
+	}
+	if strings.Contains(answer, "example.com") || strings.Contains(answer, "secondary claim") {
+		t.Fatalf("secondary source should be omitted when official sources exist: %q", answer)
+	}
+	if !strings.Contains(answer, "ลงทะเบียนผ่านเว็บไซต์ aipass.go.th") {
+		t.Fatalf("source snippet must be preserved: %q", answer)
+	}
+}
+
 func TestInternetCapabilityQuestionDoesNotTriggerDateTimeTool(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"ตอนนี้เข้า internet ได้ยัง"}]}`)
 	if shouldEnableSmartTools(body) {

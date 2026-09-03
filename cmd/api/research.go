@@ -199,6 +199,115 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 	return out, meta, nil
 }
 
+func shouldUseExtractiveResearchAnswer(query string) bool {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return false
+	}
+	for _, synthesis := range []string{"สรุป", "วิเคราะห์", "เปรียบเทียบ", "ข้อดีข้อเสีย", "ทำไม", "เพราะอะไร", "summarize", "analyse", "analyze", "compare", "why", "pros and cons"} {
+		if strings.Contains(q, synthesis) {
+			return false
+		}
+	}
+	for _, signal := range []string{"ค้นหาข้อมูล", "ค้นข้อมูล", "หาข้อมูล", "ค้นหา ", "search for ", "find information", "look up ", "lookup ", "information about "} {
+		if strings.Contains(q, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsThaiText(s string) bool {
+	for _, r := range s {
+		if r >= '\u0e00' && r <= '\u0e7f' {
+			return true
+		}
+	}
+	return false
+}
+
+func renderResearchEvidenceAnswer(meta researchMetadata) string {
+	sources := meta.Sources
+	official := make([]researchSource, 0, len(sources))
+	for _, source := range sources {
+		if researchOfficialHost(source.URL) {
+			official = append(official, source)
+		}
+	}
+	if len(official) > 0 {
+		sources = official
+	}
+	if len(sources) > 4 {
+		sources = sources[:4]
+	}
+	thai := containsThaiText(meta.Query)
+	var b strings.Builder
+	if thai {
+		if len(official) > 0 {
+			b.WriteString("พบข้อมูลที่ตรงกับคำค้นจากแหล่งทางการดังนี้:\n\n")
+		} else {
+			b.WriteString("พบข้อมูลที่ตรงกับคำค้นดังนี้:\n\n")
+		}
+	} else {
+		if len(official) > 0 {
+			b.WriteString("I found these matching official sources:\n\n")
+		} else {
+			b.WriteString("I found these matching sources:\n\n")
+		}
+	}
+	for _, source := range sources {
+		evidence := strings.TrimSpace(source.Snippet)
+		if evidence == "" {
+			evidence = strings.TrimSpace(source.Excerpt)
+		}
+		evidence = clipText(evidence, 900)
+		fmt.Fprintf(&b, "**[%d] %s**\n", source.Index, source.Title)
+		if evidence != "" {
+			b.WriteString(evidence)
+			b.WriteString("\n")
+		}
+		if thai {
+			fmt.Fprintf(&b, "แหล่งที่มา: %s\n\n", source.URL)
+		} else {
+			fmt.Fprintf(&b, "Source: %s\n\n", source.URL)
+		}
+	}
+	if thai {
+		b.WriteString("ข้อมูลด้านบนคงข้อความข้อเท็จจริงจากผลค้นหาไว้โดยตรง เพื่อหลีกเลี่ยงการตีความเกินจากแหล่งข้อมูล")
+	} else {
+		b.WriteString("The facts above are kept close to the retrieved source text to avoid unsupported interpretation.")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func writeSyntheticChatResponse(w http.ResponseWriter, stream bool, model, content string) {
+	id := fmt.Sprintf("chatcmpl-research-%d", time.Now().UnixNano())
+	created := time.Now().Unix()
+	if stream {
+		w.Header().Set("content-type", "text/event-stream")
+		w.Header().Set("cache-control", "no-cache")
+		w.Header().Set("x-accel-buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		chunk, _ := json.Marshal(map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": content}, "finish_reason": nil}},
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+		finish, _ := json.Marshal(map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", finish)
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": id, "object": "chat.completion", "created": created, "model": model,
+		"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": content}, "finish_reason": "stop"}},
+		"usage":   map[string]int{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+	})
+}
+
 func normalizeResearchText(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	var b strings.Builder
