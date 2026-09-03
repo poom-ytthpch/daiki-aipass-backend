@@ -145,3 +145,15 @@ func TestGmailRefreshTokenEncryptionRejectsWeakKey(t *testing.T) {
 		t.Fatal("expected invalid key error")
 	}
 }
+
+func TestTokenForClient(t *testing.T) {
+	if !tokenForClient(claims{AuthorizedParty: "daiki-web"}, "daiki-web") {
+		t.Fatal("expected matching authorized party")
+	}
+	if !tokenForClient(claims{Audience: []any{"account", "daiki-web"}}, "daiki-web") {
+		t.Fatal("expected matching audience")
+	}
+	if tokenForClient(claims{AuthorizedParty: "other", Audience: []any{"account"}}, "daiki-web") {
+		t.Fatal("unexpected client match")
+	}
+}

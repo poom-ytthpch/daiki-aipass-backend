@@ -63,6 +63,8 @@ type app struct {
 
 type claims struct {
 	Sub               string `json:"sub"`
+	AuthorizedParty   string `json:"azp"`
+	Audience          any    `json:"aud"`
 	Name              string `json:"name"`
 	Email             string `json:"email"`
 	EmailVerified     bool   `json:"email_verified"`
@@ -121,7 +123,7 @@ func main() {
 	defer cancel()
 	cfg := loadConfig()
 	keySet := oidc.NewRemoteKeySet(context.Background(), cfg.JWKSURL)
-	a := &app{cfg: cfg, verifier: oidc.NewVerifier(cfg.PublicIssuer, keySet, &oidc.Config{ClientID: cfg.ClientID}), http: &http.Client{Timeout: 15 * time.Second}, router: inference.NewRouter(getenv("MODEL_FAST", "qwen-local"), getenv("MODEL_BALANCED", "qwen-local"), getenv("MODEL_DEEP", "qwen-local"), getenv("MODEL_VISION", "qwen-local"))}
+	a := &app{cfg: cfg, verifier: oidc.NewVerifier(cfg.PublicIssuer, keySet, &oidc.Config{SkipClientIDCheck: true}), http: &http.Client{Timeout: 15 * time.Second}, router: inference.NewRouter(getenv("MODEL_FAST", "qwen-local"), getenv("MODEL_BALANCED", "qwen-local"), getenv("MODEL_DEEP", "qwen-local"), getenv("MODEL_VISION", "qwen-local"))}
 	if cfg.RedisAddr != "" {
 		a.redis = redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 		a.queue = inference.NewQueue(a.redis, inference.QueueConfig{
@@ -258,6 +260,10 @@ func (a *app) auth(next http.Handler) http.Handler {
 			writeJSON(w, 401, map[string]string{"error": "invalid claims"})
 			return
 		}
+		if !tokenForClient(c, a.cfg.ClientID) {
+			writeJSON(w, 401, map[string]string{"error": "token client mismatch"})
+			return
+		}
 		if a.store == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "identity store unavailable"})
 			return
@@ -280,6 +286,25 @@ func (a *app) auth(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, principalKey, principal{AuthKind: "oidc"})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+func tokenForClient(c claims, client string) bool {
+	if client == "" {
+		return false
+	}
+	if c.AuthorizedParty == client {
+		return true
+	}
+	switch aud := c.Audience.(type) {
+	case string:
+		return aud == client
+	case []any:
+		for _, v := range aud {
+			if s, ok := v.(string); ok && s == client {
+				return true
+			}
+		}
+	}
+	return false
 }
 func current(r *http.Request) claims { c, _ := r.Context().Value(claimsKey).(claims); return c }
 func roles(c claims, client string) []string {
