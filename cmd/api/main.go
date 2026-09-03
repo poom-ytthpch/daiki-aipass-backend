@@ -188,6 +188,7 @@ func main() {
 				r.Get("/usage", a.adminUsage)
 				r.Get("/queues", a.adminQueues)
 				r.Get("/users", a.adminUsers)
+				r.Get("/users/{subject}", a.adminUserDetail)
 				r.Post("/users", a.createUser)
 				r.Patch("/users/{subject}/status", a.adminUserStatus)
 				r.Put("/users/{subject}/roles", a.adminUserRoles)
@@ -481,6 +482,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, 503, map[string]string{"error": "usage ledger unavailable"})
 		return
 	}
+	requestMeta := usageRequestMetadata(body, currentPrincipal(r).AuthKind, currentPrincipal(r).APIKeyID)
+	requestMeta["resolvedAlias"] = route.ResolvedAlias
+	requestMeta["physicalModel"] = route.PhysicalModel
+	requestMeta["workload"] = string(route.Workload)
+	_ = a.store.MergeUsageMetadata(r.Context(), requestID, requestMeta)
 	principalID := "user:" + c.Sub
 	if currentPrincipal(r).APIKeyID != "" {
 		principalID = "api_key:" + currentPrincipal(r).APIKeyID
@@ -554,7 +560,8 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if stream {
 		w.Header().Set("x-accel-buffering", "no")
 		w.WriteHeader(resp.StatusCode)
-		usage, copyErr := copySSEWithUsage(w, resp.Body)
+		capture := &cappedBuffer{max: storedPayloadLimit}
+		usage, copyErr := copySSEWithUsage(io.MultiWriter(w, capture), resp.Body)
 		actual := usage.TotalTokens
 		status := "completed"
 		if copyErr != nil || r.Context().Err() != nil {
@@ -569,6 +576,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 			actual = reserved
 			usage.TotalTokens = actual
 		}
+		_ = a.store.MergeUsageMetadata(context.Background(), requestID, usageResponseMetadata(capture.Bytes()))
 		_ = a.store.FinishUsage(context.Background(), requestID, status, usage)
 		a.releaseReservation(context.Background(), requestID, decision, reserved)
 		return
@@ -594,6 +602,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if resp.StatusCode >= 400 {
 		ledgerStatus = "failed"
 	}
+	_ = a.store.MergeUsageMetadata(r.Context(), requestID, usageResponseMetadata(responseBody))
 	_ = a.store.FinishUsage(r.Context(), requestID, ledgerStatus, usage)
 	a.releaseReservation(r.Context(), requestID, decision, reserved)
 	w.WriteHeader(resp.StatusCode)

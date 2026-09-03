@@ -534,3 +534,107 @@ func (a *app) pendingQuotaPolicy() store.Policy {
 		AllowedModels: json.RawMessage(`["fast"]`),
 	}
 }
+
+func (a *app) adminUserDetail(w http.ResponseWriter, r *http.Request) {
+	subject := strings.TrimSpace(chi.URLParam(r, "subject"))
+	if subject == "" {
+		writeJSON(w, 400, map[string]string{"error": "missing subject"})
+		return
+	}
+	period := strings.TrimSpace(r.URL.Query().Get("period"))
+	if period == "" {
+		period = "month"
+	}
+	now := time.Now().UTC()
+	seriesSince := now.AddDate(0, -1, 0)
+	switch period {
+	case "day":
+		seriesSince = now.Add(-24 * time.Hour)
+	case "month":
+		seriesSince = now.AddDate(0, -1, 0)
+	case "year":
+		seriesSince = now.AddDate(-1, 0, 0)
+	default:
+		writeJSON(w, 400, map[string]string{"error": "period must be day, month or year"})
+		return
+	}
+	u, err := a.store.User(r.Context(), subject)
+	if err != nil {
+		writeJSON(w, 404, map[string]string{"error": "user not found"})
+		return
+	}
+	keys, err := a.store.APIKeysForUser(r.Context(), subject)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "api keys unavailable"})
+		return
+	}
+	connections, err := a.store.OAuthConnectionsForUser(r.Context(), subject)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "connections unavailable"})
+		return
+	}
+	caps, err := a.store.CapabilitiesForUser(r.Context(), subject)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "capabilities unavailable"})
+		return
+	}
+	activity, err := a.store.RecentActivityForUser(r.Context(), subject, 100)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "activity unavailable"})
+		return
+	}
+	series, err := a.store.UsageSeriesForUser(r.Context(), subject, period, "Asia/Bangkok", seriesSince)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "usage series unavailable"})
+		return
+	}
+	dayUsage, dayReq, err := a.store.UsageTotalsForUser(r.Context(), subject, now.Add(-24*time.Hour))
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "daily usage unavailable"})
+		return
+	}
+	monthUsage, monthReq, err := a.store.UsageTotalsForUser(r.Context(), subject, now.AddDate(0, -1, 0))
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "monthly usage unavailable"})
+		return
+	}
+	yearUsage, yearReq, err := a.store.UsageTotalsForUser(r.Context(), subject, now.AddDate(-1, 0, 0))
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "yearly usage unavailable"})
+		return
+	}
+	allUsage, allReq, err := a.store.UsageTotalsForUser(r.Context(), subject, time.Unix(0, 0).UTC())
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "lifetime usage unavailable"})
+		return
+	}
+	policy, configured, err := a.store.PolicyForUser(r.Context(), subject, u.Roles)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "quota unavailable"})
+		return
+	}
+	activeKeys := 0
+	for _, k := range keys {
+		if k.Status == "active" {
+			activeKeys++
+		}
+	}
+	writeJSON(w, 200, map[string]any{
+		"user":          u,
+		"apiKeys":       keys,
+		"apiKeySummary": map[string]any{"total": len(keys), "active": activeKeys, "revoked": len(keys) - activeKeys},
+		"connections":   connections,
+		"capabilities":  caps,
+		"quota":         map[string]any{"policy": policy, "configured": configured},
+		"usage": map[string]any{
+			"day":      map[string]any{"tokens": dayUsage, "requests": dayReq},
+			"month":    map[string]any{"tokens": monthUsage, "requests": monthReq},
+			"year":     map[string]any{"tokens": yearUsage, "requests": yearReq},
+			"lifetime": map[string]any{"tokens": allUsage, "requests": allReq},
+			"period":   period,
+			"series":   series,
+		},
+		"activity":   activity,
+		"dataPolicy": map[string]any{"requestResponseSnapshots": true, "snapshotLimitBytes": storedPayloadLimit, "secretsRedacted": true, "rawApiKeysStored": false, "rawOAuthRefreshTokensExposed": false},
+	})
+}

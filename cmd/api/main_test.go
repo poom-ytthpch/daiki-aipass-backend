@@ -271,3 +271,43 @@ func TestProviderIPAllowed(t *testing.T) {
 		}
 	}
 }
+
+func TestUsageMetadataRedactsSecretsAndTracksCapabilities(t *testing.T) {
+	body := []byte(`{"model":"auto","password":"pw","api_key":"dk_secret","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"search_docs"}}],"metadata":{"skills":["summarizer"],"mcpServers":["github"],"connectors":["gmail"]}}`)
+	meta := usageRequestMetadata(body, "oidc", "")
+	snapshot, err := json.Marshal(meta["requestPayload"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(snapshot)
+	if strings.Contains(text, "dk_secret") || strings.Contains(text, `"pw"`) {
+		t.Fatalf("secret leaked in snapshot: %s", text)
+	}
+	if !strings.Contains(text, "[REDACTED]") {
+		t.Fatalf("expected redacted marker: %s", text)
+	}
+	tools, _ := meta["tools"].([]string)
+	if len(tools) != 1 || tools[0] != "search_docs" {
+		t.Fatalf("tools=%v", tools)
+	}
+	skills, _ := meta["skills"].([]string)
+	if len(skills) != 1 || skills[0] != "summarizer" {
+		t.Fatalf("skills=%v", skills)
+	}
+	mcp, _ := meta["mcpServers"].([]string)
+	if len(mcp) != 1 || mcp[0] != "github" {
+		t.Fatalf("mcp=%v", mcp)
+	}
+	connectors, _ := meta["connectors"].([]string)
+	if len(connectors) != 1 || connectors[0] != "gmail" {
+		t.Fatalf("connectors=%v", connectors)
+	}
+}
+
+func TestResponseToolNames(t *testing.T) {
+	body := []byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"lookup_customer"}}]}}]}`)
+	got := responseToolNames(body)
+	if len(got) != 1 || got[0] != "lookup_customer" {
+		t.Fatalf("got=%v", got)
+	}
+}
