@@ -167,6 +167,10 @@ func main() {
 		r.Group(func(r chi.Router) {
 			r.Use(a.auth)
 			r.Get("/me", a.me)
+			r.Get("/attachments", a.listAttachments)
+			r.Post("/attachments", a.uploadAttachment)
+			r.Get("/attachments/{id}", a.downloadAttachment)
+			r.Delete("/attachments/{id}", a.deleteAttachment)
 			r.Route("/admin", func(r chi.Router) {
 				r.Use(a.adminOnly)
 				r.Get("/summary", a.adminSummary)
@@ -432,6 +436,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		}
 		w.Header().Set("x-daiki-access-mode", "pending-chat")
 	}
+	body, attachments, err := a.expandChatAttachments(r, body)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
 	route, upstreamBody, err := a.router.RouteChat(body)
 	if err == nil && a.store != nil && route.ResolvedAlias != "" {
 		if alias, aliasErr := a.store.ModelAlias(r.Context(), route.ResolvedAlias); aliasErr == nil && alias.LiteLLMModelName != "" {
@@ -483,6 +492,9 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		return
 	}
 	requestMeta := usageRequestMetadata(body, currentPrincipal(r).AuthKind, currentPrincipal(r).APIKeyID)
+	if len(attachments) > 0 {
+		requestMeta["attachments"] = attachments
+	}
 	requestMeta["resolvedAlias"] = route.ResolvedAlias
 	requestMeta["physicalModel"] = route.PhysicalModel
 	requestMeta["workload"] = string(route.Workload)

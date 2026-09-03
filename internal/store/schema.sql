@@ -12,6 +12,22 @@ CREATE TABLE IF NOT EXISTS app_users (
     approved_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS app_users_status_created_idx ON app_users (status, created_at DESC);
+CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,
+    owner_subject TEXT NOT NULL REFERENCES app_users(subject) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    relative_path TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'file' CHECK (source IN ('file','image','folder')),
+    media_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+    sha256 TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    extract_status TEXT NOT NULL DEFAULT 'stored',
+    extracted_text TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS attachments_owner_created_idx ON attachments (owner_subject, created_at DESC) WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS entitlement_policies (
     id BIGSERIAL PRIMARY KEY,

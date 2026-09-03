@@ -311,3 +311,15 @@ func TestResponseToolNames(t *testing.T) {
 		t.Fatalf("got=%v", got)
 	}
 }
+
+func TestAttachmentPathAndTextDetection(t *testing.T) {
+	if got := cleanRelativePath("../../project/../src/main.go", "main.go"); got != "src/main.go" {
+		t.Fatalf("unexpected cleaned relative path: %q", got)
+	}
+	if !textAttachment("config.yaml", "application/octet-stream") || !textAttachment("notes.txt", "text/plain") {
+		t.Fatal("expected common text files to be extractable")
+	}
+	if textAttachment("photo.png", "image/png") {
+		t.Fatal("image should not be treated as text")
+	}
+}

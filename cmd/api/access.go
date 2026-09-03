@@ -573,6 +573,11 @@ func (a *app) adminUserDetail(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "connections unavailable"})
 		return
 	}
+	attachments, err := a.store.UserAttachments(r.Context(), subject, 200)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "attachments unavailable"})
+		return
+	}
 	caps, err := a.store.CapabilitiesForUser(r.Context(), subject)
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "capabilities unavailable"})
@@ -624,6 +629,7 @@ func (a *app) adminUserDetail(w http.ResponseWriter, r *http.Request) {
 		"apiKeys":       keys,
 		"apiKeySummary": map[string]any{"total": len(keys), "active": activeKeys, "revoked": len(keys) - activeKeys},
 		"connections":   connections,
+		"attachments":   attachments,
 		"capabilities":  caps,
 		"quota":         map[string]any{"policy": policy, "configured": configured},
 		"usage": map[string]any{
