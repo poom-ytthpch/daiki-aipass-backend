@@ -66,9 +66,12 @@ func requirePrincipalScope(scope string) func(http.Handler) http.Handler {
 }
 
 func identityProvider(c claims) string {
-	// Keycloak does not guarantee one provider claim across all IdPs. Keep the
-	// durable value generic until the realm mapper exposes a stable provider id.
-	return "keycloak"
+	if provider := strings.ToLower(strings.TrimSpace(c.IdentityProvider)); provider != "" {
+		return provider
+	}
+	// Native Keycloak username/password sessions do not carry the broker session
+	// note, so absence of identity_provider means the built-in email/password flow.
+	return "email"
 }
 
 func (a *app) approvalRequired(next http.Handler) http.Handler {
@@ -279,6 +282,77 @@ func (a *app) adminUserStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, u)
+}
+
+func (a *app) adminUserRoles(w http.ResponseWriter, r *http.Request) {
+	subject := chi.URLParam(r, "subject")
+	if subject == "" {
+		writeJSON(w, 400, map[string]string{"error": "missing subject"})
+		return
+	}
+	var in struct {
+		Roles []string `json:"roles"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid body"})
+		return
+	}
+	allowed := map[string]bool{"ai-user": true, "ai-admin": true}
+	clean := make([]string, 0, len(in.Roles))
+	seen := map[string]bool{}
+	for _, role := range in.Roles {
+		role = strings.TrimSpace(role)
+		if !allowed[role] {
+			writeJSON(w, 400, map[string]string{"error": "unsupported role " + role})
+			return
+		}
+		if !seen[role] {
+			seen[role] = true
+			clean = append(clean, role)
+		}
+	}
+	if err := a.setKeycloakRealmRoles(r.Context(), subject, clean); err != nil {
+		writeJSON(w, 502, map[string]string{"error": err.Error()})
+		return
+	}
+	u, err := a.store.SetUserRoles(r.Context(), current(r).Sub, subject, clean)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, u)
+}
+
+func (a *app) adminSystemQuota(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		p, found, err := a.store.PolicyForPrincipal(r.Context(), "", "", nil)
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": "system token policy unavailable"})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"policy": p, "configured": found})
+		return
+	}
+	var p store.Policy
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&p) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid body"})
+		return
+	}
+	out, err := a.store.UpsertPolicy(r.Context(), current(r).Sub, "system", "default", p)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (a *app) adminAudit(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.store.AuditLog(r.Context(), 200)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "audit log unavailable"})
+		return
+	}
+	writeJSON(w, 200, rows)
 }
 
 func (a *app) adminUserQuota(w http.ResponseWriter, r *http.Request) {

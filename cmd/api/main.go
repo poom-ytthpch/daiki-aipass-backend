@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -69,6 +70,7 @@ type claims struct {
 	Email             string `json:"email"`
 	EmailVerified     bool   `json:"email_verified"`
 	PreferredUsername string `json:"preferred_username"`
+	IdentityProvider  string `json:"identity_provider"`
 	RealmAccess       struct {
 		Roles []string `json:"roles"`
 	} `json:"realm_access"`
@@ -178,6 +180,7 @@ func main() {
 				r.Get("/users", a.adminUsers)
 				r.Post("/users", a.createUser)
 				r.Patch("/users/{subject}/status", a.adminUserStatus)
+				r.Put("/users/{subject}/roles", a.adminUserRoles)
 				r.Get("/users/{subject}/quota", a.adminUserQuota)
 				r.Put("/users/{subject}/quota", a.adminUserQuota)
 				r.Get("/api-keys", a.adminAPIKeys)
@@ -185,6 +188,9 @@ func main() {
 				r.Delete("/api-keys/{id}", a.revokeAPIKey)
 				r.Get("/api-keys/{id}/quota", a.adminAPIKeyQuota)
 				r.Put("/api-keys/{id}/quota", a.adminAPIKeyQuota)
+				r.Get("/token-policy", a.adminSystemQuota)
+				r.Put("/token-policy", a.adminSystemQuota)
+				r.Get("/audit", a.adminAudit)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(a.chatAccess)
@@ -246,7 +252,7 @@ func (a *app) auth(next http.Handler) http.Handler {
 			c.RealmAccess.Roles = append([]string{}, u.Roles...)
 			ctx := context.WithValue(r.Context(), claimsKey, c)
 			ctx = context.WithValue(ctx, appUserKey, u)
-			ctx = context.WithValue(ctx, principalKey, principal{AuthKind: "api_key", APIKeyID: key.ID})
+			ctx = context.WithValue(ctx, principalKey, principal{AuthKind: "api_key", APIKeyID: key.ID, Scopes: append([]string{}, key.Scopes...)})
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
@@ -352,21 +358,23 @@ func (a *app) live(w http.ResponseWriter, r *http.Request) {
 func (a *app) ready(w http.ResponseWriter, r *http.Request) {
 	services := map[string]string{}
 	status := 200
-	if a.redis != nil {
-		if err := a.redis.Ping(r.Context()).Err(); err != nil {
-			services["redis"] = "down"
-			status = 503
-		} else {
-			services["redis"] = "ok"
-		}
+	if a.redis == nil {
+		services["redis"] = "not-configured"
+		status = 503
+	} else if err := a.redis.Ping(r.Context()).Err(); err != nil {
+		services["redis"] = "down"
+		status = 503
+	} else {
+		services["redis"] = "ok"
 	}
-	if a.db != nil {
-		if err := a.db.Ping(r.Context()); err != nil {
-			services["postgres"] = "down"
-			status = 503
-		} else {
-			services["postgres"] = "ok"
-		}
+	if a.db == nil {
+		services["postgres"] = "not-configured"
+		status = 503
+	} else if err := a.db.Ping(r.Context()); err != nil {
+		services["postgres"] = "down"
+		status = 503
+	} else {
+		services["postgres"] = "ok"
 	}
 	services["local_llm"] = "optional"
 	writeJSON(w, status, map[string]any{"status": map[bool]string{true: "ready", false: "degraded"}[status == 200], "services": services})
@@ -417,6 +425,9 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
+	}
+	if stream {
+		upstreamBody = ensureStreamUsage(upstreamBody)
 	}
 	decision, policy, err := a.quotaFor(r)
 	if err != nil {
@@ -521,14 +532,24 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if stream {
 		w.Header().Set("x-accel-buffering", "no")
 		w.WriteHeader(resp.StatusCode)
-		_, copyErr := io.Copy(w, resp.Body)
-		actual := reserved // bounded estimate until stream usage chunks are normalized.
+		usage, copyErr := copySSEWithUsage(w, resp.Body)
+		actual := usage.TotalTokens
 		status := "completed"
 		if copyErr != nil || r.Context().Err() != nil {
 			status = "cancelled"
 			actual = 0
+			usage = store.Usage{}
+		} else if resp.StatusCode >= 400 {
+			status = "failed"
+			actual = 0
+			usage = store.Usage{}
+		} else if actual == 0 {
+			// Compatibility fallback for upstreams that do not emit an OpenAI-style
+			// final usage chunk even after stream_options.include_usage is requested.
+			actual = reserved
+			usage.TotalTokens = actual
 		}
-		_ = a.store.FinishUsage(context.Background(), requestID, status, store.Usage{TotalTokens: actual})
+		_ = a.store.FinishUsage(context.Background(), requestID, status, usage)
 		a.releaseReservation(context.Background(), requestID, decision, reserved)
 		return
 	}
@@ -558,6 +579,54 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(responseBody)
 }
+func ensureStreamUsage(body []byte) []byte {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return body
+	}
+	payload["stream"] = true
+	streamOptions, _ := payload["stream_options"].(map[string]any)
+	if streamOptions == nil {
+		streamOptions = map[string]any{}
+	}
+	streamOptions["include_usage"] = true
+	payload["stream_options"] = streamOptions
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func copySSEWithUsage(dst io.Writer, src io.Reader) (store.Usage, error) {
+	reader := bufio.NewReaderSize(src, 64<<10)
+	var usage store.Usage
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			if _, writeErr := dst.Write(line); writeErr != nil {
+				return usage, writeErr
+			}
+			trimmed := strings.TrimSpace(string(line))
+			if strings.HasPrefix(trimmed, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+				if data != "" && data != "[DONE]" {
+					parsed := parseUsagePayload([]byte(data))
+					if parsed.TotalTokens > 0 || parsed.InputTokens > 0 || parsed.OutputTokens > 0 {
+						usage = parsed
+					}
+				}
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return usage, nil
+			}
+			return usage, err
+		}
+	}
+}
+
 func (a *app) chat(w http.ResponseWriter, r *http.Request) {
 	a.proxyLiteLLM(w, r, "/v1/chat/completions", false)
 }
@@ -642,7 +711,188 @@ func (a *app) kc(w http.ResponseWriter, r *http.Request, path string) {
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
-func (a *app) createUser(w http.ResponseWriter, r *http.Request) { a.kc(w, r, "/users") }
+func (a *app) keycloakJSON(ctx context.Context, method, path string, body any) (*http.Response, error) {
+	tok, err := a.kcAdminToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reader = strings.NewReader(string(encoded))
+	}
+	u := fmt.Sprintf("%s/admin/realms/%s%s", strings.TrimRight(a.cfg.KeycloakBase, "/"), a.cfg.KeycloakRealm, path)
+	req, err := http.NewRequestWithContext(ctx, method, u, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("authorization", "Bearer "+tok)
+	if body != nil {
+		req.Header.Set("content-type", "application/json")
+	}
+	return a.http.Do(req)
+}
+
+func (a *app) setKeycloakRealmRoles(ctx context.Context, userID string, desired []string) error {
+	managed := map[string]bool{"ai-user": true, "ai-admin": true}
+	roleByName := map[string]map[string]any{}
+	for name := range managed {
+		resp, err := a.keycloakJSON(ctx, http.MethodGet, "/roles/"+url.PathEscape(name), nil)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode >= 300 {
+			_ = resp.Body.Close()
+			return fmt.Errorf("keycloak role %s unavailable", name)
+		}
+		var rep map[string]any
+		err = json.NewDecoder(resp.Body).Decode(&rep)
+		_ = resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		roleByName[name] = rep
+	}
+	currentResp, err := a.keycloakJSON(ctx, http.MethodGet, "/users/"+url.PathEscape(userID)+"/role-mappings/realm", nil)
+	if err != nil {
+		return err
+	}
+	var current []map[string]any
+	if currentResp.StatusCode < 300 {
+		_ = json.NewDecoder(currentResp.Body).Decode(&current)
+	}
+	_ = currentResp.Body.Close()
+	var remove []map[string]any
+	for _, rep := range current {
+		if name, _ := rep["name"].(string); managed[name] {
+			remove = append(remove, rep)
+		}
+	}
+	if len(remove) > 0 {
+		resp, err := a.keycloakJSON(ctx, http.MethodDelete, "/users/"+url.PathEscape(userID)+"/role-mappings/realm", remove)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("keycloak role removal status %d", resp.StatusCode)
+		}
+	}
+	var add []map[string]any
+	seen := map[string]bool{}
+	for _, name := range desired {
+		name = strings.TrimSpace(name)
+		if !managed[name] || seen[name] {
+			continue
+		}
+		seen[name] = true
+		add = append(add, roleByName[name])
+	}
+	if len(add) > 0 {
+		resp, err := a.keycloakJSON(ctx, http.MethodPost, "/users/"+url.PathEscape(userID)+"/role-mappings/realm", add)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("keycloak role assignment status %d", resp.StatusCode)
+		}
+	}
+	return nil
+}
+
+func generatedPassword() (string, error) {
+	buf := make([]byte, 18)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "Dk!" + base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func (a *app) createUser(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Email       string   `json:"email"`
+		DisplayName string   `json:"displayName"`
+		Password    string   `json:"password"`
+		Status      string   `json:"status"`
+		Roles       []string `json:"roles"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid body"})
+		return
+	}
+	in.Email = strings.ToLower(strings.TrimSpace(in.Email))
+	if in.Email == "" || !strings.Contains(in.Email, "@") {
+		writeJSON(w, 400, map[string]string{"error": "valid email is required"})
+		return
+	}
+	if strings.TrimSpace(in.DisplayName) == "" {
+		in.DisplayName = strings.SplitN(in.Email, "@", 2)[0]
+	}
+	if in.Status == "" {
+		in.Status = "pending"
+	}
+	if len(in.Roles) == 0 {
+		in.Roles = []string{"ai-user"}
+	}
+	password := strings.TrimSpace(in.Password)
+	generated := false
+	if password == "" {
+		var err error
+		password, err = generatedPassword()
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": "temporary password generation failed"})
+			return
+		}
+		generated = true
+	}
+	resp, err := a.keycloakJSON(r.Context(), http.MethodPost, "/users", map[string]any{"username": in.Email, "email": in.Email, "firstName": in.DisplayName, "enabled": true, "emailVerified": true})
+	if err != nil {
+		writeJSON(w, 502, map[string]string{"error": "keycloak unavailable"})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "user already exists"})
+		return
+	}
+	if resp.StatusCode >= 300 {
+		writeJSON(w, 502, map[string]any{"error": "keycloak user creation failed", "status": resp.StatusCode})
+		return
+	}
+	location := resp.Header.Get("Location")
+	userID := strings.TrimSpace(location[strings.LastIndex(location, "/")+1:])
+	if userID == "" {
+		writeJSON(w, 502, map[string]string{"error": "keycloak did not return user id"})
+		return
+	}
+	resetResp, err := a.keycloakJSON(r.Context(), http.MethodPut, "/users/"+url.PathEscape(userID)+"/reset-password", map[string]any{"type": "password", "value": password, "temporary": generated})
+	if err != nil || resetResp.StatusCode >= 300 {
+		if resetResp != nil {
+			_ = resetResp.Body.Close()
+		}
+		writeJSON(w, 502, map[string]string{"error": "keycloak password setup failed"})
+		return
+	}
+	_ = resetResp.Body.Close()
+	if err := a.setKeycloakRealmRoles(r.Context(), userID, in.Roles); err != nil {
+		writeJSON(w, 502, map[string]string{"error": err.Error()})
+		return
+	}
+	u, err := a.store.UpsertManagedUser(r.Context(), current(r).Sub, userID, in.Email, in.DisplayName, in.Roles, in.Status)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "application user creation failed"})
+		return
+	}
+	out := map[string]any{"user": u}
+	if generated {
+		out["temporaryPassword"] = password
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
 
 func apiKeyHash(raw string) string {
 	sum := sha256.Sum256([]byte(raw))

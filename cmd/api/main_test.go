@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,6 +73,47 @@ func TestPrincipalScope(t *testing.T) {
 	}
 	if hasPrincipalScope(r.WithContext(ctx), "admin") {
 		t.Fatal("unexpected admin scope")
+	}
+}
+
+func TestEnsureStreamUsageRequestsFinalUsageChunk(t *testing.T) {
+	body := ensureStreamUsage([]byte(`{"model":"physical-fast","messages":[]}`))
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["stream"] != true {
+		t.Fatalf("stream must be enabled: %#v", payload)
+	}
+	opts, ok := payload["stream_options"].(map[string]any)
+	if !ok || opts["include_usage"] != true {
+		t.Fatalf("stream usage must be requested: %#v", payload)
+	}
+}
+
+func TestCopySSEWithUsagePreservesStreamAndExtractsTokens(t *testing.T) {
+	input := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n" +
+		"data: [DONE]\n\n"
+	var out bytes.Buffer
+	usage, err := copySSEWithUsage(&out, strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != input {
+		t.Fatalf("stream was modified:\n%s", out.String())
+	}
+	if usage.InputTokens != 12 || usage.OutputTokens != 3 || usage.TotalTokens != 15 {
+		t.Fatalf("unexpected usage: %#v", usage)
+	}
+}
+
+func TestIdentityProviderAttribution(t *testing.T) {
+	if got := identityProvider(claims{IdentityProvider: "Google"}); got != "google" {
+		t.Fatalf("expected google provider, got %q", got)
+	}
+	if got := identityProvider(claims{}); got != "email" {
+		t.Fatalf("expected native email provider, got %q", got)
 	}
 }
 
