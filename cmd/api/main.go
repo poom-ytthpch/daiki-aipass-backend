@@ -559,11 +559,9 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		status := "completed"
 		if copyErr != nil || r.Context().Err() != nil {
 			status = "cancelled"
-			actual = 0
 			usage = store.Usage{}
 		} else if resp.StatusCode >= 400 {
 			status = "failed"
-			actual = 0
 			usage = store.Usage{}
 		} else if actual == 0 {
 			// Compatibility fallback for upstreams that do not emit an OpenAI-style
@@ -710,29 +708,6 @@ func (a *app) kcAdminToken(ctx context.Context) (string, error) {
 	}
 	return x.AccessToken, nil
 }
-func (a *app) kc(w http.ResponseWriter, r *http.Request, path string) {
-	tok, err := a.kcAdminToken(r.Context())
-	if err != nil {
-		writeJSON(w, 502, map[string]string{"error": err.Error()})
-		return
-	}
-	body, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20))
-	u := fmt.Sprintf("%s/admin/realms/%s%s", strings.TrimRight(a.cfg.KeycloakBase, "/"), a.cfg.KeycloakRealm, path)
-	req, _ := http.NewRequestWithContext(r.Context(), r.Method, u, strings.NewReader(string(body)))
-	req.Header.Set("authorization", "Bearer "+tok)
-	req.Header.Set("content-type", "application/json")
-	resp, err := a.http.Do(req)
-	if err != nil {
-		writeJSON(w, 502, map[string]string{"error": "keycloak unavailable"})
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if ct := resp.Header.Get("content-type"); ct != "" {
-		w.Header().Set("content-type", ct)
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-}
 func (a *app) keycloakJSON(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	tok, err := a.kcAdminToken(ctx)
 	if err != nil {
@@ -766,7 +741,7 @@ func (a *app) syncKeycloakUsers(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("keycloak user listing status %d", resp.StatusCode)
 	}
@@ -835,7 +810,7 @@ func (a *app) setKeycloakRealmRoles(ctx context.Context, userID string, desired 
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("keycloak role removal status %d", resp.StatusCode)
 		}
@@ -855,7 +830,7 @@ func (a *app) setKeycloakRealmRoles(ctx context.Context, userID string, desired 
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("keycloak role assignment status %d", resp.StatusCode)
 		}
@@ -913,7 +888,7 @@ func (a *app) createUser(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 502, map[string]string{"error": "keycloak unavailable"})
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusConflict {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "user already exists"})
 		return
