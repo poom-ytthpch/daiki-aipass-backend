@@ -172,6 +172,12 @@ func main() {
 			r.Post("/attachments", a.uploadAttachment)
 			r.Get("/attachments/{id}", a.downloadAttachment)
 			r.Delete("/attachments/{id}", a.deleteAttachment)
+			r.Get("/chat-sessions", a.listChatSessions)
+			r.Post("/chat-sessions", a.createChatSession)
+			r.Get("/chat-sessions/{id}", a.getChatSession)
+			r.Patch("/chat-sessions/{id}", a.updateChatSession)
+			r.Delete("/chat-sessions/{id}", a.deleteChatSession)
+			r.Post("/chat-sessions/{id}/messages", a.addChatMessage)
 			r.Route("/admin", func(r chi.Router) {
 				r.Use(a.adminOnly)
 				r.Get("/summary", a.adminSummary)

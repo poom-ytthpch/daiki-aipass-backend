@@ -323,3 +323,18 @@ func TestAttachmentPathAndTextDetection(t *testing.T) {
 		t.Fatal("image should not be treated as text")
 	}
 }
+
+func TestChatSessionInputNormalization(t *testing.T) {
+	if got := cleanChatTitle("   hello session   "); got != "hello session" {
+		t.Fatalf("unexpected title %q", got)
+	}
+	if got := cleanChatTitle(""); got != "New chat" {
+		t.Fatalf("unexpected blank title %q", got)
+	}
+	if got := validChatModel("DEEP"); got != "deep" {
+		t.Fatalf("unexpected model %q", got)
+	}
+	if got := validChatModel("physical-model"); got != "auto" {
+		t.Fatalf("physical model must not become a session alias: %q", got)
+	}
+}

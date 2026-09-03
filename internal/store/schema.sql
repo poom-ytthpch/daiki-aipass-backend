@@ -165,3 +165,21 @@ CREATE TABLE IF NOT EXISTS model_aliases (
     updated_by TEXT NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id TEXT PRIMARY KEY,
+    owner_subject TEXT NOT NULL REFERENCES app_users(subject) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT 'New chat',
+    model_alias TEXT NOT NULL DEFAULT 'auto',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS chat_sessions_owner_updated_idx ON chat_sessions (owner_subject, updated_at DESC);
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id BIGSERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    content TEXT NOT NULL DEFAULT '',
+    attachment_ids TEXT[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS chat_messages_session_created_idx ON chat_messages (session_id, created_at ASC, id ASC);
