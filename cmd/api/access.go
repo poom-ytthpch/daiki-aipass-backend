@@ -146,17 +146,36 @@ func (a *app) quotaFor(r *http.Request) (quotaDecision, store.Policy, error) {
 	c := current(r)
 	principal := currentPrincipal(r)
 	if u, ok := currentUser(r); ok && u.Status == "pending" {
-		p := a.pendingQuotaPolicy()
+		p, configured, err := a.store.UserPolicyOverride(r.Context(), c.Sub)
+		if err != nil {
+			return quotaDecision{}, p, err
+		}
+		if !configured {
+			p = a.pendingQuotaPolicy()
+		}
+		if p.QuotaMode == "" {
+			p.QuotaMode = "unlimited"
+		}
+		if p.IntervalKind == "" {
+			p.IntervalKind = "lifetime"
+		}
+		d := quotaDecision{Mode: p.QuotaMode, Limit: p.TokenLimit, Interval: p.IntervalKind, CounterKey: "user:" + c.Sub}
+		if p.QuotaMode == "unlimited" || p.TokenLimit == nil {
+			return d, p, nil
+		}
 		start, reset := quotaWindow(p, time.Now().UTC())
 		uUsage, err := a.store.UsageSummaryForUser(r.Context(), c.Sub, start)
 		if err != nil {
 			return quotaDecision{}, p, err
 		}
+		d.Used = uUsage.TotalTokens
 		remaining := *p.TokenLimit - uUsage.TotalTokens
 		if remaining < 0 {
 			remaining = 0
 		}
-		return quotaDecision{Mode: p.QuotaMode, Limit: p.TokenLimit, Used: uUsage.TotalTokens, Remaining: &remaining, ResetAt: reset, Interval: p.IntervalKind, CounterKey: "user:" + c.Sub}, p, nil
+		d.Remaining = &remaining
+		d.ResetAt = reset
+		return d, p, nil
 	}
 	p, _, err := a.store.PolicyForPrincipal(r.Context(), c.Sub, principal.APIKeyID, roles(c, a.cfg.ClientID))
 	if err != nil {
@@ -369,12 +388,24 @@ func (a *app) adminUserQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet {
-		p, found, err := a.store.PolicyForUser(r.Context(), subject, nil)
+		override, configured, err := a.store.UserPolicyOverride(r.Context(), subject)
 		if err != nil {
 			writeJSON(w, 500, map[string]string{"error": "quota unavailable"})
 			return
 		}
-		writeJSON(w, 200, map[string]any{"policy": p, "configured": found})
+		var effective store.Policy
+		if configured {
+			effective = override
+		} else if u, userErr := a.store.User(r.Context(), subject); userErr == nil && u.Status == "pending" {
+			effective = a.pendingQuotaPolicy()
+		} else {
+			effective, _, err = a.store.PolicyForUser(r.Context(), subject, nil)
+			if err != nil {
+				writeJSON(w, 500, map[string]string{"error": "quota unavailable"})
+				return
+			}
+		}
+		writeJSON(w, 200, map[string]any{"policy": override, "override": override, "effective": effective, "configured": configured})
 		return
 	}
 	var p store.Policy

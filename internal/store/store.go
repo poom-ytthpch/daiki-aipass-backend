@@ -172,6 +172,16 @@ func (s *Store) SetUserStatus(ctx context.Context, actor, subject, status string
 	_, _ = s.DB.Exec(ctx, `INSERT INTO access_audit_log(actor_subject,action,target_type,target_id,old_value,new_value) VALUES($1,'user.status.update','user',$2,$3,$4)`, actor, subject, oldJSON, newJSON)
 	return u, nil
 }
+func (s *Store) UserPolicyOverride(ctx context.Context, subject string) (Policy, bool, error) {
+	row := s.DB.QueryRow(ctx, `SELECT id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_seconds,priority,allowed_models,effective_from,expires_at FROM entitlement_policies WHERE effective_from<=now() AND (expires_at IS NULL OR expires_at>now()) AND scope_type='user' AND scope_id=$1 ORDER BY priority DESC,id DESC LIMIT 1`, subject)
+	var p Policy
+	err := row.Scan(&p.ID, &p.ScopeType, &p.ScopeID, &p.QuotaMode, &p.TokenLimit, &p.IntervalKind, &p.IntervalSeconds, &p.Priority, &p.AllowedModels, &p.EffectiveFrom, &p.ExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Policy{}, false, nil
+	}
+	return p, err == nil, err
+}
+
 func (s *Store) PolicyForUser(ctx context.Context, subject string, roles []string) (Policy, bool, error) {
 	row := s.DB.QueryRow(ctx, `SELECT id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_seconds,priority,allowed_models,effective_from,expires_at FROM entitlement_policies WHERE effective_from<=now() AND (expires_at IS NULL OR expires_at>now()) AND ((scope_type='user' AND scope_id=$1) OR (scope_type='role' AND scope_id=ANY($2)) OR (scope_type='system' AND scope_id='default')) ORDER BY CASE scope_type WHEN 'user' THEN 3 WHEN 'role' THEN 2 ELSE 1 END DESC,priority DESC,id DESC LIMIT 1`, subject, roles)
 	var p Policy
