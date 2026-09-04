@@ -218,6 +218,8 @@ func main() {
 				r.Put("/users/{subject}/roles", a.adminUserRoles)
 				r.Get("/users/{subject}/quota", a.adminUserQuota)
 				r.Put("/users/{subject}/quota", a.adminUserQuota)
+				r.Post("/users/{subject}/quota-reset", a.adminResetUserQuota)
+				r.Post("/users/{subject}/quota-reset-grants", a.adminGrantUserQuotaResets)
 				r.Get("/api-keys", a.adminAPIKeys)
 				r.Post("/api-keys", a.createAPIKey)
 				r.Delete("/api-keys/{id}", a.revokeAPIKey)
@@ -231,6 +233,8 @@ func main() {
 				r.Use(a.chatAccess)
 				r.Use(requirePrincipalScope("inference"))
 				r.Get("/usage", a.usage)
+				r.Get("/quota-resets", a.quotaResets)
+				r.Post("/quota-resets/use", a.useQuotaReset)
 				r.Post("/chat", a.chat)
 				r.Post("/chat/stream", a.chatStream)
 				r.Post("/chat-sessions/{id}/runs", a.startChatRun)
@@ -528,9 +532,21 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		if strings.Contains(err.Error(), "exhausted") {
 			status = http.StatusTooManyRequests
 			code = "quota_exhausted"
+			if a.redis != nil {
+				ttl := time.Hour
+				if decision.ResetAt != nil {
+					if until := time.Until(*decision.ResetAt); until > 0 {
+						ttl = until
+					}
+				}
+				_ = a.redis.Set(r.Context(), "quota:blocked:"+decision.CounterKey, "1", ttl).Err()
+			}
 		}
 		writeJSON(w, status, map[string]any{"error": code, "quota": decision})
 		return
+	}
+	if a.redis != nil {
+		_ = a.redis.Del(r.Context(), "quota:blocked:"+decision.CounterKey).Err()
 	}
 	if err := a.store.StartUsageForPrincipal(r.Context(), requestID, c.Sub, currentPrincipal(r).APIKeyID, route.Alias, string(route.Workload), reserved); err != nil {
 		a.releaseReservation(r.Context(), requestID, decision, reserved)
@@ -825,7 +841,9 @@ func (a *app) usage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start, _ := quotaWindow(policy, time.Now().UTC())
-	if decision.Interval == "lifetime" {
+	if decision.WindowStart != nil {
+		start = *decision.WindowStart
+	} else if decision.Interval == "lifetime" {
 		start = time.Unix(0, 0).UTC()
 	}
 	var u store.Usage

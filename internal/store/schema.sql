@@ -64,6 +64,29 @@ CREATE TABLE IF NOT EXISTS quota_grants (
 );
 CREATE INDEX IF NOT EXISTS quota_grants_active_idx ON quota_grants (subject_type, subject_id, effective_from, expires_at);
 
+CREATE TABLE IF NOT EXISTS quota_reset_grants (
+    id BIGSERIAL PRIMARY KEY,
+    user_subject TEXT NOT NULL REFERENCES app_users(subject) ON DELETE CASCADE,
+    total_resets INTEGER NOT NULL CHECK (total_resets > 0),
+    remaining_resets INTEGER NOT NULL CHECK (remaining_resets >= 0 AND remaining_resets <= total_resets),
+    expires_at TIMESTAMPTZ NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS quota_reset_grants_active_idx ON quota_reset_grants(user_subject,expires_at,remaining_resets);
+
+CREATE TABLE IF NOT EXISTS quota_reset_events (
+    id BIGSERIAL PRIMARY KEY,
+    user_subject TEXT NOT NULL REFERENCES app_users(subject) ON DELETE CASCADE,
+    grant_id BIGINT REFERENCES quota_reset_grants(id) ON DELETE SET NULL,
+    reset_kind TEXT NOT NULL CHECK (reset_kind IN ('admin','credit')),
+    actor_subject TEXT NOT NULL,
+    reset_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS quota_reset_events_user_time_idx ON quota_reset_events(user_subject,reset_at DESC);
+
 CREATE TABLE IF NOT EXISTS usage_ledger (
     id BIGSERIAL PRIMARY KEY,
     request_id TEXT NOT NULL UNIQUE,
