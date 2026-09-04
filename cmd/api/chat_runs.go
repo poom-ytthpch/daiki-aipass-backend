@@ -188,14 +188,27 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 	profile := thinkingProfileFor(run.ThinkingMode)
 	_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"research": map[string]any{"mode": run.ResearchMode, "query": clipText(lastUserText, 500)}, "thinking": map[string]any{"mode": run.ThinkingMode, "reasoningBudget": profile.ReasoningBudget}})
 	payload := map[string]any{"model": session.ModelAlias, "researchMode": run.ResearchMode, "thinkingMode": run.ThinkingMode, "messages": payloadMessages, "attachmentIds": attachmentIDs, "stream": false}
+	invoke := func(body []byte) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat", bytes.NewReader(body)).WithContext(ctx)
+		req.Header.Set("x-daiki-chat-run-id", run.ID)
+		req = req.WithContext(context.WithValue(req.Context(), claimsKey, identity.Claims))
+		req = req.WithContext(context.WithValue(req.Context(), appUserKey, identity.User))
+		req = req.WithContext(context.WithValue(req.Context(), principalKey, identity.Principal))
+		rr := httptest.NewRecorder()
+		a.proxyLiteLLM(rr, req, "/v1/chat/completions", false)
+		return rr
+	}
 	raw, _ := json.Marshal(payload)
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat", bytes.NewReader(raw)).WithContext(ctx)
-	req.Header.Set("x-daiki-chat-run-id", run.ID)
-	req = req.WithContext(context.WithValue(req.Context(), claimsKey, identity.Claims))
-	req = req.WithContext(context.WithValue(req.Context(), appUserKey, identity.User))
-	req = req.WithContext(context.WithValue(req.Context(), principalKey, identity.Principal))
-	rr := httptest.NewRecorder()
-	a.proxyLiteLLM(rr, req, "/v1/chat/completions", false)
+	rr := invoke(raw)
+	if rr.Code == http.StatusBadRequest && unexpectedBlockedToolCall(rr.Body.Bytes()) {
+		// Groq documents that some reasoning models may still try to call a tool
+		// when tool_choice is none. Retry once with stronger textual steering.
+		payloadMessages = append([]map[string]any{{"role": "system", "content": "PROVIDER COMPATIBILITY: Answer this request using normal text only. Do not call, invoke, request, or emit any tool/function. Do not use provider-native browser_search or code_interpreter. If a calculation is needed, estimate it from the supplied context and state assumptions."}}, payloadMessages...)
+		payload["messages"] = payloadMessages
+		raw, _ = json.Marshal(payload)
+		_ = a.store.UpdateChatRunActivity(context.Background(), run.ID, map[string]any{"providerCompatibilityRetry": "unexpected_tool_call"})
+		rr = invoke(raw)
+	}
 	requestID := rr.Header().Get("x-daiki-request-id")
 	latest, _ := a.store.ChatRun(context.Background(), run.OwnerSubject, run.ID)
 	if latest.Status == "paused" || latest.Status == "cancelled" {
@@ -211,7 +224,7 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 			RetryAfterSeconds int           `json:"retryAfterSeconds"`
 		}
 		_ = json.Unmarshal(rr.Body.Bytes(), &e)
-		msg := strings.TrimSpace(fmt.Sprint(e.Error))
+		msg := chatRunErrorMessage(e.Error)
 		if msg == "" || msg == "<nil>" {
 			msg = "inference failed"
 		}
@@ -254,6 +267,33 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 	}
 	_, err = a.store.CompleteChatRun(context.Background(), run.OwnerSubject, run.ID, requestID, answer, activity)
 	return err
+}
+
+func unexpectedBlockedToolCall(body []byte) bool {
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "tool choice is none") &&
+		(strings.Contains(text, "model called a tool") || strings.Contains(text, "called a tool"))
+}
+
+func chatRunErrorMessage(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]any:
+		for _, key := range []string{"message", "detail", "error"} {
+			if text := chatRunErrorMessage(v[key]); text != "" {
+				return text
+			}
+		}
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+	case nil:
+		return ""
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+	return ""
 }
 
 func (a *app) failBackgroundRun(run store.ChatRun, started time.Time, message, requestID string) error {
