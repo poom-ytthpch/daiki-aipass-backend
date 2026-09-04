@@ -141,6 +141,71 @@ func (a *app) userQuotaWindow(ctx context.Context, subject string, p store.Polic
 	return start, reset, status, nil
 }
 
+func (a *app) clearUserQuotaRuntimeState(ctx context.Context, subject string) {
+	if a.redis == nil || strings.TrimSpace(subject) == "" {
+		return
+	}
+	_ = a.redis.Del(ctx,
+		"quota:pending:user:"+subject,
+		"quota:blocked:user:"+subject,
+		"pending-chat:hour:"+subject,
+		"pending-chat:last:"+subject,
+	).Err()
+}
+
+func (a *app) effectiveUserQuota(ctx context.Context, subject string) (store.Policy, bool, error) {
+	override, configured, err := a.store.UserPolicyOverride(ctx, subject)
+	if err != nil {
+		return store.Policy{}, false, err
+	}
+	if configured {
+		return override, true, nil
+	}
+	u, err := a.store.User(ctx, subject)
+	if err != nil {
+		return store.Policy{}, false, err
+	}
+	if u.Status == "pending" {
+		return a.pendingQuotaPolicy(), false, nil
+	}
+	p, _, err := a.store.PolicyForUser(ctx, subject, u.Roles)
+	return p, false, err
+}
+
+func (a *app) userQuotaSnapshot(ctx context.Context, subject string) (quotaDecision, store.Policy, store.Usage, error) {
+	p, _, err := a.effectiveUserQuota(ctx, subject)
+	if err != nil {
+		return quotaDecision{}, store.Policy{}, store.Usage{}, err
+	}
+	if p.QuotaMode == "" {
+		p.QuotaMode = "unlimited"
+	}
+	if p.IntervalKind == "" {
+		p.IntervalKind = "lifetime"
+	}
+	d := quotaDecision{Mode: p.QuotaMode, Limit: p.TokenLimit, Interval: p.IntervalKind, CounterKey: "user:" + subject}
+	start, reset, resetStatus, err := a.userQuotaWindow(ctx, subject, p, time.Now().UTC())
+	if err != nil {
+		return quotaDecision{}, p, store.Usage{}, err
+	}
+	u, err := a.store.UsageSummaryForUser(ctx, subject, start)
+	if err != nil {
+		return quotaDecision{}, p, store.Usage{}, err
+	}
+	d.Used = u.TotalTokens
+	d.ResetAt = reset
+	d.WindowStart = &start
+	d.ResetCredits = &resetStatus
+	if p.QuotaMode != "unlimited" && p.TokenLimit != nil {
+		remaining := *p.TokenLimit - u.TotalTokens
+		if remaining < 0 {
+			remaining = 0
+		}
+		d.Remaining = &remaining
+	}
+	return d, p, u, nil
+}
+
 func policyAllowsModel(p store.Policy, alias string) bool {
 	if len(p.AllowedModels) == 0 {
 		return true
@@ -433,24 +498,16 @@ func (a *app) adminUserQuota(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		start, reset, resetStatus, windowErr := a.userQuotaWindow(r.Context(), subject, effective, time.Now().UTC())
-		if windowErr != nil {
-			writeJSON(w, 500, map[string]string{"error": "quota reset status unavailable"})
-			return
-		}
-		usage, usageErr := a.store.UsageSummaryForUser(r.Context(), subject, start)
-		if usageErr != nil {
+		decision, _, usage, snapErr := a.userQuotaSnapshot(r.Context(), subject)
+		if snapErr != nil {
 			writeJSON(w, 500, map[string]string{"error": "quota usage unavailable"})
 			return
 		}
 		remaining := int64(0)
-		if effective.TokenLimit != nil {
-			remaining = *effective.TokenLimit - usage.TotalTokens
-			if remaining < 0 {
-				remaining = 0
-			}
+		if decision.Remaining != nil {
+			remaining = *decision.Remaining
 		}
-		writeJSON(w, 200, map[string]any{"policy": override, "override": override, "effective": effective, "configured": configured, "usage": usage, "remaining": remaining, "resetAt": reset, "windowStart": start, "resetCredits": resetStatus})
+		writeJSON(w, 200, map[string]any{"policy": override, "override": override, "effective": effective, "configured": configured, "usage": usage, "remaining": remaining, "resetAt": decision.ResetAt, "windowStart": decision.WindowStart, "resetCredits": decision.ResetCredits})
 		return
 	}
 	var p store.Policy
@@ -756,10 +813,13 @@ func (a *app) useQuotaReset(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if a.redis != nil {
-		_ = a.redis.Del(r.Context(), "quota:pending:user:"+current(r).Sub, "quota:blocked:user:"+current(r).Sub).Err()
+	a.clearUserQuotaRuntimeState(r.Context(), current(r).Sub)
+	decision, _, usage, snapErr := a.userQuotaSnapshot(r.Context(), current(r).Sub)
+	if snapErr != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"reset": event})
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"reset": event})
+	writeJSON(w, http.StatusOK, map[string]any{"reset": event, "usage": usage, "quota": decision})
 }
 
 func (a *app) adminGrantUserQuotaResets(w http.ResponseWriter, r *http.Request) {
@@ -800,8 +860,11 @@ func (a *app) adminResetUserQuota(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if a.redis != nil {
-		_ = a.redis.Del(r.Context(), "quota:pending:user:"+subject, "quota:blocked:user:"+subject).Err()
+	a.clearUserQuotaRuntimeState(r.Context(), subject)
+	decision, _, usage, snapErr := a.userQuotaSnapshot(r.Context(), subject)
+	if snapErr != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"reset": event})
+		return
 	}
-	writeJSON(w, http.StatusOK, event)
+	writeJSON(w, http.StatusOK, map[string]any{"reset": event, "usage": usage, "quota": decision})
 }
