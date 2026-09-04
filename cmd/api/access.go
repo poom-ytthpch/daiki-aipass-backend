@@ -405,7 +405,20 @@ func (a *app) adminUserQuota(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		writeJSON(w, 200, map[string]any{"policy": override, "override": override, "effective": effective, "configured": configured})
+		start, reset := quotaWindow(effective, time.Now().UTC())
+		usage, usageErr := a.store.UsageSummaryForUser(r.Context(), subject, start)
+		if usageErr != nil {
+			writeJSON(w, 500, map[string]string{"error": "quota usage unavailable"})
+			return
+		}
+		remaining := int64(0)
+		if effective.TokenLimit != nil {
+			remaining = *effective.TokenLimit - usage.TotalTokens
+			if remaining < 0 {
+				remaining = 0
+			}
+		}
+		writeJSON(w, 200, map[string]any{"policy": override, "override": override, "effective": effective, "configured": configured, "usage": usage, "remaining": remaining, "resetAt": reset})
 		return
 	}
 	var p store.Policy

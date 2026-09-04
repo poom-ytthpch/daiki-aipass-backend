@@ -206,13 +206,23 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 	}
 	if rr.Code < 200 || rr.Code >= 300 {
 		var e struct {
-			Error any `json:"error"`
+			Error             any           `json:"error"`
+			Quota             quotaDecision `json:"quota"`
+			RetryAfterSeconds int           `json:"retryAfterSeconds"`
 		}
 		_ = json.Unmarshal(rr.Body.Bytes(), &e)
 		msg := strings.TrimSpace(fmt.Sprint(e.Error))
 		if msg == "" || msg == "<nil>" {
 			msg = "inference failed"
 		}
+		patch := map[string]any{"httpStatus": rr.Code}
+		if e.Quota.Mode != "" {
+			patch["quota"] = e.Quota
+		}
+		if e.RetryAfterSeconds > 0 {
+			patch["retryAfterSeconds"] = e.RetryAfterSeconds
+		}
+		_ = a.store.UpdateChatRunActivity(context.Background(), run.ID, patch)
 		return a.failBackgroundRun(run, started, msg, requestID)
 	}
 	var out struct {

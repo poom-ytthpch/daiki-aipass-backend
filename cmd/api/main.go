@@ -230,6 +230,7 @@ func main() {
 			r.Group(func(r chi.Router) {
 				r.Use(a.chatAccess)
 				r.Use(requirePrincipalScope("inference"))
+				r.Get("/usage", a.usage)
 				r.Post("/chat", a.chat)
 				r.Post("/chat/stream", a.chatStream)
 				r.Post("/chat-sessions/{id}/runs", a.startChatRun)
@@ -238,7 +239,6 @@ func main() {
 				r.Use(a.approvalRequired)
 				r.Use(requirePrincipalScope("inference"))
 				r.Get("/models", a.models)
-				r.Get("/usage", a.usage)
 			})
 		})
 	})
