@@ -162,7 +162,7 @@ CREATE INDEX IF NOT EXISTS password_reset_tokens_expiry_idx ON password_reset_to
 CREATE TABLE IF NOT EXISTS model_providers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    provider_type TEXT NOT NULL CHECK (provider_type IN ('vllm','lmstudio','ollama')),
+    provider_type TEXT NOT NULL CHECK (provider_type IN ('vllm','lmstudio','ollama','openai-compatible','anthropic','gemini')),
     base_url TEXT NOT NULL,
     encrypted_api_key TEXT NOT NULL DEFAULT '',
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -173,6 +173,23 @@ CREATE TABLE IF NOT EXISTS model_providers (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+DO $$
+DECLARE
+    constraint_name TEXT;
+BEGIN
+    SELECT conname INTO constraint_name
+    FROM pg_constraint
+    WHERE conrelid='model_providers'::regclass AND contype='c'
+      AND pg_get_constraintdef(oid) ILIKE '%provider_type%';
+    IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE model_providers DROP CONSTRAINT %I', constraint_name);
+    END IF;
+    ALTER TABLE model_providers
+        ADD CONSTRAINT model_providers_provider_type_check
+        CHECK (provider_type IN ('vllm','lmstudio','ollama','openai-compatible','anthropic','gemini'));
+EXCEPTION WHEN duplicate_object THEN
+    NULL;
+END $$;
 CREATE TABLE IF NOT EXISTS provider_models (
     id TEXT PRIMARY KEY,
     provider_id TEXT NOT NULL REFERENCES model_providers(id) ON DELETE CASCADE,

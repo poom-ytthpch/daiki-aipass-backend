@@ -32,8 +32,39 @@ type discoveredModel struct {
 func normalizeProviderType(v string) string {
 	v = strings.ToLower(strings.TrimSpace(v))
 	switch v {
-	case "vllm", "lmstudio", "ollama":
+	case "vllm", "lmstudio", "ollama", "anthropic", "gemini":
 		return v
+	case "openai-compatible", "openai_compatible", "openai", "groq", "openrouter", "together", "together-ai", "fireworks", "deepinfra", "xai", "mistral", "cerebras", "custom":
+		return "openai-compatible"
+	default:
+		return ""
+	}
+}
+
+func providerTypeDefaultBase(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "openai":
+		return "https://api.openai.com/v1"
+	case "groq":
+		return "https://api.groq.com/openai/v1"
+	case "openrouter":
+		return "https://openrouter.ai/api/v1"
+	case "together", "together-ai":
+		return "https://api.together.xyz/v1"
+	case "fireworks":
+		return "https://api.fireworks.ai/inference/v1"
+	case "deepinfra":
+		return "https://api.deepinfra.com/v1/openai"
+	case "xai":
+		return "https://api.x.ai/v1"
+	case "mistral":
+		return "https://api.mistral.ai/v1"
+	case "cerebras":
+		return "https://api.cerebras.ai/v1"
+	case "anthropic":
+		return "https://api.anthropic.com"
+	case "gemini":
+		return "https://generativelanguage.googleapis.com/v1beta"
 	default:
 		return ""
 	}
@@ -68,29 +99,55 @@ func normalizeProviderBase(providerType, raw string) (string, error) {
 
 func providerDiscoveryURL(p store.ModelProvider) string {
 	base := strings.TrimRight(p.BaseURL, "/")
-	if p.ProviderType == "ollama" {
+	switch p.ProviderType {
+	case "ollama":
 		return base + "/api/tags"
+	case "anthropic":
+		if strings.HasSuffix(base, "/v1") {
+			return base + "/models"
+		}
+		return base + "/v1/models"
+	case "gemini", "openai-compatible":
+		return providerLiteLLMBase(p) + "/models"
+	default:
+		if strings.HasSuffix(base, "/v1") {
+			return base + "/models"
+		}
+		return base + "/v1/models"
 	}
-	if strings.HasSuffix(base, "/v1") {
-		return base + "/models"
-	}
-	return base + "/v1/models"
 }
 func providerLiteLLMBase(p store.ModelProvider) string {
 	base := strings.TrimRight(p.BaseURL, "/")
-	if p.ProviderType == "ollama" {
+	switch p.ProviderType {
+	case "ollama":
 		return strings.TrimSuffix(base, "/v1")
-	}
-	if strings.HasSuffix(base, "/v1") {
+	case "openai-compatible":
+		u, err := url.Parse(base)
+		if err == nil && strings.Trim(u.Path, "/") != "" {
+			return base
+		}
+		return base + "/v1"
+	case "gemini", "anthropic":
 		return base
+	default:
+		if strings.HasSuffix(base, "/v1") {
+			return base
+		}
+		return base + "/v1"
 	}
-	return base + "/v1"
 }
 func providerLiteLLMModel(p store.ModelProvider, upstream string) string {
-	if p.ProviderType == "ollama" {
+	upstream = strings.TrimPrefix(strings.TrimSpace(upstream), "models/")
+	switch p.ProviderType {
+	case "ollama":
 		return "ollama/" + upstream
+	case "anthropic":
+		return "anthropic/" + upstream
+	case "gemini":
+		return "gemini/" + upstream
+	default:
+		return "openai/" + upstream
 	}
-	return "openai/" + upstream
 }
 
 func (a *app) providerAPIKey(p store.ModelProvider) (string, error) {
@@ -153,7 +210,15 @@ func (a *app) discoverProvider(ctx context.Context, p store.ModelProvider) ([]di
 		return nil, 0, err
 	}
 	if apiKey != "" {
-		req.Header.Set("authorization", "Bearer "+apiKey)
+		switch p.ProviderType {
+		case "anthropic":
+			req.Header.Set("x-api-key", apiKey)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		case "gemini":
+			req.Header.Set("x-goog-api-key", apiKey)
+		default:
+			req.Header.Set("authorization", "Bearer "+apiKey)
+		}
 	}
 	started := time.Now()
 	resp, err := client.Do(req)
@@ -179,6 +244,21 @@ func (a *app) discoverProvider(ctx context.Context, p store.ModelProvider) ([]di
 		}
 		for _, m := range payload.Models {
 			id := first(m.Model, m.Name)
+			if id != "" {
+				out = append(out, discoveredModel{ID: id})
+			}
+		}
+	} else if p.ProviderType == "gemini" {
+		var payload struct {
+			Models []struct {
+				Name string `json:"name"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
+			return nil, latency, err
+		}
+		for _, m := range payload.Models {
+			id := strings.TrimPrefix(strings.TrimSpace(m.Name), "models/")
 			if id != "" {
 				out = append(out, discoveredModel{ID: id})
 			}
@@ -232,12 +312,17 @@ func (a *app) adminSaveModelProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "invalid provider payload"})
 		return
 	}
-	typ := normalizeProviderType(in.ProviderType)
+	rawType := strings.ToLower(strings.TrimSpace(in.ProviderType))
+	typ := normalizeProviderType(rawType)
 	if typ == "" {
-		writeJSON(w, 400, map[string]string{"error": "providerType must be vllm, lmstudio, or ollama"})
+		writeJSON(w, 400, map[string]string{"error": "providerType must be vllm, lmstudio, ollama, openai-compatible, anthropic, or gemini"})
 		return
 	}
-	base, err := normalizeProviderBase(typ, in.BaseURL)
+	rawBase := strings.TrimSpace(in.BaseURL)
+	if rawBase == "" {
+		rawBase = providerTypeDefaultBase(rawType)
+	}
+	base, err := normalizeProviderBase(typ, rawBase)
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
@@ -350,7 +435,10 @@ func (a *app) providerLiteLLMParams(p store.ModelProvider, upstream string) (map
 	if err != nil {
 		return nil, err
 	}
-	params := map[string]any{"model": providerLiteLLMModel(p, upstream), "api_base": providerLiteLLMBase(p), "timeout": 300}
+	params := map[string]any{"model": providerLiteLLMModel(p, upstream), "timeout": 300}
+	if p.ProviderType != "anthropic" && p.ProviderType != "gemini" {
+		params["api_base"] = providerLiteLLMBase(p)
+	}
 	if providerKey != "" {
 		params["api_key"] = providerKey
 	} else if p.ProviderType != "ollama" {
