@@ -1,0 +1,45 @@
+package store
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestNormalizePolicyParallelQuotaAndHourResetCount(t *testing.T) {
+	weekly := int64(10_000_000)
+	p, err := normalizePolicy(Policy{
+		QuotaMode:     "limited",
+		TokenLimit:    &weekly,
+		IntervalKind:  "week",
+		IntervalCount: 9,
+		ParallelLimits: json.RawMessage(`[
+			{"id":"client-value-is-ignored","tokenLimit":10000,"intervalKind":"hour","intervalCount":3}
+		]`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.IntervalCount != 1 {
+		t.Fatalf("non-hour primary reset count should normalize to 1, got %d", p.IntervalCount)
+	}
+	var limits []QuotaLimit
+	if err := json.Unmarshal(p.ParallelLimits, &limits); err != nil {
+		t.Fatal(err)
+	}
+	if len(limits) != 1 || limits[0].ID != "parallel-1" || limits[0].TokenLimit != 10_000 || limits[0].IntervalKind != "hour" || limits[0].IntervalCount != 3 {
+		t.Fatalf("unexpected normalized limits %#v", limits)
+	}
+}
+
+func TestNormalizePolicyRejectsTooManyParallelLimits(t *testing.T) {
+	limit := int64(100)
+	rows := make([]QuotaLimit, 9)
+	for i := range rows {
+		rows[i] = QuotaLimit{TokenLimit: 10, IntervalKind: "hour", IntervalCount: 1}
+	}
+	raw, _ := json.Marshal(rows)
+	_, err := normalizePolicy(Policy{QuotaMode: "limited", TokenLimit: &limit, IntervalKind: "week", ParallelLimits: raw})
+	if err == nil {
+		t.Fatal("expected parallel limit count validation error")
+	}
+}

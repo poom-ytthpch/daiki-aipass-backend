@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS entitlement_policies (
     quota_mode TEXT NOT NULL DEFAULT 'unlimited' CHECK (quota_mode IN ('unlimited','limited')),
     token_limit BIGINT CHECK (token_limit IS NULL OR token_limit >= 0),
     interval_kind TEXT NOT NULL DEFAULT 'lifetime' CHECK (interval_kind IN ('hour','day','week','month','rolling','custom','lifetime')),
+	interval_count INTEGER NOT NULL DEFAULT 1 CHECK (interval_count > 0),
     interval_seconds BIGINT CHECK (interval_seconds IS NULL OR interval_seconds > 0),
+	parallel_limits JSONB NOT NULL DEFAULT '[]'::jsonb,
     priority INTEGER NOT NULL DEFAULT 0,
     allowed_models JSONB NOT NULL DEFAULT '[]'::jsonb,
     concurrency_limit INTEGER,
@@ -48,6 +50,8 @@ CREATE TABLE IF NOT EXISTS entitlement_policies (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (scope_type, scope_id)
 );
+ALTER TABLE entitlement_policies ADD COLUMN IF NOT EXISTS interval_count INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE entitlement_policies ADD COLUMN IF NOT EXISTS parallel_limits JSONB NOT NULL DEFAULT '[]'::jsonb;
 CREATE INDEX IF NOT EXISTS entitlement_policies_active_idx ON entitlement_policies (scope_type, scope_id, effective_from, expires_at);
 
 CREATE TABLE IF NOT EXISTS quota_grants (

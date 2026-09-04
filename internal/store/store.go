@@ -38,11 +38,21 @@ type Policy struct {
 	QuotaMode       string          `json:"quotaMode"`
 	TokenLimit      *int64          `json:"tokenLimit,omitempty"`
 	IntervalKind    string          `json:"intervalKind"`
+	IntervalCount   int             `json:"intervalCount,omitempty"`
 	IntervalSeconds *int64          `json:"intervalSeconds,omitempty"`
+	ParallelLimits  json.RawMessage `json:"parallelLimits,omitempty"`
 	Priority        int             `json:"priority"`
 	AllowedModels   json.RawMessage `json:"allowedModels"`
 	EffectiveFrom   time.Time       `json:"effectiveFrom"`
 	ExpiresAt       *time.Time      `json:"expiresAt,omitempty"`
+}
+
+type QuotaLimit struct {
+	ID              string `json:"id,omitempty"`
+	TokenLimit      int64  `json:"tokenLimit"`
+	IntervalKind    string `json:"intervalKind"`
+	IntervalCount   int    `json:"intervalCount,omitempty"`
+	IntervalSeconds *int64 `json:"intervalSeconds,omitempty"`
 }
 
 type Usage struct {
@@ -172,10 +182,83 @@ func (s *Store) SetUserStatus(ctx context.Context, actor, subject, status string
 	_, _ = s.DB.Exec(ctx, `INSERT INTO access_audit_log(actor_subject,action,target_type,target_id,old_value,new_value) VALUES($1,'user.status.update','user',$2,$3,$4)`, actor, subject, oldJSON, newJSON)
 	return u, nil
 }
-func (s *Store) UserPolicyOverride(ctx context.Context, subject string) (Policy, bool, error) {
-	row := s.DB.QueryRow(ctx, `SELECT id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_seconds,priority,allowed_models,effective_from,expires_at FROM entitlement_policies WHERE effective_from<=now() AND (expires_at IS NULL OR expires_at>now()) AND scope_type='user' AND scope_id=$1 ORDER BY priority DESC,id DESC LIMIT 1`, subject)
+
+const policyColumns = `id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_count,interval_seconds,parallel_limits,priority,allowed_models,effective_from,expires_at`
+
+func scanPolicy(row pgx.Row) (Policy, error) {
 	var p Policy
-	err := row.Scan(&p.ID, &p.ScopeType, &p.ScopeID, &p.QuotaMode, &p.TokenLimit, &p.IntervalKind, &p.IntervalSeconds, &p.Priority, &p.AllowedModels, &p.EffectiveFrom, &p.ExpiresAt)
+	err := row.Scan(&p.ID, &p.ScopeType, &p.ScopeID, &p.QuotaMode, &p.TokenLimit, &p.IntervalKind, &p.IntervalCount, &p.IntervalSeconds, &p.ParallelLimits, &p.Priority, &p.AllowedModels, &p.EffectiveFrom, &p.ExpiresAt)
+	return p, err
+}
+
+func normalizeQuotaInterval(kind string, count int, seconds *int64) (string, int, error) {
+	if kind == "" {
+		kind = "lifetime"
+	}
+	switch kind {
+	case "hour", "day", "week", "month", "rolling", "custom", "lifetime":
+	default:
+		return "", 0, errors.New("invalid intervalKind")
+	}
+	if count <= 0 {
+		count = 1
+	}
+	if count > 8760 {
+		return "", 0, errors.New("intervalCount is too large")
+	}
+	if kind != "hour" {
+		count = 1
+	}
+	if (kind == "rolling" || kind == "custom") && (seconds == nil || *seconds <= 0) {
+		return "", 0, errors.New("rolling/custom interval requires intervalSeconds")
+	}
+	return kind, count, nil
+}
+
+func normalizePolicy(p Policy) (Policy, error) {
+	if p.QuotaMode != "unlimited" && p.QuotaMode != "limited" {
+		return Policy{}, errors.New("quotaMode must be unlimited or limited")
+	}
+	if p.QuotaMode == "limited" && (p.TokenLimit == nil || *p.TokenLimit < 0) {
+		return Policy{}, errors.New("limited quota requires tokenLimit")
+	}
+	var err error
+	p.IntervalKind, p.IntervalCount, err = normalizeQuotaInterval(p.IntervalKind, p.IntervalCount, p.IntervalSeconds)
+	if err != nil {
+		return Policy{}, err
+	}
+	if len(p.AllowedModels) == 0 {
+		p.AllowedModels = json.RawMessage(`[]`)
+	}
+	if p.QuotaMode == "unlimited" {
+		p.ParallelLimits = json.RawMessage(`[]`)
+		return p, nil
+	}
+	var limits []QuotaLimit
+	if len(p.ParallelLimits) > 0 {
+		if err := json.Unmarshal(p.ParallelLimits, &limits); err != nil {
+			return Policy{}, errors.New("parallelLimits must be an array")
+		}
+	}
+	if len(limits) > 8 {
+		return Policy{}, errors.New("parallelLimits supports at most 8 limits")
+	}
+	for i := range limits {
+		if limits[i].TokenLimit < 0 {
+			return Policy{}, errors.New("parallel tokenLimit must be >= 0")
+		}
+		limits[i].IntervalKind, limits[i].IntervalCount, err = normalizeQuotaInterval(limits[i].IntervalKind, limits[i].IntervalCount, limits[i].IntervalSeconds)
+		if err != nil {
+			return Policy{}, fmt.Errorf("parallel limit %d: %w", i+1, err)
+		}
+		limits[i].ID = fmt.Sprintf("parallel-%d", i+1)
+	}
+	p.ParallelLimits, _ = json.Marshal(limits)
+	return p, nil
+}
+
+func (s *Store) UserPolicyOverride(ctx context.Context, subject string) (Policy, bool, error) {
+	p, err := scanPolicy(s.DB.QueryRow(ctx, `SELECT `+policyColumns+` FROM entitlement_policies WHERE effective_from<=now() AND (expires_at IS NULL OR expires_at>now()) AND scope_type='user' AND scope_id=$1 ORDER BY priority DESC,id DESC LIMIT 1`, subject))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Policy{}, false, nil
 	}
@@ -183,36 +266,19 @@ func (s *Store) UserPolicyOverride(ctx context.Context, subject string) (Policy,
 }
 
 func (s *Store) PolicyForUser(ctx context.Context, subject string, roles []string) (Policy, bool, error) {
-	row := s.DB.QueryRow(ctx, `SELECT id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_seconds,priority,allowed_models,effective_from,expires_at FROM entitlement_policies WHERE effective_from<=now() AND (expires_at IS NULL OR expires_at>now()) AND ((scope_type='user' AND scope_id=$1) OR (scope_type='role' AND scope_id=ANY($2)) OR (scope_type='system' AND scope_id='default')) ORDER BY CASE scope_type WHEN 'user' THEN 3 WHEN 'role' THEN 2 ELSE 1 END DESC,priority DESC,id DESC LIMIT 1`, subject, roles)
-	var p Policy
-	err := row.Scan(&p.ID, &p.ScopeType, &p.ScopeID, &p.QuotaMode, &p.TokenLimit, &p.IntervalKind, &p.IntervalSeconds, &p.Priority, &p.AllowedModels, &p.EffectiveFrom, &p.ExpiresAt)
+	p, err := scanPolicy(s.DB.QueryRow(ctx, `SELECT `+policyColumns+` FROM entitlement_policies WHERE effective_from<=now() AND (expires_at IS NULL OR expires_at>now()) AND ((scope_type='user' AND scope_id=$1) OR (scope_type='role' AND scope_id=ANY($2)) OR (scope_type='system' AND scope_id='default')) ORDER BY CASE scope_type WHEN 'user' THEN 3 WHEN 'role' THEN 2 ELSE 1 END DESC,priority DESC,id DESC LIMIT 1`, subject, roles))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Policy{QuotaMode: "unlimited", IntervalKind: "lifetime"}, false, nil
 	}
 	return p, err == nil, err
 }
 func (s *Store) UpsertUserPolicy(ctx context.Context, actor, subject string, p Policy) (Policy, error) {
-	if p.QuotaMode != "unlimited" && p.QuotaMode != "limited" {
-		return Policy{}, errors.New("quotaMode must be unlimited or limited")
+	p, err := normalizePolicy(p)
+	if err != nil {
+		return Policy{}, err
 	}
-	if p.QuotaMode == "limited" && (p.TokenLimit == nil || *p.TokenLimit < 0) {
-		return Policy{}, errors.New("limited quota requires tokenLimit")
-	}
-	if p.IntervalKind == "" {
-		p.IntervalKind = "lifetime"
-	}
-	if p.IntervalKind != "hour" && p.IntervalKind != "day" && p.IntervalKind != "week" && p.IntervalKind != "month" && p.IntervalKind != "rolling" && p.IntervalKind != "custom" && p.IntervalKind != "lifetime" {
-		return Policy{}, errors.New("invalid intervalKind")
-	}
-	if (p.IntervalKind == "rolling" || p.IntervalKind == "custom") && (p.IntervalSeconds == nil || *p.IntervalSeconds <= 0) {
-		return Policy{}, errors.New("rolling/custom interval requires intervalSeconds")
-	}
-	if len(p.AllowedModels) == 0 {
-		p.AllowedModels = json.RawMessage(`[]`)
-	}
-	row := s.DB.QueryRow(ctx, `INSERT INTO entitlement_policies(scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_seconds,priority,allowed_models,created_by) VALUES('user',$1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(scope_type,scope_id) DO UPDATE SET quota_mode=EXCLUDED.quota_mode,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_seconds=EXCLUDED.interval_seconds,priority=EXCLUDED.priority,allowed_models=EXCLUDED.allowed_models,updated_at=now() RETURNING id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_seconds,priority,allowed_models,effective_from,expires_at`, subject, p.QuotaMode, p.TokenLimit, p.IntervalKind, p.IntervalSeconds, p.Priority, p.AllowedModels, actor)
-	var out Policy
-	if err := row.Scan(&out.ID, &out.ScopeType, &out.ScopeID, &out.QuotaMode, &out.TokenLimit, &out.IntervalKind, &out.IntervalSeconds, &out.Priority, &out.AllowedModels, &out.EffectiveFrom, &out.ExpiresAt); err != nil {
+	out, err := scanPolicy(s.DB.QueryRow(ctx, `INSERT INTO entitlement_policies(scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_count,interval_seconds,parallel_limits,priority,allowed_models,created_by) VALUES('user',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(scope_type,scope_id) DO UPDATE SET quota_mode=EXCLUDED.quota_mode,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_count=EXCLUDED.interval_count,interval_seconds=EXCLUDED.interval_seconds,parallel_limits=EXCLUDED.parallel_limits,priority=EXCLUDED.priority,allowed_models=EXCLUDED.allowed_models,updated_at=now() RETURNING `+policyColumns, subject, p.QuotaMode, p.TokenLimit, p.IntervalKind, p.IntervalCount, p.IntervalSeconds, p.ParallelLimits, p.Priority, p.AllowedModels, actor))
+	if err != nil {
 		return Policy{}, err
 	}
 	newJSON, _ := json.Marshal(out)
@@ -299,9 +365,7 @@ func (s *Store) RevokeAPIKey(ctx context.Context, actor, id string) error {
 }
 
 func (s *Store) PolicyForPrincipal(ctx context.Context, subject, apiKeyID string, roles []string) (Policy, bool, error) {
-	row := s.DB.QueryRow(ctx, `SELECT id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_seconds,priority,allowed_models,effective_from,expires_at FROM entitlement_policies WHERE effective_from<=now() AND (expires_at IS NULL OR expires_at>now()) AND ((scope_type='api_key' AND scope_id=$2 AND $2<>'') OR (scope_type='user' AND scope_id=$1) OR (scope_type='role' AND scope_id=ANY($3)) OR (scope_type='system' AND scope_id='default')) ORDER BY CASE scope_type WHEN 'api_key' THEN 4 WHEN 'user' THEN 3 WHEN 'role' THEN 2 ELSE 1 END DESC,priority DESC,id DESC LIMIT 1`, subject, apiKeyID, roles)
-	var p Policy
-	err := row.Scan(&p.ID, &p.ScopeType, &p.ScopeID, &p.QuotaMode, &p.TokenLimit, &p.IntervalKind, &p.IntervalSeconds, &p.Priority, &p.AllowedModels, &p.EffectiveFrom, &p.ExpiresAt)
+	p, err := scanPolicy(s.DB.QueryRow(ctx, `SELECT `+policyColumns+` FROM entitlement_policies WHERE effective_from<=now() AND (expires_at IS NULL OR expires_at>now()) AND ((scope_type='api_key' AND scope_id=$2 AND $2<>'') OR (scope_type='user' AND scope_id=$1) OR (scope_type='role' AND scope_id=ANY($3)) OR (scope_type='system' AND scope_id='default')) ORDER BY CASE scope_type WHEN 'api_key' THEN 4 WHEN 'user' THEN 3 WHEN 'role' THEN 2 ELSE 1 END DESC,priority DESC,id DESC LIMIT 1`, subject, apiKeyID, roles))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Policy{QuotaMode: "unlimited", IntervalKind: "lifetime"}, false, nil
 	}
@@ -312,27 +376,12 @@ func (s *Store) UpsertPolicy(ctx context.Context, actor, scopeType, scopeID stri
 	if scopeType != "user" && scopeType != "api_key" && scopeType != "role" && scopeType != "workspace" && scopeType != "project" && scopeType != "plan" && scopeType != "system" {
 		return Policy{}, errors.New("invalid scopeType")
 	}
-	if p.QuotaMode != "unlimited" && p.QuotaMode != "limited" {
-		return Policy{}, errors.New("quotaMode must be unlimited or limited")
+	p, err := normalizePolicy(p)
+	if err != nil {
+		return Policy{}, err
 	}
-	if p.QuotaMode == "limited" && (p.TokenLimit == nil || *p.TokenLimit < 0) {
-		return Policy{}, errors.New("limited quota requires tokenLimit")
-	}
-	if p.IntervalKind == "" {
-		p.IntervalKind = "lifetime"
-	}
-	if p.IntervalKind != "hour" && p.IntervalKind != "day" && p.IntervalKind != "week" && p.IntervalKind != "month" && p.IntervalKind != "rolling" && p.IntervalKind != "custom" && p.IntervalKind != "lifetime" {
-		return Policy{}, errors.New("invalid intervalKind")
-	}
-	if (p.IntervalKind == "rolling" || p.IntervalKind == "custom") && (p.IntervalSeconds == nil || *p.IntervalSeconds <= 0) {
-		return Policy{}, errors.New("rolling/custom interval requires intervalSeconds")
-	}
-	if len(p.AllowedModels) == 0 {
-		p.AllowedModels = json.RawMessage(`[]`)
-	}
-	row := s.DB.QueryRow(ctx, `INSERT INTO entitlement_policies(scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_seconds,priority,allowed_models,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(scope_type,scope_id) DO UPDATE SET quota_mode=EXCLUDED.quota_mode,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_seconds=EXCLUDED.interval_seconds,priority=EXCLUDED.priority,allowed_models=EXCLUDED.allowed_models,updated_at=now() RETURNING id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_seconds,priority,allowed_models,effective_from,expires_at`, scopeType, scopeID, p.QuotaMode, p.TokenLimit, p.IntervalKind, p.IntervalSeconds, p.Priority, p.AllowedModels, actor)
-	var out Policy
-	if err := row.Scan(&out.ID, &out.ScopeType, &out.ScopeID, &out.QuotaMode, &out.TokenLimit, &out.IntervalKind, &out.IntervalSeconds, &out.Priority, &out.AllowedModels, &out.EffectiveFrom, &out.ExpiresAt); err != nil {
+	out, err := scanPolicy(s.DB.QueryRow(ctx, `INSERT INTO entitlement_policies(scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_count,interval_seconds,parallel_limits,priority,allowed_models,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(scope_type,scope_id) DO UPDATE SET quota_mode=EXCLUDED.quota_mode,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_count=EXCLUDED.interval_count,interval_seconds=EXCLUDED.interval_seconds,parallel_limits=EXCLUDED.parallel_limits,priority=EXCLUDED.priority,allowed_models=EXCLUDED.allowed_models,updated_at=now() RETURNING `+policyColumns, scopeType, scopeID, p.QuotaMode, p.TokenLimit, p.IntervalKind, p.IntervalCount, p.IntervalSeconds, p.ParallelLimits, p.Priority, p.AllowedModels, actor))
+	if err != nil {
 		return Policy{}, err
 	}
 	newJSON, _ := json.Marshal(out)

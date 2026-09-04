@@ -23,16 +23,41 @@ type principal struct {
 	Scopes   []string
 }
 
+type quotaLimitDecision struct {
+	ID            string     `json:"id"`
+	Primary       bool       `json:"primary,omitempty"`
+	Limit         int64      `json:"limit"`
+	Used          int64      `json:"used"`
+	Remaining     int64      `json:"remaining"`
+	ResetAt       *time.Time `json:"resetAt,omitempty"`
+	Interval      string     `json:"interval"`
+	IntervalCount int        `json:"intervalCount,omitempty"`
+	WindowStart   time.Time  `json:"windowStart"`
+}
+
 type quotaDecision struct {
-	CounterKey   string                  `json:"-"`
-	Mode         string                  `json:"mode"`
-	Limit        *int64                  `json:"limit,omitempty"`
-	Used         int64                   `json:"used"`
-	Remaining    *int64                  `json:"remaining,omitempty"`
-	ResetAt      *time.Time              `json:"resetAt,omitempty"`
-	Interval     string                  `json:"interval"`
-	WindowStart  *time.Time              `json:"windowStart,omitempty"`
-	ResetCredits *store.QuotaResetStatus `json:"resetCredits,omitempty"`
+	CounterKey      string                  `json:"-"`
+	Mode            string                  `json:"mode"`
+	Limit           *int64                  `json:"limit,omitempty"`
+	Used            int64                   `json:"used"`
+	Remaining       *int64                  `json:"remaining,omitempty"`
+	ResetAt         *time.Time              `json:"resetAt,omitempty"`
+	Interval        string                  `json:"interval"`
+	IntervalCount   int                     `json:"intervalCount,omitempty"`
+	WindowStart     *time.Time              `json:"windowStart,omitempty"`
+	Blocked         bool                    `json:"blocked"`
+	BlockingLimitID string                  `json:"blockingLimitId,omitempty"`
+	Limits          []quotaLimitDecision    `json:"limits,omitempty"`
+	ResetCredits    *store.QuotaResetStatus `json:"resetCredits,omitempty"`
+}
+
+type quotaSpec struct {
+	ID              string
+	Primary         bool
+	Limit           int64
+	IntervalKind    string
+	IntervalCount   int
+	IntervalSeconds *int64
 }
 
 func currentUser(r *http.Request) (store.User, bool) {
@@ -93,35 +118,39 @@ func (a *app) approvalRequired(next http.Handler) http.Handler {
 	})
 }
 
-func quotaWindow(p store.Policy, now time.Time) (time.Time, *time.Time) {
+func quotaWindowSpec(kind string, count int, seconds *int64, now time.Time) (time.Time, *time.Time) {
 	var start time.Time
 	var reset *time.Time
-	switch p.IntervalKind {
+	if count <= 0 {
+		count = 1
+	}
+	switch kind {
 	case "hour":
-		start = now.Truncate(time.Hour)
-		r := start.Add(time.Hour)
+		span := time.Duration(count) * time.Hour
+		start = now.Truncate(span)
+		r := start.Add(span)
 		reset = &r
 	case "day":
 		start = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-		r := start.AddDate(0, 0, 1)
+		r := start.AddDate(0, 0, count)
 		reset = &r
 	case "week":
 		d := (int(now.Weekday()) + 6) % 7
 		base := now.AddDate(0, 0, -d)
 		start = time.Date(base.Year(), base.Month(), base.Day(), 0, 0, 0, 0, time.UTC)
-		r := start.AddDate(0, 0, 7)
+		r := start.AddDate(0, 0, 7*count)
 		reset = &r
 	case "month":
 		start = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-		r := start.AddDate(0, 1, 0)
+		r := start.AddDate(0, count, 0)
 		reset = &r
 	case "rolling", "custom":
-		seconds := int64(3600)
-		if p.IntervalSeconds != nil {
-			seconds = *p.IntervalSeconds
+		windowSeconds := int64(3600)
+		if seconds != nil {
+			windowSeconds = *seconds
 		}
-		start = now.Add(-time.Duration(seconds) * time.Second)
-		r := now.Add(time.Duration(seconds) * time.Second)
+		start = now.Add(-time.Duration(windowSeconds) * time.Second)
+		r := now.Add(time.Duration(windowSeconds) * time.Second)
 		reset = &r
 	default:
 		start = time.Unix(0, 0).UTC()
@@ -129,21 +158,51 @@ func quotaWindow(p store.Policy, now time.Time) (time.Time, *time.Time) {
 	return start, reset
 }
 
-func (a *app) userQuotaWindow(ctx context.Context, subject string, p store.Policy, now time.Time) (time.Time, *time.Time, store.QuotaResetStatus, error) {
-	start, reset := quotaWindow(p, now)
-	status, err := a.store.QuotaResetStatus(ctx, subject)
-	if err != nil {
-		return start, reset, status, err
+func quotaWindow(p store.Policy, now time.Time) (time.Time, *time.Time) {
+	return quotaWindowSpec(p.IntervalKind, p.IntervalCount, p.IntervalSeconds, now)
+}
+
+func policyQuotaSpecs(p store.Policy) ([]quotaSpec, error) {
+	if p.QuotaMode == "unlimited" || p.TokenLimit == nil {
+		return nil, nil
 	}
-	if status.LastResetAt != nil && status.LastResetAt.After(start) && !status.LastResetAt.After(now) {
-		start = *status.LastResetAt
+	specs := []quotaSpec{{ID: "primary", Primary: true, Limit: *p.TokenLimit, IntervalKind: p.IntervalKind, IntervalCount: p.IntervalCount, IntervalSeconds: p.IntervalSeconds}}
+	if len(p.ParallelLimits) == 0 {
+		return specs, nil
 	}
-	return start, reset, status, nil
+	var parallel []store.QuotaLimit
+	if err := json.Unmarshal(p.ParallelLimits, &parallel); err != nil {
+		return nil, fmt.Errorf("invalid parallel quota limits: %w", err)
+	}
+	for i, limit := range parallel {
+		id := strings.TrimSpace(limit.ID)
+		if id == "" {
+			id = fmt.Sprintf("parallel-%d", i+1)
+		}
+		specs = append(specs, quotaSpec{ID: id, Limit: limit.TokenLimit, IntervalKind: limit.IntervalKind, IntervalCount: limit.IntervalCount, IntervalSeconds: limit.IntervalSeconds})
+	}
+	return specs, nil
 }
 
 func (a *app) clearUserQuotaRuntimeState(ctx context.Context, subject string) {
 	if a.redis == nil || strings.TrimSpace(subject) == "" {
 		return
+	}
+	for _, pattern := range []string{"quota:pending:user:" + subject + ":*", "quota:reservation:user:" + subject + ":*"} {
+		var cursor uint64
+		for {
+			keys, next, err := a.redis.Scan(ctx, cursor, pattern, 100).Result()
+			if err != nil {
+				break
+			}
+			if len(keys) > 0 {
+				_ = a.redis.Del(ctx, keys...).Err()
+			}
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+		}
 	}
 	_ = a.redis.Del(ctx,
 		"quota:pending:user:"+subject,
@@ -172,38 +231,98 @@ func (a *app) effectiveUserQuota(ctx context.Context, subject string) (store.Pol
 	return p, false, err
 }
 
-func (a *app) userQuotaSnapshot(ctx context.Context, subject string) (quotaDecision, store.Policy, store.Usage, error) {
-	p, _, err := a.effectiveUserQuota(ctx, subject)
-	if err != nil {
-		return quotaDecision{}, store.Policy{}, store.Usage{}, err
-	}
+func (a *app) evaluateQuota(ctx context.Context, subject, apiKeyID string, p store.Policy, countAsAPIKey bool) (quotaDecision, store.Usage, error) {
 	if p.QuotaMode == "" {
 		p.QuotaMode = "unlimited"
 	}
 	if p.IntervalKind == "" {
 		p.IntervalKind = "lifetime"
 	}
-	d := quotaDecision{Mode: p.QuotaMode, Limit: p.TokenLimit, Interval: p.IntervalKind, CounterKey: "user:" + subject}
-	start, reset, resetStatus, err := a.userQuotaWindow(ctx, subject, p, time.Now().UTC())
-	if err != nil {
-		return quotaDecision{}, p, store.Usage{}, err
+	if p.IntervalCount <= 0 {
+		p.IntervalCount = 1
 	}
-	u, err := a.store.UsageSummaryForUser(ctx, subject, start)
-	if err != nil {
-		return quotaDecision{}, p, store.Usage{}, err
+	counterKey := "user:" + subject
+	if countAsAPIKey && apiKeyID != "" {
+		counterKey = "api_key:" + apiKeyID
 	}
-	d.Used = u.TotalTokens
-	d.ResetAt = reset
-	d.WindowStart = &start
-	d.ResetCredits = &resetStatus
-	if p.QuotaMode != "unlimited" && p.TokenLimit != nil {
-		remaining := *p.TokenLimit - u.TotalTokens
+	d := quotaDecision{Mode: p.QuotaMode, Limit: p.TokenLimit, Interval: p.IntervalKind, IntervalCount: p.IntervalCount, CounterKey: counterKey}
+	if p.QuotaMode == "unlimited" || p.TokenLimit == nil {
+		return d, store.Usage{}, nil
+	}
+	specs, err := policyQuotaSpecs(p)
+	if err != nil {
+		return quotaDecision{}, store.Usage{}, err
+	}
+	now := time.Now().UTC()
+	var resetStatus store.QuotaResetStatus
+	if !countAsAPIKey {
+		resetStatus, err = a.store.QuotaResetStatus(ctx, subject)
+		if err != nil {
+			return quotaDecision{}, store.Usage{}, err
+		}
+		d.ResetCredits = &resetStatus
+	}
+	var primaryUsage store.Usage
+	var blockingReset *time.Time
+	blockingNever := false
+	for _, spec := range specs {
+		start, reset := quotaWindowSpec(spec.IntervalKind, spec.IntervalCount, spec.IntervalSeconds, now)
+		if !countAsAPIKey && resetStatus.LastResetAt != nil && resetStatus.LastResetAt.After(start) && !resetStatus.LastResetAt.After(now) {
+			start = *resetStatus.LastResetAt
+		}
+		var usage store.Usage
+		if countAsAPIKey {
+			usage, err = a.store.UsageSummaryForAPIKey(ctx, apiKeyID, start)
+		} else {
+			usage, err = a.store.UsageSummaryForUser(ctx, subject, start)
+		}
+		if err != nil {
+			return quotaDecision{}, store.Usage{}, err
+		}
+		remaining := spec.Limit - usage.TotalTokens
 		if remaining < 0 {
 			remaining = 0
 		}
-		d.Remaining = &remaining
+		limit := quotaLimitDecision{ID: spec.ID, Primary: spec.Primary, Limit: spec.Limit, Used: usage.TotalTokens, Remaining: remaining, ResetAt: reset, Interval: spec.IntervalKind, IntervalCount: max(1, spec.IntervalCount), WindowStart: start}
+		d.Limits = append(d.Limits, limit)
+		if spec.Primary {
+			primaryUsage = usage
+			d.Used = usage.TotalTokens
+			d.Remaining = &remaining
+			d.ResetAt = reset
+			d.WindowStart = &start
+		}
+		if remaining <= 0 {
+			d.Blocked = true
+			// A request becomes usable only after every exhausted window resets.
+			// A lifetime blocker therefore wins; otherwise use the latest reset.
+			if reset == nil {
+				blockingNever = true
+				d.BlockingLimitID = spec.ID
+			} else if !blockingNever && (blockingReset == nil || reset.After(*blockingReset)) {
+				t := *reset
+				blockingReset = &t
+				d.BlockingLimitID = spec.ID
+			}
+		}
 	}
-	return d, p, u, nil
+	if d.Blocked {
+		if blockingNever {
+			d.ResetAt = nil
+		} else {
+			d.ResetAt = blockingReset
+		}
+	}
+	return d, primaryUsage, nil
+}
+
+func (a *app) userQuotaSnapshot(ctx context.Context, subject string) (quotaDecision, store.Policy, store.Usage, error) {
+	p, _, err := a.effectiveUserQuota(ctx, subject)
+	if err != nil {
+		return quotaDecision{}, store.Policy{}, store.Usage{}, err
+	}
+	d, usage, err := a.evaluateQuota(ctx, subject, "", p, false)
+	return d, p, usage, err
 }
 
 func policyAllowsModel(p store.Policy, alias string) bool {
@@ -233,79 +352,16 @@ func (a *app) quotaFor(r *http.Request) (quotaDecision, store.Policy, error) {
 		if !configured {
 			p = a.pendingQuotaPolicy()
 		}
-		if p.QuotaMode == "" {
-			p.QuotaMode = "unlimited"
-		}
-		if p.IntervalKind == "" {
-			p.IntervalKind = "lifetime"
-		}
-		d := quotaDecision{Mode: p.QuotaMode, Limit: p.TokenLimit, Interval: p.IntervalKind, CounterKey: "user:" + c.Sub}
-		if p.QuotaMode == "unlimited" || p.TokenLimit == nil {
-			return d, p, nil
-		}
-		start, reset, resetStatus, err := a.userQuotaWindow(r.Context(), c.Sub, p, time.Now().UTC())
-		if err != nil {
-			return quotaDecision{}, p, err
-		}
-		uUsage, err := a.store.UsageSummaryForUser(r.Context(), c.Sub, start)
-		if err != nil {
-			return quotaDecision{}, p, err
-		}
-		d.Used = uUsage.TotalTokens
-		remaining := *p.TokenLimit - uUsage.TotalTokens
-		if remaining < 0 {
-			remaining = 0
-		}
-		d.Remaining = &remaining
-		d.ResetAt = reset
-		d.WindowStart = &start
-		d.ResetCredits = &resetStatus
-		return d, p, nil
+		d, _, err := a.evaluateQuota(r.Context(), c.Sub, "", p, false)
+		return d, p, err
 	}
 	p, _, err := a.store.PolicyForPrincipal(r.Context(), c.Sub, principal.APIKeyID, roles(c, a.cfg.ClientID))
 	if err != nil {
 		return quotaDecision{}, p, err
 	}
-	if p.QuotaMode == "" {
-		p.QuotaMode = "unlimited"
-	}
-	if p.IntervalKind == "" {
-		p.IntervalKind = "lifetime"
-	}
-	counterKey := "user:" + c.Sub
-	if p.ScopeType == "api_key" && principal.APIKeyID != "" {
-		counterKey = "api_key:" + principal.APIKeyID
-	}
-	d := quotaDecision{Mode: p.QuotaMode, Limit: p.TokenLimit, Interval: p.IntervalKind, CounterKey: counterKey}
-	if p.QuotaMode == "unlimited" || p.TokenLimit == nil {
-		return d, p, nil
-	}
-	start, reset := quotaWindow(p, time.Now().UTC())
-	var resetStatus store.QuotaResetStatus
-	var u store.Usage
-	if p.ScopeType == "api_key" && principal.APIKeyID != "" {
-		u, err = a.store.UsageSummaryForAPIKey(r.Context(), principal.APIKeyID, start)
-	} else {
-		start, reset, resetStatus, err = a.userQuotaWindow(r.Context(), c.Sub, p, time.Now().UTC())
-		if err == nil {
-			u, err = a.store.UsageSummaryForUser(r.Context(), c.Sub, start)
-		}
-	}
-	if err != nil {
-		return quotaDecision{}, p, err
-	}
-	d.Used = u.TotalTokens
-	remaining := *p.TokenLimit - u.TotalTokens
-	if remaining < 0 {
-		remaining = 0
-	}
-	d.Remaining = &remaining
-	d.ResetAt = reset
-	d.WindowStart = &start
-	if p.ScopeType != "api_key" || principal.APIKeyID == "" {
-		d.ResetCredits = &resetStatus
-	}
-	return d, p, nil
+	countAsAPIKey := p.ScopeType == "api_key" && principal.APIKeyID != ""
+	d, _, err := a.evaluateQuota(r.Context(), c.Sub, principal.APIKeyID, p, countAsAPIKey)
+	return d, p, err
 }
 
 func reservationTokens(body []byte) int64 {
@@ -329,23 +385,47 @@ func reservationTokens(body []byte) int64 {
 	return prompt + out
 }
 
+func quotaRuntimeKeys(d quotaDecision, requestID string) ([]string, []any) {
+	if len(d.Limits) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(d.Limits)*2)
+	args := make([]any, 0, 2+len(d.Limits)*2)
+	args = append(args, len(d.Limits))
+	for _, limit := range d.Limits {
+		keys = append(keys, fmt.Sprintf("quota:pending:%s:%s:%d", d.CounterKey, limit.ID, limit.WindowStart.Unix()))
+	}
+	for _, limit := range d.Limits {
+		keys = append(keys, fmt.Sprintf("quota:reservation:%s:%s:%s", d.CounterKey, limit.ID, requestID))
+	}
+	return keys, args
+}
+
 func (a *app) reserveQuota(ctx context.Context, requestID string, d quotaDecision, amount int64) error {
-	if d.Mode == "unlimited" || d.Limit == nil || a.redis == nil {
+	if d.Mode == "unlimited" || d.Limit == nil {
 		return nil
 	}
-	key := "quota:pending:" + d.CounterKey
-	reservationKey := "quota:reservation:" + requestID
-	// Redis tracks only in-flight reservations. The estimate is deliberately
-	// capped to the currently available quota instead of rejecting a request
-	// merely because its maximum completion budget is larger than the tokens
-	// left in the window. Actual completed usage is still written to PostgreSQL
-	// and the next request is blocked once the durable limit is exhausted.
-	//
-	// This matters for small quotas (for example 2k/hour): the system prompt +
-	// max_completion_tokens estimate can be >2k even for a tiny user message,
-	// which previously made a freshly reset quota impossible to use at all.
-	script := `local pending=tonumber(redis.call('GET',KEYS[1]) or '0'); local amount=tonumber(ARGV[1]); local lim=tonumber(ARGV[2]); local durable=tonumber(ARGV[3]); local available=lim-durable-pending; if available<=0 then return -1 end; local reserve=math.min(amount,available); redis.call('INCRBY',KEYS[1],reserve); redis.call('EXPIRE',KEYS[1],3600); redis.call('SET',KEYS[2],reserve,'EX',3600); return pending+reserve`
-	v, err := a.redis.Eval(ctx, script, []string{key, reservationKey}, amount, *d.Limit, d.Used).Int64()
+	if d.Blocked {
+		return fmt.Errorf("quota exhausted")
+	}
+	if a.redis == nil {
+		return nil
+	}
+	keys, args := quotaRuntimeKeys(d, requestID)
+	if len(d.Limits) == 0 {
+		return nil
+	}
+	args = append(args, amount)
+	for _, limit := range d.Limits {
+		args = append(args, limit.Limit, limit.Used)
+	}
+	// All configured windows are checked atomically. Every successful request
+	// consumes the same eventual token usage from every window, e.g. 10K/hour
+	// and 10M/week. The reservation is capped to each window's remaining
+	// headroom so a large max-output estimate cannot make a freshly reset small
+	// quota unusable.
+	script := `local n=tonumber(ARGV[1]); local amount=tonumber(ARGV[2]); for i=1,n do local lim=tonumber(ARGV[2*i+1]); local durable=tonumber(ARGV[2*i+2]); local pending=tonumber(redis.call('GET',KEYS[i]) or '0'); if lim-durable-pending<=0 then return -1 end end; for i=1,n do local lim=tonumber(ARGV[2*i+1]); local durable=tonumber(ARGV[2*i+2]); local pending=tonumber(redis.call('GET',KEYS[i]) or '0'); local reserve=math.min(amount,lim-durable-pending); redis.call('INCRBY',KEYS[i],reserve); redis.call('EXPIRE',KEYS[i],3600); redis.call('SET',KEYS[n+i],reserve,'EX',3600); end; return 1`
+	v, err := a.redis.Eval(ctx, script, keys, args...).Int64()
 	if err != nil {
 		return err
 	}
@@ -356,16 +436,17 @@ func (a *app) reserveQuota(ctx context.Context, requestID string, d quotaDecisio
 }
 
 func (a *app) releaseReservation(ctx context.Context, requestID string, d quotaDecision, reserved int64) {
-	if d.Mode == "unlimited" || d.Limit == nil || a.redis == nil {
+	if d.Mode == "unlimited" || d.Limit == nil || a.redis == nil || len(d.Limits) == 0 {
 		return
 	}
-	key := "quota:pending:" + d.CounterKey
-	// Read the exact amount that reserveQuota actually reserved. It can be lower
-	// than the original estimate when the request consumes the final headroom in
-	// a quota window, and subtracting the estimate would under-count other
-	// concurrent reservations.
-	script := `local pending=tonumber(redis.call('GET',KEYS[1]) or '0'); local amount=tonumber(redis.call('GET',KEYS[2]) or ARGV[1]); local next=pending-amount; if next<=0 then redis.call('DEL',KEYS[1]) else redis.call('SET',KEYS[1],next,'EX',3600) end; redis.call('DEL',KEYS[2]); return math.max(next,0)`
-	_, _ = a.redis.Eval(ctx, script, []string{key, "quota:reservation:" + requestID}, reserved).Result()
+	keys, _ := quotaRuntimeKeys(d, requestID)
+	args := []any{len(d.Limits)}
+	// Read the exact amount reserved for every parallel window. This prevents a
+	// capped short-window reservation from subtracting too much from another
+	// concurrent request when it is released.
+	script := `local n=tonumber(ARGV[1]); for i=1,n do local pending=tonumber(redis.call('GET',KEYS[i]) or '0'); local amount=tonumber(redis.call('GET',KEYS[n+i]) or '0'); local next=pending-amount; if next<=0 then redis.call('DEL',KEYS[i]) else redis.call('SET',KEYS[i],next,'EX',3600) end; redis.call('DEL',KEYS[n+i]); end; return 1`
+	_, _ = a.redis.Eval(ctx, script, keys, args...).Result()
+	_ = reserved // kept in the signature for existing callers and compatibility.
 }
 
 func parseUsagePayload(body []byte) store.Usage {
@@ -518,7 +599,7 @@ func (a *app) adminUserQuota(w http.ResponseWriter, r *http.Request) {
 		if decision.Remaining != nil {
 			remaining = *decision.Remaining
 		}
-		writeJSON(w, 200, map[string]any{"policy": override, "override": override, "effective": effective, "configured": configured, "usage": usage, "remaining": remaining, "resetAt": decision.ResetAt, "windowStart": decision.WindowStart, "resetCredits": decision.ResetCredits})
+		writeJSON(w, 200, map[string]any{"policy": override, "override": override, "effective": effective, "configured": configured, "usage": usage, "remaining": remaining, "resetAt": decision.ResetAt, "windowStart": decision.WindowStart, "resetCredits": decision.ResetCredits, "blocked": decision.Blocked, "blockingLimitId": decision.BlockingLimitID, "limits": decision.Limits})
 		return
 	}
 	var p store.Policy
@@ -811,7 +892,7 @@ func (a *app) useQuotaReset(w http.ResponseWriter, r *http.Request) {
 	if a.redis != nil {
 		blockedCount, _ = a.redis.Exists(r.Context(), "quota:blocked:"+decision.CounterKey).Result()
 	}
-	if decision.Mode != "limited" || decision.Limit == nil || decision.Remaining == nil || (*decision.Remaining > 0 && blockedCount == 0) {
+	if decision.Mode != "limited" || decision.Limit == nil || (!decision.Blocked && blockedCount == 0) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "quota_not_exhausted", "quota": decision})
 		return
 	}
