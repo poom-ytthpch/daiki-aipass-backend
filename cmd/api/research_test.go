@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeResearchMode(t *testing.T) {
@@ -28,6 +32,8 @@ func TestAutoResearchSignals(t *testing.T) {
 		"What is the latest LiteLLM release?",
 		"ช่วยค้นราคา GPU ล่าสุดให้หน่อย",
 		"compare current vLLM and Ollama",
+		"thai aipass",
+		"https://aipass.go.th/",
 	} {
 		if !shouldAutoResearch(q) {
 			t.Fatalf("expected research for %q", q)
@@ -40,6 +46,27 @@ func TestAutoResearchSignals(t *testing.T) {
 	}
 }
 
+func TestExtractResearchURLs(t *testing.T) {
+	got := extractResearchURLs("อ่าน https://aipass.go.th/ ให้หน่อย และ https://example.com/docs).")
+	if len(got) != 2 || got[0] != "https://aipass.go.th/" || got[1] != "https://example.com/docs" {
+		t.Fatalf("unexpected URLs %#v", got)
+	}
+}
+func TestPreferredResearchURLsForAIPass(t *testing.T) {
+	for _, query := range []string{"thai aipass", "TH-AI Passport", "https://aipass.go.th"} {
+		got := preferredResearchURLs(query)
+		if len(got) != 1 || got[0] != "https://aipass.go.th/" {
+			t.Fatalf("preferredResearchURLs(%q)=%#v", query, got)
+		}
+	}
+}
+func TestResearchQueryVariantsForAIPass(t *testing.T) {
+	variants := researchQueryVariants("thai aipass")
+	joined := strings.Join(variants, "\n")
+	if !strings.Contains(joined, `site:aipass.go.th "TH-AI Passport"`) {
+		t.Fatalf("missing authoritative fallback query: %#v", variants)
+	}
+}
 func TestWebCapabilityQuestion(t *testing.T) {
 	for _, q := range []string{
 		"ตอนนี้เข้า internet ได้ยัง",
@@ -119,12 +146,18 @@ func TestResearchRankingAndRelevanceForAIPassport(t *testing.T) {
 	unrelatedURL := "https://thaiembassy.org/thai-passport"
 	unrelatedTitle := "Thai Passport"
 	unrelatedContent := "Instruction for obtaining e-passport"
+	photoURL := "https://photogpt.example/passport"
+	photoTitle := "Passport Photo AI Image Generator"
+	photoContent := "Create passport-style AI photos online"
 
 	if !researchResultRelevant(query, officialTitle, officialURL, officialContent) {
 		t.Fatal("official AI Passport result must remain relevant")
 	}
 	if researchResultRelevant(query, unrelatedTitle, unrelatedURL, unrelatedContent) {
 		t.Fatal("generic Thai passport result without AI signal must be filtered")
+	}
+	if researchResultRelevant(query, photoTitle, photoURL, photoContent) {
+		t.Fatal("generic AI passport-photo result must be filtered for AiPASS intent")
 	}
 	officialRank := researchResultRank(query, officialTitle, officialURL, officialContent, 0.5)
 	secondaryRank := researchResultRank(query, secondaryTitle, secondaryURL, secondaryContent, 4.0)
@@ -133,6 +166,61 @@ func TestResearchRankingAndRelevanceForAIPassport(t *testing.T) {
 	}
 }
 
+func TestFetchPublicPageDirectURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<html><head><title>TH-AI Passport</title></head><body><main>TH-AI Passport official project information for Thai citizens age 15 and above.</main></body></html>`))
+	}))
+	defer server.Close()
+	text, err := fetchPublicPage(context.Background(), server.Client(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "TH-AI Passport official project information") {
+		t.Fatalf("unexpected page text %q", text)
+	}
+}
+func TestFetchPublicPageTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(40 * time.Millisecond)
+		_, _ = w.Write([]byte("this response should arrive after the client timeout and must not be accepted"))
+	}))
+	defer server.Close()
+	client := server.Client()
+	client.Timeout = 5 * time.Millisecond
+	if _, err := fetchPublicPage(context.Background(), client, server.URL); err == nil {
+		t.Fatal("expected timeout error")
+	}
+}
+func TestWebResearchNoResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+	a := &app{cfg: config{SearXNGBase: server.URL}, http: server.Client()}
+	if _, err := a.webResearch(context.Background(), "query with no results"); err == nil || !strings.Contains(err.Error(), "no search results") {
+		t.Fatalf("expected no search results error, got %v", err)
+	}
+}
+func TestExplicitWebResearchFailureStillLetsModelAnswer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+	a := &app{cfg: config{SearXNGBase: server.URL}, http: server.Client()}
+	body, meta, err := a.enrichChatWithResearch(context.Background(), []byte(`{"model":"auto","researchMode":"web","messages":[{"role":"user","content":"find a thing that does not exist"}]}`))
+	if err != nil {
+		t.Fatalf("research failure should degrade gracefully, got %v", err)
+	}
+	if meta.Used || meta.Error == "" {
+		t.Fatalf("expected failed research metadata, got %#v", meta)
+	}
+	if !strings.Contains(string(body), "WEB RESEARCH STATUS: FAILED") {
+		t.Fatalf("model must receive explicit failed-research context: %s", body)
+	}
+}
 func TestInternetCapabilityQuestionDoesNotTriggerDateTimeTool(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"ตอนนี้เข้า internet ได้ยัง"}]}`)
 	if shouldEnableSmartTools(body) {

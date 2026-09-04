@@ -34,20 +34,22 @@ type researchMetadata struct {
 	Error   string           `json:"error,omitempty"`
 }
 
+type searxResult struct {
+	Title   string  `json:"title"`
+	URL     string  `json:"url"`
+	Content string  `json:"content"`
+	Engine  string  `json:"engine"`
+	Score   float64 `json:"score"`
+}
 type searxResponse struct {
-	Results []struct {
-		Title   string  `json:"title"`
-		URL     string  `json:"url"`
-		Content string  `json:"content"`
-		Engine  string  `json:"engine"`
-		Score   float64 `json:"score"`
-	} `json:"results"`
+	Results []searxResult `json:"results"`
 }
 
 var (
 	researchScriptRE = regexp.MustCompile(`(?is)<(?:script|style|noscript|svg|iframe)[^>]*>.*?</(?:script|style|noscript|svg|iframe)>`)
 	researchTagRE    = regexp.MustCompile(`(?s)<[^>]+>`)
 	researchSpaceRE  = regexp.MustCompile(`\s+`)
+	researchURLRE    = regexp.MustCompile(`(?i)https?://[^\s<>"']+`)
 )
 
 func normalizeResearchMode(v any) string {
@@ -92,6 +94,9 @@ func shouldAutoResearch(q string) bool {
 	q = strings.ToLower(strings.TrimSpace(q))
 	if q == "" {
 		return false
+	}
+	if len(extractResearchURLs(q)) > 0 || isAIPassIntent(q) {
+		return true
 	}
 	keywords := []string{
 		"latest", "current", "today", "tonight", "this week", "this month", "news", "recent", "price", "release", "version", "documentation", "docs", "research", "search the web", "internet", "compare", "comparison", "review", "availability", "status", "outage", "weather", "market",
@@ -156,16 +161,13 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 		sources, err = a.webResearch(ctx, searchQuery)
 		if err != nil {
 			meta.Error = err.Error()
-			if mode == "web" {
-				return nil, meta, fmt.Errorf("web research unavailable: %w", err)
-			}
 		} else {
 			meta.Used = len(sources) > 0
 			meta.Sources = sources
 		}
 	}
 
-	instruction := `You are Daiki, a careful reasoning assistant. Think through the task internally before answering, but never reveal private chain-of-thought. Give the user a clear, substantive answer with the key reasoning, assumptions, and uncertainty that are useful to them. Do not make up facts. If information may have changed and no fresh evidence is available, say that explicitly. Runtime capability: Daiki can search and fetch public web pages through its backend research service when Research Auto/Web is enabled. Do not claim that you cannot access the internet when fresh web evidence is provided. This capability does not mean you can test or control the user's own device/network connection.`
+	instruction := `You are Daiki, a careful reasoning assistant. Think through the task internally before answering, but never reveal private chain-of-thought. Give the user a clear, substantive answer with the key reasoning, assumptions, and uncertainty that are useful to them. Do not make up facts. If information may have changed and no fresh evidence is available, say that explicitly. Runtime capability: Daiki can search and fetch public web pages through its backend research service when Research Auto/Web is enabled. Do not claim that you cannot access the internet when fresh web evidence is provided. This capability does not mean you can test or control the user's own device/network connection. Never answer a research request by merely dumping raw search results; infer the user's intent and synthesize the evidence into a direct answer.`
 	if len(sources) > 0 {
 		var b strings.Builder
 		b.WriteString(instruction)
@@ -189,6 +191,8 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 		if strings.EqualFold(strings.TrimSpace(fmt.Sprint(payload["model"])), "auto") {
 			payload["model"] = "deep"
 		}
+	} else if useWeb && meta.Error != "" {
+		instruction += "\n\nWEB RESEARCH STATUS: FAILED for this request. The backend could not obtain fresh public-web evidence. Do not fabricate search results, citations, page contents, or claim that the URL was read successfully. Still answer helpfully from reliable existing knowledge when possible, and clearly say that fresh web verification was unavailable."
 	}
 	messages, _ := payload["messages"].([]any)
 	payload["messages"] = append([]any{map[string]any{"role": "system", "content": instruction}}, messages...)
@@ -223,6 +227,81 @@ func researchHasAITerm(s string) bool {
 	n := " " + normalizeResearchText(s) + " "
 	return strings.Contains(n, " ai ") || strings.Contains(n, " artificial intelligence ") || strings.Contains(n, " ปัญญาประดิษฐ์ ")
 }
+func extractResearchURLs(s string) []string {
+	matches := researchURLRE.FindAllString(s, 4)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(matches))
+	seen := map[string]bool{}
+	for _, raw := range matches {
+		raw = strings.TrimRight(raw, ".,;:!?)]}>'\"")
+		if !isHTTPURL(raw) || seen[raw] {
+			continue
+		}
+		seen[raw] = true
+		out = append(out, raw)
+	}
+	return out
+}
+func aipassSignal(s string) bool {
+	n := " " + normalizeResearchText(s) + " "
+	return strings.Contains(n, " aipass ") ||
+		strings.Contains(n, " th ai passport ") ||
+		strings.Contains(n, " thai ai passport ") ||
+		strings.Contains(n, " thai ai pass ") ||
+		strings.Contains(n, " ไทย เอไอ พาส ")
+}
+func isAIPassIntent(s string) bool {
+	if aipassSignal(s) {
+		return true
+	}
+	for _, raw := range extractResearchURLs(s) {
+		u, err := url.Parse(raw)
+		if err == nil && strings.EqualFold(strings.TrimPrefix(u.Hostname(), "www."), "aipass.go.th") {
+			return true
+		}
+	}
+	return false
+}
+func preferredResearchURLs(query string) []string {
+	if isAIPassIntent(query) {
+		return []string{"https://aipass.go.th/"}
+	}
+	return nil
+}
+func researchQueryVariants(query string) []string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+	variants := []string{query}
+	if isAIPassIntent(query) {
+		variants = append(variants, `"TH-AI Passport" Thailand`, `site:aipass.go.th "TH-AI Passport"`)
+	}
+	for _, raw := range extractResearchURLs(query) {
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		host := strings.ToLower(strings.TrimPrefix(u.Hostname(), "www."))
+		variants = append(variants, "site:"+host, host)
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, min(len(variants), 4))
+	for _, v := range variants {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+		if len(out) >= 4 {
+			break
+		}
+	}
+	return out
+}
 
 func researchOfficialHost(rawURL string) bool {
 	u, err := url.Parse(rawURL)
@@ -240,6 +319,9 @@ func researchResultRelevant(query, title, rawURL, content string) bool {
 	if researchHasAITerm(query) && !researchHasAITerm(title+" "+rawURL+" "+content) {
 		return false
 	}
+	if isAIPassIntent(query) && !aipassSignal(title+" "+rawURL+" "+content) {
+		return false
+	}
 	return true
 }
 
@@ -253,6 +335,15 @@ func researchResultRank(query, title, rawURL, content string, base float64) floa
 	if researchOfficialHost(rawURL) {
 		rank += 4
 	}
+	if isAIPassIntent(query) {
+		u, _ := url.Parse(rawURL)
+		host := strings.ToLower(strings.TrimPrefix(u.Hostname(), "www."))
+		if host == "aipass.go.th" {
+			rank += 12
+		} else if aipassSignal(title + " " + rawURL + " " + content) {
+			rank += 4
+		}
+	}
 	stopwords := map[string]bool{"latest": true, "current": true, "today": true, "tonight": true, "recent": true, "search": true, "find": true, "data": true, "info": true, "information": true, "ข้อมูล": true, "ค้นหา": true, "หา": true, "ล่าสุด": true, "ปัจจุบัน": true, "วันนี้": true}
 	for _, token := range strings.Fields(q) {
 		if len([]rune(token)) < 2 || stopwords[token] {
@@ -265,11 +356,7 @@ func researchResultRank(query, title, rawURL, content string, base float64) floa
 	return rank
 }
 
-func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, error) {
-	base := strings.TrimRight(strings.TrimSpace(a.cfg.SearXNGBase), "/")
-	if base == "" {
-		return nil, errors.New("search service not configured")
-	}
+func (a *app) searxSearch(ctx context.Context, base, query string) ([]searxResult, error) {
 	u, err := url.Parse(base + "/search")
 	if err != nil {
 		return nil, err
@@ -301,12 +388,68 @@ func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, 
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&found); err != nil {
 		return nil, fmt.Errorf("invalid search response: %w", err)
 	}
-	if len(found.Results) == 0 {
+	return found.Results, nil
+}
+func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, error) {
+	directURLs := append([]string{}, extractResearchURLs(query)...)
+	directURLs = append(directURLs, preferredResearchURLs(query)...)
+	if len(directURLs) > 0 {
+		client := newPublicWebClient(10 * time.Second)
+		direct := make([]researchSource, 0, len(directURLs))
+		seenDirect := map[string]bool{}
+		for _, raw := range directURLs {
+			if seenDirect[raw] {
+				continue
+			}
+			seenDirect[raw] = true
+			text, err := fetchPublicPage(ctx, client, raw)
+			if err != nil {
+				continue
+			}
+			u, _ := url.Parse(raw)
+			title := raw
+			if u != nil && u.Hostname() != "" {
+				title = u.Hostname()
+			}
+			direct = append(direct, researchSource{Index: len(direct) + 1, Title: title, URL: raw, Excerpt: clipText(text, 6500), Engine: "direct"})
+		}
+		if len(direct) > 0 {
+			return direct, nil
+		}
+	}
+	base := strings.TrimRight(strings.TrimSpace(a.cfg.SearXNGBase), "/")
+	if base == "" {
+		return nil, errors.New("search service not configured")
+	}
+	var results []searxResult
+	var lastSearchErr error
+	for _, searchQuery := range researchQueryVariants(query) {
+		found, err := a.searxSearch(ctx, base, searchQuery)
+		if err != nil {
+			lastSearchErr = err
+			continue
+		}
+		results = append(results, found...)
+	}
+	if len(results) == 0 {
+		if lastSearchErr != nil {
+			return nil, lastSearchErr
+		}
 		return nil, errors.New("no search results")
 	}
-	sort.SliceStable(found.Results, func(i, j int) bool {
-		a := found.Results[i]
-		b := found.Results[j]
+	seenURLs := map[string]bool{}
+	unique := results[:0]
+	for _, r := range results {
+		if r.URL == "" || seenURLs[r.URL] {
+			continue
+		}
+		seenURLs[r.URL] = true
+		unique = append(unique, r)
+	}
+	results = unique
+	sort.SliceStable(results, func(i, j int) bool {
+		a := results[i]
+		b := results[j]
 		return researchResultRank(query, a.Title, a.URL, a.Content, a.Score) > researchResultRank(query, b.Title, b.URL, b.Content, b.Score)
 	})
 	limit := a.cfg.WebResearchMaxResults
@@ -314,7 +457,7 @@ func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, 
 		limit = 5
 	}
 	sources := make([]researchSource, 0, limit)
-	for _, r := range found.Results {
+	for _, r := range results {
 		if len(sources) >= limit {
 			break
 		}
@@ -350,7 +493,6 @@ func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, 
 	wg.Wait()
 	return sources, nil
 }
-
 func newPublicWebClient(timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{Timeout: 4 * time.Second, KeepAlive: 20 * time.Second}
 	transport := &http.Transport{
