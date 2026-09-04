@@ -335,9 +335,16 @@ func (a *app) reserveQuota(ctx context.Context, requestID string, d quotaDecisio
 	}
 	key := "quota:pending:" + d.CounterKey
 	reservationKey := "quota:reservation:" + requestID
-	// Redis tracks only in-flight reservations. Durable completed usage stays in
-	// PostgreSQL, so fixed and rolling windows can always be rebuilt accurately.
-	script := `local pending=tonumber(redis.call('GET',KEYS[1]) or '0'); local amount=tonumber(ARGV[1]); local lim=tonumber(ARGV[2]); local durable=tonumber(ARGV[3]); if durable+pending+amount>lim then return -1 end; redis.call('INCRBY',KEYS[1],amount); redis.call('EXPIRE',KEYS[1],3600); redis.call('SET',KEYS[2],amount,'EX',3600); return pending+amount`
+	// Redis tracks only in-flight reservations. The estimate is deliberately
+	// capped to the currently available quota instead of rejecting a request
+	// merely because its maximum completion budget is larger than the tokens
+	// left in the window. Actual completed usage is still written to PostgreSQL
+	// and the next request is blocked once the durable limit is exhausted.
+	//
+	// This matters for small quotas (for example 2k/hour): the system prompt +
+	// max_completion_tokens estimate can be >2k even for a tiny user message,
+	// which previously made a freshly reset quota impossible to use at all.
+	script := `local pending=tonumber(redis.call('GET',KEYS[1]) or '0'); local amount=tonumber(ARGV[1]); local lim=tonumber(ARGV[2]); local durable=tonumber(ARGV[3]); local available=lim-durable-pending; if available<=0 then return -1 end; local reserve=math.min(amount,available); redis.call('INCRBY',KEYS[1],reserve); redis.call('EXPIRE',KEYS[1],3600); redis.call('SET',KEYS[2],reserve,'EX',3600); return pending+reserve`
 	v, err := a.redis.Eval(ctx, script, []string{key, reservationKey}, amount, *d.Limit, d.Used).Int64()
 	if err != nil {
 		return err
@@ -353,7 +360,11 @@ func (a *app) releaseReservation(ctx context.Context, requestID string, d quotaD
 		return
 	}
 	key := "quota:pending:" + d.CounterKey
-	script := `local pending=tonumber(redis.call('GET',KEYS[1]) or '0'); local amount=tonumber(ARGV[1]); local next=pending-amount; if next<=0 then redis.call('DEL',KEYS[1]) else redis.call('SET',KEYS[1],next,'EX',3600) end; redis.call('DEL',KEYS[2]); return math.max(next,0)`
+	// Read the exact amount that reserveQuota actually reserved. It can be lower
+	// than the original estimate when the request consumes the final headroom in
+	// a quota window, and subtracting the estimate would under-count other
+	// concurrent reservations.
+	script := `local pending=tonumber(redis.call('GET',KEYS[1]) or '0'); local amount=tonumber(redis.call('GET',KEYS[2]) or ARGV[1]); local next=pending-amount; if next<=0 then redis.call('DEL',KEYS[1]) else redis.call('SET',KEYS[1],next,'EX',3600) end; redis.call('DEL',KEYS[2]); return math.max(next,0)`
 	_, _ = a.redis.Eval(ctx, script, []string{key, "quota:reservation:" + requestID}, reserved).Result()
 }
 
