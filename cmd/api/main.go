@@ -38,6 +38,9 @@ type config struct {
 	KeycloakBase, KeycloakRealm           string
 	KeycloakAdminUser, KeycloakAdminPass  string
 	LiteLLMBase, LiteLLMKey               string
+	HermesBase, HermesKey                 string
+	HermesEnabled                         bool
+	HermesFallbackToLiteLLM               bool
 	DatabaseURL, RedisAddr                string
 	AllowedOrigins                        []string
 	AdminEmail                            string
@@ -118,6 +121,7 @@ func loadConfig() config {
 		KeycloakBase: getenv("KEYCLOAK_BASE_URL", "http://keycloak.daiki-ai-passport.svc.cluster.local:8080"), KeycloakRealm: getenv("KEYCLOAK_REALM", "daiki"),
 		KeycloakAdminUser: getenv("KEYCLOAK_ADMIN_USER", "admin"), KeycloakAdminPass: os.Getenv("KEYCLOAK_ADMIN_PASSWORD"),
 		LiteLLMBase: getenv("LITELLM_BASE_URL", "http://litellm.daiki-ai-passport.svc.cluster.local:4000"), LiteLLMKey: os.Getenv("LITELLM_MASTER_KEY"),
+		HermesBase: strings.TrimRight(strings.TrimSpace(os.Getenv("HERMES_BASE_URL")), "/"), HermesKey: strings.TrimSpace(os.Getenv("HERMES_API_KEY")), HermesEnabled: strings.EqualFold(getenv("HERMES_ENABLED", "false"), "true"), HermesFallbackToLiteLLM: strings.EqualFold(getenv("HERMES_FALLBACK_TO_LITELLM", "true"), "true"),
 		DatabaseURL: os.Getenv("DATABASE_URL"), RedisAddr: getenv("REDIS_ADDR", "daiki-redis.daiki-ai-passport.svc.cluster.local:6379"),
 		AllowedOrigins: splitCSV(getenv("ALLOWED_ORIGINS", "https://ai.infra.local")), AdminEmail: strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))), AppBaseURL: strings.TrimRight(getenv("APP_BASE_URL", "https://daiki-aipass.matchchemical.co"), "/"), GoogleClientID: strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_ID")), GoogleClientSecret: strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_SECRET")), GmailOAuthRedirectURI: getenv("GMAIL_OAUTH_REDIRECT_URI", "https://daiki-aipass.matchchemical.co/api/admin/integrations/gmail/callback"), TokenEncryptionKey: strings.TrimSpace(os.Getenv("TOKEN_ENCRYPTION_KEY")), LocalLLMBase: getenv("LOCAL_LLM_BASE_URL", "http://10.90.0.11:8000/v1"),
 		PendingChatTokenLimit: int64(getenvInt("PENDING_CHAT_TOKEN_LIMIT", 8000)), PendingChatRequestsPerHour: getenvInt("PENDING_CHAT_REQUESTS_PER_HOUR", 10),
@@ -173,6 +177,9 @@ func main() {
 		r.Get("/health/ready", a.ready)
 		r.Post("/auth/password-reset", a.passwordReset)
 		r.Post("/auth/password-reset/confirm", a.passwordResetConfirm)
+		r.Get("/guest/policy", a.guestPolicyPublic)
+		r.Post("/guest/chat", a.guestChat)
+		r.Post("/guest/chat/stream", a.guestChatStream)
 		r.Group(func(r chi.Router) {
 			r.Use(a.auth)
 			r.Get("/me", a.me)
@@ -227,6 +234,8 @@ func main() {
 				r.Put("/api-keys/{id}/quota", a.adminAPIKeyQuota)
 				r.Get("/token-policy", a.adminSystemQuota)
 				r.Put("/token-policy", a.adminSystemQuota)
+				r.Get("/guest-policy", a.adminGuestPolicy)
+				r.Put("/guest-policy", a.adminGuestPolicy)
 				r.Get("/audit", a.adminAudit)
 			})
 			r.Group(func(r chi.Router) {
@@ -601,7 +610,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	defer ticket.Release(context.Background())
 	toolUsage := store.Usage{}
 	toolNames := []string{}
-	if !researchMeta.Used && shouldEnableSmartTools(body) {
+	if !a.cfg.HermesEnabled && !researchMeta.Used && shouldEnableSmartTools(body) {
 		plannedBody, usedTools, plannerUsage, planErr := a.runSmartToolLoop(r.Context(), c.Sub, upstreamBody)
 		toolUsage = plannerUsage
 		toolNames = usedTools
@@ -638,7 +647,8 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	w.Header().Set("x-daiki-token-estimate-output", fmt.Sprint(tokenEstimate.VisibleBudget))
 	w.Header().Set("x-daiki-token-estimate-total", fmt.Sprint(tokenEstimate.TotalBudget))
 	w.Header().Set("x-daiki-queue-wait-ms", fmt.Sprint(ticket.AcquiredAt.Sub(ticket.EnqueuedAt).Milliseconds()))
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, strings.TrimRight(a.cfg.LiteLLMBase, "/")+path, strings.NewReader(string(upstreamBody)))
+	upstreamURL, upstreamKey, upstreamName := a.inferenceUpstreamForRequest(r, path)
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, strings.NewReader(string(upstreamBody)))
 	if err != nil {
 		a.releaseReservation(r.Context(), requestID, decision, reserved)
 		_ = a.store.FinishUsage(r.Context(), requestID, "failed", toolUsage)
@@ -646,10 +656,44 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		return
 	}
 	req.Header.Set("content-type", "application/json")
-	if a.cfg.LiteLLMKey != "" {
-		req.Header.Set("authorization", "Bearer "+a.cfg.LiteLLMKey)
+	if upstreamKey != "" {
+		req.Header.Set("authorization", "Bearer "+upstreamKey)
 	}
+	req.Header.Set("x-daiki-request-id", requestID)
+	req.Header.Set("x-daiki-principal", currentPrincipal(r).AuthKind)
+	if upstreamName == "hermes" {
+		req.Header.Set("X-Hermes-Session-Id", requestID)
+		if key := hermesSessionKey(r); key != "" {
+			req.Header.Set("X-Hermes-Session-Key", key)
+		}
+	}
+	w.Header().Set("x-daiki-inference-upstream", upstreamName)
 	resp, err := a.inferenceHTTP.Do(req)
+	statusCode := 0
+	if resp != nil {
+		statusCode = resp.StatusCode
+	}
+	if shouldFallbackFromHermes(upstreamName, a.cfg.HermesFallbackToLiteLLM, statusCode, err) {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		fallbackURL, fallbackKey, _ := a.liteLLMUpstream(path)
+		fallbackReq, fallbackReqErr := http.NewRequestWithContext(r.Context(), r.Method, fallbackURL, strings.NewReader(string(upstreamBody)))
+		if fallbackReqErr == nil {
+			fallbackReq.Header.Set("content-type", "application/json")
+			if fallbackKey != "" {
+				fallbackReq.Header.Set("authorization", "Bearer "+fallbackKey)
+			}
+			fallbackReq.Header.Set("x-daiki-request-id", requestID)
+			fallbackReq.Header.Set("x-daiki-principal", currentPrincipal(r).AuthKind)
+			resp, err = a.inferenceHTTP.Do(fallbackReq)
+			if err == nil {
+				upstreamName = "litellm-fallback"
+				w.Header().Set("x-daiki-inference-upstream", upstreamName)
+				_ = a.store.MergeUsageMetadata(r.Context(), requestID, map[string]any{"inferenceUpstream": upstreamName, "hermesFallback": true})
+			}
+		}
+	}
 	if err != nil {
 		a.releaseReservation(r.Context(), requestID, decision, reserved)
 		status := "failed"
@@ -657,7 +701,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 			status = "cancelled"
 		}
 		_ = a.store.FinishUsage(context.Background(), requestID, status, toolUsage)
-		writeJSON(w, 502, map[string]string{"error": "LiteLLM unavailable"})
+		writeJSON(w, 502, map[string]string{"error": upstreamName + " unavailable"})
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()

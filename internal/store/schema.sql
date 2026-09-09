@@ -53,6 +53,19 @@ CREATE TABLE IF NOT EXISTS entitlement_policies (
 ALTER TABLE entitlement_policies ADD COLUMN IF NOT EXISTS interval_count INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE entitlement_policies ADD COLUMN IF NOT EXISTS parallel_limits JSONB NOT NULL DEFAULT '[]'::jsonb;
 CREATE INDEX IF NOT EXISTS entitlement_policies_active_idx ON entitlement_policies (scope_type, scope_id, effective_from, expires_at);
+CREATE TABLE IF NOT EXISTS guest_access_policy (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    token_limit BIGINT NOT NULL DEFAULT 4000 CHECK (token_limit >= 0),
+    interval_kind TEXT NOT NULL DEFAULT 'day' CHECK (interval_kind IN ('hour','day','week','month','rolling','custom','lifetime')),
+    interval_seconds BIGINT CHECK (interval_seconds IS NULL OR interval_seconds > 0),
+    requests_per_hour INTEGER NOT NULL DEFAULT 6 CHECK (requests_per_hour > 0),
+    min_interval_seconds INTEGER NOT NULL DEFAULT 45 CHECK (min_interval_seconds >= 0),
+    max_completion_tokens INTEGER NOT NULL DEFAULT 384 CHECK (max_completion_tokens > 0),
+    fast_model TEXT NOT NULL DEFAULT 'fast',
+    updated_by TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS quota_grants (
     id BIGSERIAL PRIMARY KEY,
