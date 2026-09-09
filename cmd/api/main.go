@@ -162,6 +162,18 @@ func main() {
 			if err := a.store.RecoverInterruptedChatRuns(ctx); err != nil {
 				slog.Warn("chat run recovery failed", "error", err)
 			}
+			go func() {
+				timer := time.NewTimer(2 * time.Second)
+				defer timer.Stop()
+				select {
+				case <-ctx.Done():
+					return
+				case <-timer.C:
+				}
+				reconcileCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+				defer cancel()
+				a.reconcileProviderModels(reconcileCtx)
+			}()
 			defer db.Close()
 		} else {
 			slog.Warn("postgres disabled", "error", err)
@@ -180,6 +192,12 @@ func main() {
 		r.Get("/guest/policy", a.guestPolicyPublic)
 		r.Post("/guest/chat", a.guestChat)
 		r.Post("/guest/chat/stream", a.guestChatStream)
+		r.Get("/guest/attachments", a.guestListAttachments)
+		r.Post("/guest/attachments", a.guestUploadAttachment)
+		r.Get("/guest/attachments/{id}", a.guestDownloadAttachment)
+		r.Delete("/guest/attachments/{id}", a.guestDeleteAttachment)
+		r.Post("/guest/generate/file", a.guestGenerateFile)
+		r.Post("/guest/generate/image", a.guestGenerateImage)
 		r.Group(func(r chi.Router) {
 			r.Use(a.auth)
 			r.Get("/me", a.me)
@@ -208,6 +226,7 @@ func main() {
 				r.Post("/model-providers/{id}/test", a.adminTestModelProvider)
 				r.Get("/model-providers/{id}/discover", a.adminDiscoverProviderModels)
 				r.Post("/model-providers/{id}/models", a.adminRegisterProviderModel)
+				r.Put("/provider-models/{id}", a.adminUpdateProviderModel)
 				r.Delete("/provider-models/{id}", a.adminDeleteProviderModel)
 				r.Get("/model-aliases", a.adminModelAliases)
 				r.Put("/model-aliases/{alias}", a.adminSetModelAlias)
@@ -236,6 +255,7 @@ func main() {
 				r.Put("/token-policy", a.adminSystemQuota)
 				r.Get("/guest-policy", a.adminGuestPolicy)
 				r.Put("/guest-policy", a.adminGuestPolicy)
+				r.Post("/guests/{guestSubject}/quota-reset", a.adminResetGuestQuota)
 				r.Get("/audit", a.adminAudit)
 			})
 			r.Group(func(r chi.Router) {
@@ -648,27 +668,40 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	w.Header().Set("x-daiki-token-estimate-total", fmt.Sprint(tokenEstimate.TotalBudget))
 	w.Header().Set("x-daiki-queue-wait-ms", fmt.Sprint(ticket.AcquiredAt.Sub(ticket.EnqueuedAt).Milliseconds()))
 	upstreamURL, upstreamKey, upstreamName := a.inferenceUpstreamForRequest(r, path)
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, strings.NewReader(string(upstreamBody)))
-	if err != nil {
-		a.releaseReservation(r.Context(), requestID, decision, reserved)
-		_ = a.store.FinishUsage(r.Context(), requestID, "failed", toolUsage)
-		writeJSON(w, 500, map[string]string{"error": "request construction failed"})
-		return
-	}
-	req.Header.Set("content-type", "application/json")
-	if upstreamKey != "" {
-		req.Header.Set("authorization", "Bearer "+upstreamKey)
-	}
-	req.Header.Set("x-daiki-request-id", requestID)
-	req.Header.Set("x-daiki-principal", currentPrincipal(r).AuthKind)
-	if upstreamName == "hermes" {
-		req.Header.Set("X-Hermes-Session-Id", requestID)
-		if key := hermesSessionKey(r); key != "" {
-			req.Header.Set("X-Hermes-Session-Key", key)
+	makeUpstreamRequest := func(payload []byte) (*http.Request, error) {
+		req, buildErr := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, strings.NewReader(string(payload)))
+		if buildErr != nil {
+			return nil, buildErr
 		}
+		req.Header.Set("content-type", "application/json")
+		if upstreamKey != "" {
+			req.Header.Set("authorization", "Bearer "+upstreamKey)
+		}
+		req.Header.Set("x-daiki-request-id", requestID)
+		req.Header.Set("x-daiki-principal", currentPrincipal(r).AuthKind)
+		if upstreamName == "hermes" {
+			req.Header.Set("X-Hermes-Session-Id", requestID)
+			if key := hermesSessionKey(r); key != "" {
+				req.Header.Set("X-Hermes-Session-Key", key)
+			}
+		}
+		return req, nil
 	}
 	w.Header().Set("x-daiki-inference-upstream", upstreamName)
-	resp, err := a.inferenceHTTP.Do(req)
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, makeUpstreamRequest)
+	upstreamBody = recoveredBody
+	if recoveredModel != "" {
+		route.PhysicalModel = recoveredModel
+	}
+	w.Header().Set("x-daiki-model-physical", route.PhysicalModel)
+	w.Header().Set("x-daiki-retry-attempts", strconv.Itoa(max(0, recovery.Attempts-1)))
+	if recovery.ContextTrimmed {
+		w.Header().Set("x-daiki-context-trimmed", "true")
+	}
+	if recovery.FallbackTo != "" {
+		w.Header().Set("x-daiki-fallback-model", recovery.FallbackTo)
+	}
+	_ = a.store.MergeUsageMetadata(r.Context(), requestID, recoveryMetadata(recovery))
 	statusCode := 0
 	if resp != nil {
 		statusCode = resp.StatusCode
@@ -703,6 +736,14 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		_ = a.store.FinishUsage(context.Background(), requestID, status, toolUsage)
 		writeJSON(w, 502, map[string]string{"error": upstreamName + " unavailable"})
 		return
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		rawRateBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+		friendly := friendlyRateLimitError(rawRateBody, recovery)
+		resp.Body = io.NopCloser(bytes.NewReader(friendly))
+		resp.ContentLength = int64(len(friendly))
+		resp.Header.Set("content-type", "application/json")
 	}
 	defer func() { _ = resp.Body.Close() }()
 	for _, h := range []string{"content-type", "cache-control"} {

@@ -31,7 +31,7 @@ func TestRestrictGuestChatForcesFastAndStripsCapabilities(t *testing.T) {
 	if payload["max_completion_tokens"] != float64(321) {
 		t.Fatalf("unexpected output cap: %#v", payload)
 	}
-	for _, key := range []string{"max_tokens", "researchMode", "thinkingMode", "research", "web_search", "tools", "tool_choice", "attachments", "attachmentIds"} {
+	for _, key := range []string{"max_tokens", "researchMode", "thinkingMode", "research", "web_search", "tools", "tool_choice", "attachments"} {
 		if _, exists := payload[key]; exists {
 			t.Fatalf("guest payload must strip %s: %#v", key, payload)
 		}
@@ -102,21 +102,24 @@ func TestGuestRateLimit(t *testing.T) {
 	}
 }
 
-func TestRestrictedAuthenticatedRequestBypassesHermes(t *testing.T) {
+func TestAllAuthenticatedInferenceUsesHermes(t *testing.T) {
 	a := &app{cfg: config{LiteLLMBase: "http://litellm:4000", LiteLLMKey: "lite", HermesBase: "http://hermes:8642", HermesKey: "hermes", HermesEnabled: true}}
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat", nil)
-	r = r.WithContext(context.WithValue(r.Context(), appUserKey, store.User{Subject: "pending-user", Status: "pending"}))
-	url, key, name := a.inferenceUpstreamForRequest(r, "/v1/chat/completions")
-	if url != "http://litellm:4000/v1/chat/completions" || key != "lite" || name != "litellm" {
-		t.Fatalf("pending user must bypass Hermes: %q %q %q", url, key, name)
-	}
-	r = r.WithContext(context.WithValue(r.Context(), appUserKey, store.User{Subject: "approved-user", Status: "approved"}))
-	url, key, name = a.inferenceUpstreamForRequest(r, "/v1/chat/completions")
-	if url != "http://hermes:8642/v1/chat/completions" || key != "hermes" || name != "hermes" {
-		t.Fatalf("approved user should use Hermes: %q %q %q", url, key, name)
+	for _, status := range []string{"pending", "approved"} {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat", nil)
+		r = r.WithContext(context.WithValue(r.Context(), appUserKey, store.User{Subject: status + "-user", Status: status}))
+		url, key, name := a.inferenceUpstreamForRequest(r, "/v1/chat/completions")
+		if url != "http://hermes:8642/v1/chat/completions" || key != "hermes" || name != "hermes" {
+			t.Fatalf("%s user must use Hermes: %q %q %q", status, url, key, name)
+		}
 	}
 }
-
+func TestGuestUsesRestrictedHermesProfile(t *testing.T) {
+	a := &app{cfg: config{LiteLLMBase: "http://litellm:4000", LiteLLMKey: "lite", HermesBase: "http://hermes:8642", HermesKey: "hermes", HermesEnabled: true}}
+	url, key, name := a.guestHermesUpstream("/v1/chat/completions")
+	if url != "http://hermes:8642/p/guest/v1/chat/completions" || key != "hermes" || name != "hermes-guest" {
+		t.Fatalf("guest must use restricted Hermes profile: %q %q %q", url, key, name)
+	}
+}
 func TestHermesFallbackDecision(t *testing.T) {
 	if !shouldFallbackFromHermes("hermes", true, 503, nil) {
 		t.Fatal("Hermes 5xx should fallback")

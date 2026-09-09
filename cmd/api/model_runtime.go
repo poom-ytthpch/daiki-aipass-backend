@@ -1,0 +1,438 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
+)
+
+type modelRecoveryMeta struct {
+	Attempts            int    `json:"attempts"`
+	ContextTrimmed      bool   `json:"contextTrimmed"`
+	OriginalInputTokens int    `json:"originalInputTokens"`
+	FinalInputTokens    int    `json:"finalInputTokens"`
+	ObservedRateLimit   int    `json:"observedRateLimit,omitempty"`
+	ObservedRequested   int    `json:"observedRequested,omitempty"`
+	ObservedRateKind    string `json:"observedRateKind,omitempty"`
+	FallbackFrom        string `json:"fallbackFrom,omitempty"`
+	FallbackTo          string `json:"fallbackTo,omitempty"`
+	FinalModel          string `json:"finalModel"`
+}
+
+type rateLimitObservation struct {
+	Kind      string
+	Limit     int
+	Requested int
+}
+
+var providerLimitPattern = regexp.MustCompile(`(?i)limit\s+([0-9][0-9,]*)\s*,\s*requested\s+([0-9][0-9,]*)`)
+
+func parsePositiveInt(s string) int {
+	s = strings.ReplaceAll(strings.TrimSpace(s), ",", "")
+	v, _ := strconv.Atoi(s)
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+func parseRateLimitObservation(status int, body []byte) rateLimitObservation {
+	if status != http.StatusTooManyRequests {
+		return rateLimitObservation{}
+	}
+	text := strings.ToLower(string(body))
+	obs := rateLimitObservation{}
+	switch {
+	case strings.Contains(text, "input tokens per minute") || strings.Contains(text, "itpm"):
+		obs.Kind = "itpm"
+	case strings.Contains(text, "output tokens per minute") || strings.Contains(text, "otpm"):
+		obs.Kind = "otpm"
+	case strings.Contains(text, "tokens per minute") || strings.Contains(text, "tpm"):
+		obs.Kind = "tpm"
+	case strings.Contains(text, "requests per minute") || strings.Contains(text, "rpm"):
+		obs.Kind = "rpm"
+	default:
+		obs.Kind = "rate_limit"
+	}
+	if m := providerLimitPattern.FindStringSubmatch(string(body)); len(m) == 3 {
+		obs.Limit, obs.Requested = parsePositiveInt(m[1]), parsePositiveInt(m[2])
+	}
+	return obs
+}
+
+func estimateMessageTokens(v any) int {
+	switch x := v.(type) {
+	case string:
+		return max(1, (len([]byte(x))+3)/4)
+	case []any:
+		n := 0
+		for _, item := range x {
+			n += estimateMessageTokens(item)
+		}
+		return n
+	case map[string]any:
+		typ, _ := x["type"].(string)
+		if typ == "image_url" || typ == "input_image" || typ == "image" {
+			return 512
+		}
+		n := 0
+		for k, item := range x {
+			if k == "image_url" || k == "url" {
+				continue
+			}
+			n += estimateMessageTokens(item)
+		}
+		return n
+	default:
+		return 0
+	}
+}
+
+func estimateChatInputTokens(body []byte) int {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return max(1, len(body)/4)
+	}
+	messages, _ := payload["messages"].([]any)
+	total := 64
+	for _, raw := range messages {
+		total += 8 + estimateMessageTokens(raw)
+	}
+	return max(1, total)
+}
+
+func compactText(v string, budgetTokens int) string {
+	if budgetTokens <= 0 {
+		return ""
+	}
+	maxBytes := budgetTokens * 4
+	if len(v) <= maxBytes {
+		return v
+	}
+	if maxBytes < 160 {
+		return v[len(v)-maxBytes:]
+	}
+	head := maxBytes * 3 / 5
+	tail := maxBytes - head - len("\n…[context compacted]…\n")
+	if tail < 32 {
+		tail = 32
+	}
+	return v[:head] + "\n…[context compacted]…\n" + v[len(v)-tail:]
+}
+
+func compactMessage(raw any, budgetTokens int) any {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return raw
+	}
+	copyMap := make(map[string]any, len(m))
+	for k, v := range m {
+		copyMap[k] = v
+	}
+	switch c := copyMap["content"].(type) {
+	case string:
+		copyMap["content"] = compactText(c, budgetTokens)
+	case []any:
+		remaining := budgetTokens
+		out := make([]any, 0, len(c))
+		for _, part := range c {
+			pm, _ := part.(map[string]any)
+			if pm != nil {
+				typ, _ := pm["type"].(string)
+				if typ == "image_url" || typ == "input_image" || typ == "image" {
+					out = append(out, part)
+					remaining -= 512
+					continue
+				}
+				if text, ok := pm["text"].(string); ok {
+					cp := make(map[string]any, len(pm))
+					for k, v := range pm {
+						cp[k] = v
+					}
+					cp["text"] = compactText(text, max(0, remaining))
+					remaining -= estimateMessageTokens(cp["text"])
+					out = append(out, cp)
+					continue
+				}
+			}
+			out = append(out, part)
+			remaining -= estimateMessageTokens(part)
+		}
+		copyMap["content"] = out
+	}
+	return copyMap
+}
+
+func trimChatContext(body []byte, target int) ([]byte, int, int, error) {
+	if target <= 0 {
+		return body, estimateChatInputTokens(body), estimateChatInputTokens(body), nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, 0, 0, err
+	}
+	messages, ok := payload["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		return body, estimateChatInputTokens(body), estimateChatInputTokens(body), nil
+	}
+	original := estimateChatInputTokens(body)
+	if original <= target {
+		return body, original, original, nil
+	}
+	budget := max(256, target-96)
+	selected := make([]any, 0, len(messages))
+	used := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		cost := 8 + estimateMessageTokens(messages[i])
+		if len(selected) == 0 || used+cost <= budget {
+			selected = append(selected, messages[i])
+			used += cost
+			continue
+		}
+		// Preserve a leading system/developer instruction if it fits after compaction.
+		if i == 0 {
+			if m, ok := messages[i].(map[string]any); ok {
+				role, _ := m["role"].(string)
+				if role == "system" || role == "developer" {
+					selected = append(selected, compactMessage(messages[i], max(64, budget-used)))
+					used = budget
+				}
+			}
+		}
+	}
+	for i, j := 0, len(selected)-1; i < j; i, j = i+1, j-1 {
+		selected[i], selected[j] = selected[j], selected[i]
+	}
+	payload["messages"] = selected
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	final := estimateChatInputTokens(out)
+	if final > target && len(selected) > 0 {
+		// The newest turn itself is larger than the target. Compact it rather than failing repeatedly.
+		last := len(selected) - 1
+		selected[last] = compactMessage(selected[last], max(128, target-192))
+		payload["messages"] = selected
+		out, err = json.Marshal(payload)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		final = estimateChatInputTokens(out)
+	}
+	return out, original, final, nil
+}
+
+func applyModelOutputCap(body []byte, maxOutput int) []byte {
+	if maxOutput <= 0 {
+		return body
+	}
+	var p map[string]any
+	if json.Unmarshal(body, &p) != nil {
+		return body
+	}
+	cur := maxOutput
+	for _, key := range []string{"max_completion_tokens", "max_tokens"} {
+		if v, ok := p[key].(float64); ok && int(v) > 0 && int(v) < cur {
+			cur = int(v)
+		}
+		delete(p, "max_tokens")
+	}
+	p["max_completion_tokens"] = cur
+	out, err := json.Marshal(p)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func setRequestModel(body []byte, model string) []byte {
+	if strings.TrimSpace(model) == "" {
+		return body
+	}
+	var p map[string]any
+	if json.Unmarshal(body, &p) != nil {
+		return body
+	}
+	p["model"] = model
+	out, err := json.Marshal(p)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func runtimeContextTarget(m store.ProviderModel, observed int, factor float64) int {
+	candidates := []int{}
+	if m.ContextTargetTokens > 0 {
+		candidates = append(candidates, m.ContextTargetTokens)
+	}
+	if m.MaxInputTokens > 0 {
+		candidates = append(candidates, m.MaxInputTokens)
+	}
+	if m.ITPMLimit > 0 {
+		candidates = append(candidates, int(float64(m.ITPMLimit)*0.78))
+	}
+	if observed > 0 {
+		candidates = append(candidates, int(float64(observed)*0.78))
+	}
+	if len(candidates) == 0 {
+		return 0
+	}
+	target := candidates[0]
+	for _, v := range candidates[1:] {
+		if v > 0 && v < target {
+			target = v
+		}
+	}
+	if factor > 0 && factor < 1 {
+		target = int(float64(target) * factor)
+	}
+	return max(256, target)
+}
+
+func defaultRuntimeModel(name string) store.ProviderModel {
+	return store.ProviderModel{LiteLLMModelName: name, TimeoutSeconds: 300, StreamTimeoutSeconds: 300, MaxRetries: 2, ProviderMaxRetries: 0, RetryBackoffMS: 500, ContextStrategy: "adaptive"}
+}
+
+func (a *app) runtimeModel(ctx context.Context, name string) store.ProviderModel {
+	if a.store == nil || strings.TrimSpace(name) == "" {
+		return defaultRuntimeModel(name)
+	}
+	m, err := a.store.ProviderModelByLiteLLMName(ctx, name)
+	if err != nil {
+		return defaultRuntimeModel(name)
+	}
+	if m.TimeoutSeconds <= 0 {
+		m.TimeoutSeconds = 300
+	}
+	if m.StreamTimeoutSeconds <= 0 {
+		m.StreamTimeoutSeconds = m.TimeoutSeconds
+	}
+	if m.ContextStrategy == "" {
+		m.ContextStrategy = "adaptive"
+	}
+	return m
+}
+
+type inferenceRequestFactory func(body []byte) (*http.Request, error)
+
+func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model string, makeReq inferenceRequestFactory) (*http.Response, []byte, string, modelRecoveryMeta, error) {
+	m := a.runtimeModel(ctx, model)
+	meta := modelRecoveryMeta{Attempts: 0, OriginalInputTokens: estimateChatInputTokens(body), FinalModel: model}
+	body = applyModelOutputCap(body, m.MaxOutputTokens)
+	strategy := m.ContextStrategy
+	if strategy == "" {
+		strategy = "adaptive"
+	}
+	if strategy == "adaptive" || strategy == "trim" {
+		if target := runtimeContextTarget(m, 0, 1); target > 0 {
+			trimmed, orig, final, err := trimChatContext(body, target)
+			if err == nil {
+				body = trimmed
+				meta.OriginalInputTokens = orig
+				meta.FinalInputTokens = final
+				meta.ContextTrimmed = final < orig
+			}
+		}
+	}
+	if meta.FinalInputTokens == 0 {
+		meta.FinalInputTokens = estimateChatInputTokens(body)
+	}
+	currentModel := model
+	maxRetries := m.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	if maxRetries > 4 {
+		maxRetries = 4
+	}
+	for attempt := 0; ; attempt++ {
+		meta.Attempts++
+		req, err := makeReq(body)
+		if err != nil {
+			return nil, body, currentModel, meta, err
+		}
+		resp, err := a.inferenceHTTP.Do(req)
+		if err != nil {
+			return resp, body, currentModel, meta, err
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			meta.FinalInputTokens = estimateChatInputTokens(body)
+			meta.FinalModel = currentModel
+			return resp, body, currentModel, meta, nil
+		}
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+		obs := parseRateLimitObservation(resp.StatusCode, errBody)
+		meta.ObservedRateKind, meta.ObservedRateLimit, meta.ObservedRequested = obs.Kind, obs.Limit, obs.Requested
+		if attempt >= maxRetries || strategy == "reject" {
+			resp.Body = io.NopCloser(bytes.NewReader(errBody))
+			return resp, body, currentModel, meta, nil
+		}
+		recovered := false
+		if (strategy == "adaptive" || strategy == "trim") && (obs.Kind == "itpm" || obs.Kind == "tpm" || obs.Requested > obs.Limit && obs.Limit > 0) {
+			target := runtimeContextTarget(m, obs.Limit, 1-float64(attempt)*0.18)
+			if target == 0 && obs.Limit > 0 {
+				target = max(256, int(float64(obs.Limit)*0.72))
+			}
+			if target > 0 {
+				trimmed, orig, final, trimErr := trimChatContext(body, target)
+				if trimErr == nil && final < estimateChatInputTokens(body) {
+					body = trimmed
+					if meta.OriginalInputTokens == 0 {
+						meta.OriginalInputTokens = orig
+					}
+					meta.FinalInputTokens = final
+					meta.ContextTrimmed = true
+					recovered = true
+				}
+			}
+		}
+		if !recovered && (strategy == "adaptive" || strategy == "fallback") && m.FallbackModelName != "" && m.FallbackModelName != currentModel {
+			meta.FallbackFrom = currentModel
+			meta.FallbackTo = m.FallbackModelName
+			currentModel = m.FallbackModelName
+			body = setRequestModel(body, currentModel)
+			m = a.runtimeModel(ctx, currentModel)
+			body = applyModelOutputCap(body, m.MaxOutputTokens)
+			strategy = m.ContextStrategy
+			recovered = true
+		}
+		if !recovered {
+			// RPM/opaque rate limits: retry once with bounded backoff; do not sleep on huge provider Retry-After values.
+			if m.RetryBackoffMS <= 0 {
+				resp.Body = io.NopCloser(bytes.NewReader(errBody))
+				return resp, body, currentModel, meta, nil
+			}
+			select {
+			case <-ctx.Done():
+				return nil, body, currentModel, meta, ctx.Err()
+			case <-time.After(time.Duration(min(m.RetryBackoffMS*(attempt+1), 3000)) * time.Millisecond):
+			}
+		}
+	}
+}
+
+func recoveryMetadata(meta modelRecoveryMeta) map[string]any {
+	return map[string]any{"modelRecovery": meta}
+}
+
+func friendlyRateLimitError(body []byte, meta modelRecoveryMeta) []byte {
+	obs := parseRateLimitObservation(http.StatusTooManyRequests, body)
+	message := "Model provider is temporarily rate limited. Daiki retried automatically; please continue in a moment."
+	if obs.Kind == "itpm" && obs.Limit > 0 {
+		message = fmt.Sprintf("This model's input limit is %d tokens/minute. Daiki compacted the conversation and retried automatically, but the provider is still rate limited. Your chat is preserved; send the next message normally.", obs.Limit)
+	}
+	out, _ := json.Marshal(map[string]any{"error": "provider_rate_limited", "message": message, "retryable": true, "recovery": meta})
+	return out
+}

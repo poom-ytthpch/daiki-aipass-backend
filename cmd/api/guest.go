@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -25,7 +26,15 @@ func (a *app) guestPolicyPublic(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest policy unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"enabled": p.Enabled, "model": "fast", "tokenLimit": p.TokenLimit, "intervalKind": p.IntervalKind, "requestsPerHour": p.RequestsPerHour, "minIntervalSeconds": p.MinIntervalSeconds, "maxCompletionTokens": p.MaxCompletionTokens})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": p.Enabled, "model": "fast", "tokenLimit": p.TokenLimit, "intervalKind": p.IntervalKind,
+		"requestsPerHour": p.RequestsPerHour, "minIntervalSeconds": p.MinIntervalSeconds, "maxCompletionTokens": p.MaxCompletionTokens,
+		"allowUploads": p.AllowUploads, "allowImageGeneration": p.AllowImageGeneration, "allowFileGeneration": p.AllowFileGeneration,
+		"maxUploadBytes": p.MaxUploadBytes, "maxUploadsPerHour": p.MaxUploadsPerHour, "maxStoredFiles": p.MaxStoredFiles,
+		"maxStoredBytes": p.MaxStoredBytes, "attachmentRetentionHours": p.AttachmentRetentionHours,
+		"imageGenerationsPerDay": p.ImageGenerationsPerDay, "fileGenerationsPerDay": p.FileGenerationsPerDay,
+		"maxGeneratedFileBytes": p.MaxGeneratedFileBytes,
+	})
 }
 
 func (a *app) adminGuestPolicy(w http.ResponseWriter, r *http.Request) {
@@ -36,7 +45,8 @@ func (a *app) adminGuestPolicy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		u, requests, _ := a.store.GuestUsageTotals(r.Context())
-		writeJSON(w, http.StatusOK, map[string]any{"policy": p, "configured": configured, "usage": u, "requests": requests})
+		devices, _ := a.store.GuestUsageBreakdown(r.Context(), 500)
+		writeJSON(w, http.StatusOK, map[string]any{"policy": p, "configured": configured, "usage": u, "requests": requests, "devices": devices})
 		return
 	}
 	var p store.GuestAccessPolicy
@@ -80,6 +90,40 @@ func guestSubject(r *http.Request) string {
 	return "guest:" + hex.EncodeToString(sum[:12])
 }
 
+type guestIdentity struct {
+	Subject       string
+	DeviceID      string
+	DeviceName    string
+	UserAgentHash string
+}
+
+func cleanGuestHeader(value string, maxLen int) string {
+	value = strings.TrimSpace(value)
+	if len(value) > maxLen {
+		value = value[:maxLen]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return -1
+		}
+		return r
+	}, value)
+}
+func guestIdentityForRequest(r *http.Request) guestIdentity {
+	deviceID := cleanGuestHeader(r.Header.Get("X-Daiki-Guest-Device-ID"), 128)
+	if deviceID == "" {
+		deviceID = "anonymous"
+	}
+	deviceName := cleanGuestHeader(r.Header.Get("X-Daiki-Guest-Device-Name"), 120)
+	ua := sha256.Sum256([]byte(r.UserAgent()))
+	return guestIdentity{Subject: guestSubject(r), DeviceID: deviceID, DeviceName: deviceName, UserAgentHash: hex.EncodeToString(ua[:8])}
+}
+func (a *app) recordGuestIdentity(ctx context.Context, id guestIdentity) {
+	if a.store != nil {
+		_ = a.store.UpsertGuestDevice(ctx, id.Subject, id.DeviceID, id.DeviceName, id.UserAgentHash)
+	}
+}
+
 func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -113,6 +157,12 @@ func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 	if stream, ok := payload["stream"].(bool); ok {
 		clean["stream"] = stream
 	}
+	if ids, ok := payload["attachmentIds"].([]any); ok {
+		if len(ids) > 10 {
+			return nil, fmt.Errorf("guest chat supports at most 10 attachments")
+		}
+		clean["attachmentIds"] = ids
+	}
 	return json.Marshal(clean)
 }
 
@@ -138,6 +188,9 @@ func (a *app) guestQuota(ctx context.Context, subject string, p store.GuestAcces
 	limit := p.TokenLimit
 	policy := store.Policy{ScopeType: "system", ScopeID: "guest", QuotaMode: "limited", TokenLimit: &limit, IntervalKind: p.IntervalKind, IntervalSeconds: p.IntervalSeconds, AllowedModels: json.RawMessage(`["fast"]`)}
 	start, reset := quotaWindow(policy, time.Now().UTC())
+	if lastReset, resetErr := a.store.GuestLastReset(ctx, subject); resetErr == nil && lastReset != nil && lastReset.After(start) {
+		start = *lastReset
+	}
 	u, err := a.store.GuestUsageSummary(ctx, subject, start)
 	if err != nil {
 		return quotaDecision{}, policy, err
@@ -161,17 +214,19 @@ func (a *app) inferenceUpstream(path string) (string, string, string) {
 }
 
 func shouldFallbackFromHermes(upstreamName string, enabled bool, statusCode int, err error) bool {
-	return upstreamName == "hermes" && enabled && (err != nil || statusCode >= 500)
+	return strings.HasPrefix(upstreamName, "hermes") && enabled && (err != nil || statusCode >= 500)
 }
 
 func (a *app) inferenceUpstreamForRequest(r *http.Request, path string) (string, string, string) {
-	// Restricted authenticated accounts must never inherit the Hermes API profile's
-	// agent toolsets. Approved users/API keys may use Hermes; pending users stay on
-	// the same Fast-only direct LiteLLM path as before.
-	if u, ok := currentUser(r); ok && u.Status != "approved" {
-		return a.liteLLMUpstream(path)
-	}
+	// Every authenticated inference request enters Hermes. Daiki still owns auth,
+	// quota and model policy; Hermes owns the agent/tool/skill loop.
 	return a.inferenceUpstream(path)
+}
+func (a *app) guestHermesUpstream(path string) (string, string, string) {
+	if a.cfg.HermesEnabled && a.cfg.HermesBase != "" {
+		return strings.TrimRight(a.cfg.HermesBase, "/") + "/p/guest" + path, a.cfg.HermesKey, "hermes-guest"
+	}
+	return a.liteLLMUpstream(path)
 }
 
 func hermesSessionKey(r *http.Request) string {
@@ -209,7 +264,9 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, status, map[string]string{"error": code})
 		return
 	}
-	subject := guestSubject(r)
+	identity := guestIdentityForRequest(r)
+	subject := identity.Subject
+	a.recordGuestIdentity(r.Context(), identity)
 	if retry, rateErr := a.enforceGuestRate(r.Context(), subject, p); rateErr != nil {
 		if retry > 0 {
 			seconds := max(1, int(retry.Seconds()))
@@ -226,6 +283,11 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		return
 	}
 	body, err = restrictGuestChat(body, p)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	body, attachments, err := a.expandGuestChatAttachments(r.Context(), identity, body, p)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -266,7 +328,11 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest usage ledger unavailable"})
 		return
 	}
-	_ = a.store.MergeUsageMetadata(r.Context(), requestID, map[string]any{"authKind": "guest", "resolvedAlias": "fast", "physicalModel": route.PhysicalModel})
+	_ = a.store.MergeUsageMetadata(r.Context(), requestID, map[string]any{
+		"authKind": "guest", "resolvedAlias": "fast", "physicalModel": route.PhysicalModel,
+		"guestNetworkId": identity.Subject, "guestDeviceId": identity.DeviceID, "guestDeviceName": identity.DeviceName,
+		"attachments": attachments,
+	})
 	ticket, err := a.queue.Acquire(r.Context(), requestID, subject, inference.WorkloadFast, route.Priority)
 	if err != nil {
 		a.releaseReservation(context.Background(), requestID, decision, reserved)
@@ -282,31 +348,74 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	if stream {
 		upstreamBody = ensureStreamUsage(upstreamBody)
 	}
-	upstreamURL, upstreamKey, upstreamName := a.liteLLMUpstream("/v1/chat/completions")
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, strings.NewReader(string(upstreamBody)))
-	if err != nil {
-		a.releaseReservation(r.Context(), requestID, decision, reserved)
-		_ = a.store.FinishUsage(r.Context(), requestID, "failed", store.Usage{})
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request construction failed"})
-		return
+	upstreamURL, upstreamKey, upstreamName := a.guestHermesUpstream("/v1/chat/completions")
+	makeGuestRequest := func(payload []byte) (*http.Request, error) {
+		req, buildErr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, strings.NewReader(string(payload)))
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		req.Header.Set("content-type", "application/json")
+		if upstreamKey != "" {
+			req.Header.Set("authorization", "Bearer "+upstreamKey)
+		}
+		req.Header.Set("x-daiki-request-id", requestID)
+		req.Header.Set("x-daiki-principal", "guest")
+		if strings.HasPrefix(upstreamName, "hermes") {
+			req.Header.Set("X-Hermes-Session-Id", requestID)
+			req.Header.Set("X-Hermes-Session-Key", "daiki-guest:"+strings.TrimPrefix(identity.Subject, "guest:")+":"+identity.DeviceID)
+		}
+		return req, nil
 	}
-	req.Header.Set("content-type", "application/json")
-	if upstreamKey != "" {
-		req.Header.Set("authorization", "Bearer "+upstreamKey)
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, makeGuestRequest)
+	upstreamBody = recoveredBody
+	if recoveredModel != "" {
+		route.PhysicalModel = recoveredModel
 	}
-	req.Header.Set("x-daiki-request-id", requestID)
-	req.Header.Set("x-daiki-principal", "guest")
-	resp, err := a.inferenceHTTP.Do(req)
+	_ = a.store.MergeUsageMetadata(r.Context(), requestID, recoveryMetadata(recovery))
+	statusCode := 0
+	if resp != nil {
+		statusCode = resp.StatusCode
+	}
+	if shouldFallbackFromHermes(upstreamName, a.cfg.HermesFallbackToLiteLLM, statusCode, err) {
+		fallbackURL, fallbackKey, fallbackName := a.liteLLMUpstream("/v1/chat/completions")
+		fallbackReq, buildErr := http.NewRequestWithContext(r.Context(), http.MethodPost, fallbackURL, strings.NewReader(string(upstreamBody)))
+		if buildErr == nil {
+			fallbackReq.Header.Set("content-type", "application/json")
+			if fallbackKey != "" {
+				fallbackReq.Header.Set("authorization", "Bearer "+fallbackKey)
+			}
+			resp, err = a.inferenceHTTP.Do(fallbackReq)
+			if err == nil {
+				upstreamName = fallbackName
+			}
+		}
+	}
 	if err != nil {
 		a.releaseReservation(r.Context(), requestID, decision, reserved)
 		_ = a.store.FinishUsage(context.Background(), requestID, "failed", store.Usage{})
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": upstreamName + " unavailable"})
 		return
 	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		rawRateBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+		friendly := friendlyRateLimitError(rawRateBody, recovery)
+		resp.Body = io.NopCloser(bytes.NewReader(friendly))
+		resp.ContentLength = int64(len(friendly))
+		resp.Header.Set("content-type", "application/json")
+	}
 	defer resp.Body.Close()
 	w.Header().Set("x-daiki-access-mode", "guest-fast")
 	w.Header().Set("x-daiki-model-alias", "fast")
 	w.Header().Set("x-daiki-inference-upstream", upstreamName)
+	w.Header().Set("x-daiki-model-physical", route.PhysicalModel)
+	w.Header().Set("x-daiki-retry-attempts", strconv.Itoa(max(0, recovery.Attempts-1)))
+	if recovery.ContextTrimmed {
+		w.Header().Set("x-daiki-context-trimmed", "true")
+	}
+	if recovery.FallbackTo != "" {
+		w.Header().Set("x-daiki-fallback-model", recovery.FallbackTo)
+	}
 	if decision.Remaining != nil {
 		w.Header().Set("x-daiki-quota-remaining", fmt.Sprint(*decision.Remaining))
 	}

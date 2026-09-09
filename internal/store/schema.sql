@@ -63,9 +63,66 @@ CREATE TABLE IF NOT EXISTS guest_access_policy (
     min_interval_seconds INTEGER NOT NULL DEFAULT 45 CHECK (min_interval_seconds >= 0),
     max_completion_tokens INTEGER NOT NULL DEFAULT 384 CHECK (max_completion_tokens > 0),
     fast_model TEXT NOT NULL DEFAULT 'fast',
+    allow_uploads BOOLEAN NOT NULL DEFAULT TRUE,
+    allow_image_generation BOOLEAN NOT NULL DEFAULT TRUE,
+    allow_file_generation BOOLEAN NOT NULL DEFAULT TRUE,
+    max_upload_bytes BIGINT NOT NULL DEFAULT 10485760 CHECK (max_upload_bytes > 0),
+    max_uploads_per_hour INTEGER NOT NULL DEFAULT 10 CHECK (max_uploads_per_hour > 0),
+    max_stored_files INTEGER NOT NULL DEFAULT 20 CHECK (max_stored_files > 0),
+    max_stored_bytes BIGINT NOT NULL DEFAULT 52428800 CHECK (max_stored_bytes > 0),
+    attachment_retention_hours INTEGER NOT NULL DEFAULT 24 CHECK (attachment_retention_hours > 0),
+    image_generations_per_day INTEGER NOT NULL DEFAULT 3 CHECK (image_generations_per_day >= 0),
+    file_generations_per_day INTEGER NOT NULL DEFAULT 5 CHECK (file_generations_per_day >= 0),
+    max_generated_file_bytes BIGINT NOT NULL DEFAULT 1048576 CHECK (max_generated_file_bytes > 0),
     updated_by TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS allow_uploads BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS allow_image_generation BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS allow_file_generation BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_upload_bytes BIGINT NOT NULL DEFAULT 10485760;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_uploads_per_hour INTEGER NOT NULL DEFAULT 10;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_stored_files INTEGER NOT NULL DEFAULT 20;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_stored_bytes BIGINT NOT NULL DEFAULT 52428800;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS attachment_retention_hours INTEGER NOT NULL DEFAULT 24;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS image_generations_per_day INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS file_generations_per_day INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_generated_file_bytes BIGINT NOT NULL DEFAULT 1048576;
+CREATE TABLE IF NOT EXISTS guest_devices (
+    guest_subject TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    device_name TEXT NOT NULL DEFAULT '',
+    user_agent_hash TEXT NOT NULL DEFAULT '',
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (guest_subject, device_id)
+);
+CREATE INDEX IF NOT EXISTS guest_devices_last_seen_idx ON guest_devices(last_seen_at DESC);
+CREATE TABLE IF NOT EXISTS guest_quota_reset_events (
+    id BIGSERIAL PRIMARY KEY,
+    guest_subject TEXT NOT NULL,
+    actor_subject TEXT NOT NULL,
+    reset_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS guest_quota_reset_events_subject_time_idx ON guest_quota_reset_events(guest_subject,reset_at DESC);
+CREATE TABLE IF NOT EXISTS guest_attachments (
+    id TEXT PRIMARY KEY,
+    guest_subject TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    relative_path TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'file' CHECK (source IN ('file','image','generated-file','generated-image')),
+    media_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+    sha256 TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    extract_status TEXT NOT NULL DEFAULT 'stored',
+    extracted_text TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS guest_attachments_owner_created_idx ON guest_attachments(guest_subject,device_id,created_at DESC) WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS quota_grants (
     id BIGSERIAL PRIMARY KEY,
@@ -211,10 +268,38 @@ CREATE TABLE IF NOT EXISTS provider_models (
     litellm_model_id TEXT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','active','error','disabled')),
     last_error TEXT NOT NULL DEFAULT '',
+    max_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (max_input_tokens >= 0),
+    max_output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (max_output_tokens >= 0),
+    tpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (tpm_limit >= 0),
+    itpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (itpm_limit >= 0),
+    otpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (otpm_limit >= 0),
+    rpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (rpm_limit >= 0),
+    timeout_seconds INTEGER NOT NULL DEFAULT 300 CHECK (timeout_seconds > 0 AND timeout_seconds <= 1800),
+    stream_timeout_seconds INTEGER NOT NULL DEFAULT 300 CHECK (stream_timeout_seconds > 0 AND stream_timeout_seconds <= 1800),
+    max_retries INTEGER NOT NULL DEFAULT 2 CHECK (max_retries >= 0 AND max_retries <= 8),
+    provider_max_retries INTEGER NOT NULL DEFAULT 0 CHECK (provider_max_retries >= 0 AND provider_max_retries <= 8),
+    retry_backoff_ms INTEGER NOT NULL DEFAULT 500 CHECK (retry_backoff_ms >= 0 AND retry_backoff_ms <= 30000),
+    context_strategy TEXT NOT NULL DEFAULT 'adaptive' CHECK (context_strategy IN ('adaptive','trim','fallback','reject')),
+    context_target_tokens INTEGER NOT NULL DEFAULT 0 CHECK (context_target_tokens >= 0),
+    fallback_model_name TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(provider_id, upstream_model)
 );
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS max_input_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS max_output_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS tpm_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS itpm_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS otpm_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS rpm_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS timeout_seconds INTEGER NOT NULL DEFAULT 300;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS stream_timeout_seconds INTEGER NOT NULL DEFAULT 300;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 2;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS provider_max_retries INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS retry_backoff_ms INTEGER NOT NULL DEFAULT 500;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS context_strategy TEXT NOT NULL DEFAULT 'adaptive';
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS context_target_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS fallback_model_name TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS model_aliases (
     alias TEXT PRIMARY KEY CHECK (alias IN ('fast','balanced','deep','vision')),

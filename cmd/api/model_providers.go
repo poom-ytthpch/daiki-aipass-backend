@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -430,12 +431,34 @@ func (a *app) litellmAdmin(ctx context.Context, method, path string, payload any
 	return out, resp.StatusCode, nil
 }
 
-func (a *app) providerLiteLLMParams(p store.ModelProvider, upstream string) (map[string]any, error) {
+func (a *app) providerLiteLLMParams(p store.ModelProvider, m store.ProviderModel) (map[string]any, error) {
 	providerKey, err := a.providerAPIKey(p)
 	if err != nil {
 		return nil, err
 	}
-	params := map[string]any{"model": providerLiteLLMModel(p, upstream), "timeout": 300}
+	timeout := m.TimeoutSeconds
+	if timeout <= 0 {
+		timeout = 300
+	}
+	params := map[string]any{"model": providerLiteLLMModel(p, m.UpstreamModel), "timeout": timeout}
+	if m.StreamTimeoutSeconds > 0 {
+		params["stream_timeout"] = m.StreamTimeoutSeconds
+	}
+	if m.ProviderMaxRetries >= 0 {
+		params["max_retries"] = m.ProviderMaxRetries
+	}
+	if m.TPMLimit > 0 {
+		params["tpm"] = m.TPMLimit
+	}
+	if m.ITPMLimit > 0 {
+		params["itpm"] = m.ITPMLimit
+	}
+	if m.OTPMLimit > 0 {
+		params["otpm"] = m.OTPMLimit
+	}
+	if m.RPMLimit > 0 {
+		params["rpm"] = m.RPMLimit
+	}
 	if p.ProviderType != "anthropic" && p.ProviderType != "gemini" {
 		params["api_base"] = providerLiteLLMBase(p)
 	}
@@ -456,11 +479,11 @@ func (a *app) syncProviderModels(ctx context.Context, p store.ModelProvider) err
 		if m.Status != "active" || m.LiteLLMModelID == "" {
 			continue
 		}
-		params, err := a.providerLiteLLMParams(p, m.UpstreamModel)
+		params, err := a.providerLiteLLMParams(p, m)
 		if err != nil {
 			return err
 		}
-		_, _, err = a.litellmAdmin(ctx, http.MethodPost, "/model/update", map[string]any{"model_info": map[string]any{"id": m.LiteLLMModelID}, "litellm_params": params})
+		_, _, err = a.litellmAdmin(ctx, http.MethodPost, "/model/update", map[string]any{"model_info": providerLiteLLMModelInfo(m, m.LiteLLMModelID), "litellm_params": params})
 		if err != nil {
 			_ = a.store.SetProviderModelState(ctx, m.ID, "error", "", err.Error())
 			return fmt.Errorf("update %s: %w", m.LiteLLMModelName, err)
@@ -468,6 +491,130 @@ func (a *app) syncProviderModels(ctx context.Context, p store.ModelProvider) err
 		_ = a.store.SetProviderModelState(ctx, m.ID, "active", "", "")
 	}
 	return nil
+}
+
+func providerLiteLLMModelInfo(m store.ProviderModel, id string) map[string]any {
+	info := map[string]any{"provider": "daiki", "provider_id": m.ProviderID}
+	if id != "" {
+		info["id"] = id
+	}
+	if m.MaxInputTokens > 0 {
+		info["max_input_tokens"] = m.MaxInputTokens
+	}
+	if m.MaxOutputTokens > 0 {
+		info["max_output_tokens"] = m.MaxOutputTokens
+	}
+	info["daiki_context_strategy"] = m.ContextStrategy
+	info["daiki_context_target_tokens"] = m.ContextTargetTokens
+	info["daiki_fallback_model"] = m.FallbackModelName
+	return info
+}
+
+func (a *app) adminUpdateProviderModel(w http.ResponseWriter, r *http.Request) {
+	currentModel, err := a.store.ProviderModel(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, 404, map[string]string{"error": "model not found"})
+		return
+	}
+	var in struct {
+		MaxInputTokens       int    `json:"maxInputTokens"`
+		MaxOutputTokens      int    `json:"maxOutputTokens"`
+		TPMLimit             int    `json:"tpmLimit"`
+		ITPMLimit            int    `json:"itpmLimit"`
+		OTPMLimit            int    `json:"otpmLimit"`
+		RPMLimit             int    `json:"rpmLimit"`
+		TimeoutSeconds       int    `json:"timeoutSeconds"`
+		StreamTimeoutSeconds int    `json:"streamTimeoutSeconds"`
+		MaxRetries           int    `json:"maxRetries"`
+		ProviderMaxRetries   int    `json:"providerMaxRetries"`
+		RetryBackoffMS       int    `json:"retryBackoffMs"`
+		ContextStrategy      string `json:"contextStrategy"`
+		ContextTargetTokens  int    `json:"contextTargetTokens"`
+		FallbackModelName    string `json:"fallbackModelName"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid model settings"})
+		return
+	}
+	currentModel.MaxInputTokens = in.MaxInputTokens
+	currentModel.MaxOutputTokens = in.MaxOutputTokens
+	currentModel.TPMLimit = in.TPMLimit
+	currentModel.ITPMLimit = in.ITPMLimit
+	currentModel.OTPMLimit = in.OTPMLimit
+	currentModel.RPMLimit = in.RPMLimit
+	currentModel.TimeoutSeconds = in.TimeoutSeconds
+	currentModel.StreamTimeoutSeconds = in.StreamTimeoutSeconds
+	currentModel.MaxRetries = in.MaxRetries
+	currentModel.ProviderMaxRetries = in.ProviderMaxRetries
+	currentModel.RetryBackoffMS = in.RetryBackoffMS
+	currentModel.ContextStrategy = strings.TrimSpace(in.ContextStrategy)
+	currentModel.ContextTargetTokens = in.ContextTargetTokens
+	currentModel.FallbackModelName = strings.TrimSpace(in.FallbackModelName)
+	if currentModel.TimeoutSeconds == 0 {
+		currentModel.TimeoutSeconds = 300
+	}
+	if currentModel.StreamTimeoutSeconds == 0 {
+		currentModel.StreamTimeoutSeconds = currentModel.TimeoutSeconds
+	}
+	if currentModel.ContextStrategy == "" {
+		currentModel.ContextStrategy = "adaptive"
+	}
+	if currentModel.FallbackModelName != "" {
+		if currentModel.FallbackModelName == currentModel.LiteLLMModelName {
+			writeJSON(w, 400, map[string]string{"error": "fallback model cannot be the same model"})
+			return
+		}
+		fallback, ferr := a.store.ProviderModelByLiteLLMName(r.Context(), currentModel.FallbackModelName)
+		if ferr != nil || fallback.Status != "active" {
+			writeJSON(w, 400, map[string]string{"error": "fallbackModelName must be an active registered model"})
+			return
+		}
+	}
+	updated, err := a.store.UpdateProviderModelRuntime(r.Context(), current(r).Sub, currentModel)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	p, err := a.store.ModelProvider(r.Context(), updated.ProviderID)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "provider unavailable"})
+		return
+	}
+	params, err := a.providerLiteLLMParams(p, updated)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "provider secret unavailable"})
+		return
+	}
+	if updated.LiteLLMModelID != "" {
+		if _, _, err = a.litellmAdmin(r.Context(), http.MethodPost, "/model/update", map[string]any{"model_info": providerLiteLLMModelInfo(updated, updated.LiteLLMModelID), "litellm_params": params}); err != nil {
+			_ = a.store.SetProviderModelState(r.Context(), updated.ID, "error", "", err.Error())
+			writeJSON(w, 502, map[string]any{"error": "LiteLLM model update failed", "detail": err.Error(), "model": updated})
+			return
+		}
+	}
+	_ = a.store.SetProviderModelState(r.Context(), updated.ID, "active", "", "")
+	updated.Status = "active"
+	updated.LastError = ""
+	writeJSON(w, 200, map[string]any{"model": updated})
+}
+
+func (a *app) reconcileProviderModels(ctx context.Context) {
+	if a.store == nil {
+		return
+	}
+	providers, err := a.store.ModelProviders(ctx)
+	if err != nil {
+		slog.Warn("provider runtime reconciliation skipped", "error", err)
+		return
+	}
+	for _, p := range providers {
+		if !p.Enabled {
+			continue
+		}
+		if err := a.syncProviderModels(ctx, p); err != nil {
+			slog.Warn("provider runtime reconciliation failed", "provider", p.ID, "error", err)
+		}
+	}
 }
 
 func (a *app) adminRegisterProviderModel(w http.ResponseWriter, r *http.Request) {
@@ -508,12 +655,12 @@ func (a *app) adminRegisterProviderModel(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, 409, map[string]string{"error": "model already registered or name conflicts"})
 		return
 	}
-	params, paramErr := a.providerLiteLLMParams(p, upstream)
+	params, paramErr := a.providerLiteLLMParams(p, rec)
 	if paramErr != nil {
 		writeJSON(w, 503, map[string]string{"error": "provider secret unavailable"})
 		return
 	}
-	result, _, regErr := a.litellmAdmin(r.Context(), http.MethodPost, "/model/new", map[string]any{"model_name": name, "litellm_params": params, "model_info": map[string]any{"provider": "daiki-" + p.ProviderType, "provider_id": p.ID}})
+	result, _, regErr := a.litellmAdmin(r.Context(), http.MethodPost, "/model/new", map[string]any{"model_name": name, "litellm_params": params, "model_info": providerLiteLLMModelInfo(rec, "")})
 	if regErr != nil {
 		_ = a.store.SetProviderModelState(r.Context(), rec.ID, "error", "", regErr.Error())
 		writeJSON(w, 502, map[string]any{"error": "LiteLLM registration failed", "detail": regErr.Error(), "model": rec})
