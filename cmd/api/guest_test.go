@@ -127,3 +127,23 @@ func TestHermesFallbackDecision(t *testing.T) {
 		t.Fatal("LiteLLM errors are not Hermes fallback candidates")
 	}
 }
+
+func TestGuestSubjectUsesCanonicalNetworkIPAndIgnoresUserAgent(t *testing.T) {
+	r1 := httptest.NewRequest(http.MethodPost, "/v1/guest/chat", nil)
+	r1.Header.Set("X-Daiki-Client-IP", "203.0.113.42")
+	r1.Header.Set("User-Agent", "browser-a")
+	r2 := httptest.NewRequest(http.MethodPost, "/v1/guest/chat", nil)
+	r2.Header.Set("X-Daiki-Client-IP", "203.0.113.42")
+	r2.Header.Set("User-Agent", "browser-b")
+	if guestSubject(r1) != guestSubject(r2) {
+		t.Fatal("changing user-agent must not create a new guest quota identity")
+	}
+	r3 := httptest.NewRequest(http.MethodPost, "/v1/guest/chat", nil)
+	r3.Header.Set("X-Daiki-Client-IP", "203.0.113.43")
+	if guestSubject(r1) == guestSubject(r3) {
+		t.Fatal("different network IPs must use different guest quota identities")
+	}
+	if strings.Contains(guestSubject(r1), "203.0.113.42") {
+		t.Fatal("raw network IP must not be persisted in guest subject")
+	}
+}

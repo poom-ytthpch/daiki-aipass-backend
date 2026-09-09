@@ -53,6 +53,12 @@ func (a *app) adminGuestPolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func guestClientIP(r *http.Request) string {
+	// Public Guest traffic is terminated by the Next.js frontend, which resolves
+	// the network address at the server boundary and forwards only this single
+	// canonical value to the internal backend service.
+	if v := strings.TrimSpace(r.Header.Get("X-Daiki-Client-IP")); v != "" {
+		return v
+	}
 	if v := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); v != "" {
 		return v
 	}
@@ -67,7 +73,9 @@ func guestClientIP(r *http.Request) string {
 }
 
 func guestSubject(r *http.Request) string {
-	raw := guestClientIP(r) + "|" + strings.TrimSpace(r.UserAgent())
+	// IP-only identity is intentionally strict: changing browser/User-Agent must
+	// not create a fresh Guest quota bucket. Raw addresses are never persisted.
+	raw := guestClientIP(r)
 	sum := sha256.Sum256([]byte(raw))
 	return "guest:" + hex.EncodeToString(sum[:12])
 }
