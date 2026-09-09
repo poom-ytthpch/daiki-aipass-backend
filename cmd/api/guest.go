@@ -85,19 +85,35 @@ func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("invalid chat payload")
 	}
-	encoded := string(body)
-	if strings.Contains(encoded, `"image_url"`) || strings.Contains(encoded, `"input_image"`) {
-		return nil, fmt.Errorf("guest chat supports text only")
+	rawMessages, ok := payload["messages"].([]any)
+	if !ok || len(rawMessages) == 0 {
+		return nil, fmt.Errorf("guest chat requires messages")
 	}
-	payload["model"] = "fast"
-	delete(payload, "tools")
-	delete(payload, "tool_choice")
-	delete(payload, "attachments")
-	delete(payload, "research")
-	delete(payload, "web_search")
-	delete(payload, "max_tokens")
-	payload["max_completion_tokens"] = p.MaxCompletionTokens
-	return json.Marshal(payload)
+	messages := make([]any, 0, len(rawMessages))
+	for _, raw := range rawMessages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("guest chat supports text only")
+		}
+		role, _ := message["role"].(string)
+		if role != "user" && role != "assistant" {
+			return nil, fmt.Errorf("guest chat supports user and assistant messages only")
+		}
+		content, ok := message["content"].(string)
+		if !ok {
+			return nil, fmt.Errorf("guest chat supports text only")
+		}
+		messages = append(messages, map[string]any{"role": role, "content": content})
+	}
+	clean := map[string]any{
+		"model":                 "fast",
+		"messages":              messages,
+		"max_completion_tokens": p.MaxCompletionTokens,
+	}
+	if stream, ok := payload["stream"].(bool); ok {
+		clean["stream"] = stream
+	}
+	return json.Marshal(clean)
 }
 
 func (a *app) enforceGuestRate(ctx context.Context, subject string, p store.GuestAccessPolicy) (time.Duration, error) {

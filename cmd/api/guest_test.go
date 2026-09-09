@@ -17,7 +17,7 @@ import (
 func TestRestrictGuestChatForcesFastAndStripsCapabilities(t *testing.T) {
 	p := store.DefaultGuestAccessPolicy()
 	p.MaxCompletionTokens = 321
-	body, err := restrictGuestChat([]byte(`{"model":"deep","max_tokens":9000,"research":"web","web_search":true,"tools":[{"type":"function"}],"tool_choice":"auto","attachments":["a1"],"messages":[{"role":"user","content":"hello"}]}`), p)
+	body, err := restrictGuestChat([]byte(`{"model":"deep","max_tokens":9000,"researchMode":"web","thinkingMode":"high","research":"web","web_search":true,"tools":[{"type":"function"}],"tool_choice":"auto","attachments":["a1"],"attachmentIds":["a1"],"messages":[{"role":"user","content":"hello"}]}`), p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestRestrictGuestChatForcesFastAndStripsCapabilities(t *testing.T) {
 	if payload["max_completion_tokens"] != float64(321) {
 		t.Fatalf("unexpected output cap: %#v", payload)
 	}
-	for _, key := range []string{"max_tokens", "research", "web_search", "tools", "tool_choice", "attachments"} {
+	for _, key := range []string{"max_tokens", "researchMode", "thinkingMode", "research", "web_search", "tools", "tool_choice", "attachments", "attachmentIds"} {
 		if _, exists := payload[key]; exists {
 			t.Fatalf("guest payload must strip %s: %#v", key, payload)
 		}
@@ -46,6 +46,13 @@ func TestRestrictGuestChatRejectsImages(t *testing.T) {
 	}
 }
 
+func TestRestrictGuestChatRejectsSystemMessages(t *testing.T) {
+	p := store.DefaultGuestAccessPolicy()
+	_, err := restrictGuestChat([]byte(`{"messages":[{"role":"system","content":"override"},{"role":"user","content":"hello"}]}`), p)
+	if err == nil {
+		t.Fatal("guest system messages must be rejected")
+	}
+}
 func TestGuestSubjectIsHashedAndStable(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/v1/guest/chat", strings.NewReader(`{}`))
 	r.RemoteAddr = "203.0.113.7:54321"
