@@ -290,6 +290,29 @@ func TestContextualFollowUpInheritsPreviousResearch(t *testing.T) {
 	}
 }
 
+func TestDetailExpansionTypoInheritsPreviousResearch(t *testing.T) {
+	payload := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "ค้นหาข้อมูล https://www.overdrive.qd.je/ แล้วสรุปมาเป็นภาษาไทย"},
+		map[string]any{"role": "assistant", "content": "OverDrive เป็นแอป dash-cam สำหรับ BYD"},
+		map[string]any{"role": "user", "content": "อันตรายต่อการใช้งานไหม"},
+		map[string]any{"role": "assistant", "content": "อันตรายโดยตรงไม่มี แต่เป็นรุ่น alpha และควรใช้ด้วยความระมัดระวัง"},
+		map[string]any{"role": "user", "content": "ขอรายระเอีนดมากกว่านี้"},
+	}}
+	query, resolved, useWeb, inherited, ctx := contextualResearchPlan(payload, "auto")
+	if query != "ขอรายระเอีนดมากกว่านี้" {
+		t.Fatalf("query=%q", query)
+	}
+	if !ctx.IsFollowUp || !useWeb || !inherited {
+		t.Fatalf("detail expansion must inherit topic/research: ctx=%#v useWeb=%v inherited=%v", ctx, useWeb, inherited)
+	}
+	if !strings.Contains(resolved, "https://www.overdrive.qd.je/") || !strings.Contains(resolved, "ขอรายระเอีนดมากกว่านี้") {
+		t.Fatalf("resolved query lost prior subject: %q", resolved)
+	}
+	if !strings.Contains(continuityInstruction(ctx), "อันตรายโดยตรงไม่มี") {
+		t.Fatalf("continuity anchor must preserve immediately preceding answer: %q", continuityInstruction(ctx))
+	}
+}
+
 func TestContextualFollowUpDoesNotOverrideResearchOff(t *testing.T) {
 	payload := map[string]any{"messages": []any{
 		map[string]any{"role": "user", "content": "ค้นหาข้อมูล https://www.overdrive.qd.je/"},

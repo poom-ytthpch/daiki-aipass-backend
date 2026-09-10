@@ -136,7 +136,8 @@ func looksContextualFollowUp(q string) bool {
 	n := strings.ToLower(q)
 	markers := []string{
 		"อันตราย", "ปลอดภัย", "มีผล", "ดีไหม", "ดีมั้ย", "ใช้ได้ไหม", "ใช้ได้มั้ย", "เป็นยังไง", "เป็นอย่างไร", "ทำไม", "ยังไง", "อย่างไร", "คุ้มไหม", "คุ้มมั้ย", "ควรไหม", "ควรมั้ย", "แล้ว", "อันนี้", "ตัวนี้", "แบบนี้", "มัน", "ต่อไหม", "ต่อมั้ย",
-		"is it", "does it", "can it", "what about", "how about", "is this", "is that", "safe", "dangerous", "worth it", "why", "how does that", "what does that",
+		"รายละเอียด", "รายละเอ", "รายระเอ", "มากกว่านี้", "เพิ่มเติม", "เพิ่มอีก", "ขอเพิ่ม", "ขยายความ", "อธิบายเพิ่ม", "เจาะลึก", "ลงลึก", "ละเอียดกว่านี้",
+		"is it", "does it", "can it", "what about", "how about", "is this", "is that", "safe", "dangerous", "worth it", "why", "how does that", "what does that", "more detail", "more details", "tell me more", "expand", "elaborate", "go deeper",
 	}
 	for _, marker := range markers {
 		if strings.Contains(n, marker) {
