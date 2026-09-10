@@ -28,13 +28,13 @@ func (a *app) guestPolicyPublic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled": p.Enabled, "model": "fast", "tokenLimit": p.TokenLimit, "intervalKind": p.IntervalKind,
+		"enabled": p.Enabled, "model": "fast", "quotaMode": p.QuotaMode, "tokenLimit": p.TokenLimit, "intervalKind": p.IntervalKind,
 		"requestsPerHour": p.RequestsPerHour, "minIntervalSeconds": p.MinIntervalSeconds, "maxCompletionTokens": p.MaxCompletionTokens,
 		"allowUploads": p.AllowUploads, "allowImageGeneration": p.AllowImageGeneration, "allowFileGeneration": p.AllowFileGeneration,
-		"maxUploadBytes": p.MaxUploadBytes, "maxUploadsPerHour": p.MaxUploadsPerHour, "maxStoredFiles": p.MaxStoredFiles,
-		"maxStoredBytes": p.MaxStoredBytes, "attachmentRetentionHours": p.AttachmentRetentionHours,
+		"maxUploadBytes": p.MaxUploadBytes, "maxImageUploadBytes": p.MaxImageUploadBytes, "maxUploadsPerHour": p.MaxUploadsPerHour, "maxStoredFiles": p.MaxStoredFiles,
+		"maxStoredBytes": p.MaxStoredBytes, "maxAttachmentsPerMessage": p.MaxAttachmentsPerMessage, "attachmentRetentionHours": p.AttachmentRetentionHours,
 		"imageGenerationsPerDay": p.ImageGenerationsPerDay, "fileGenerationsPerDay": p.FileGenerationsPerDay,
-		"maxGeneratedFileBytes": p.MaxGeneratedFileBytes,
+		"maxGeneratedFileBytes": p.MaxGeneratedFileBytes, "maxGeneratedImageBytes": p.MaxGeneratedImageBytes,
 	})
 }
 
@@ -172,8 +172,12 @@ func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 		clean["commandSkills"] = commandSkills
 	}
 	if ids, ok := payload["attachmentIds"].([]any); ok {
-		if len(ids) > 10 {
-			return nil, fmt.Errorf("guest chat supports at most 10 attachments")
+		limit := 10
+		if p.MaxAttachmentsPerMessage > 0 && p.MaxAttachmentsPerMessage < limit {
+			limit = p.MaxAttachmentsPerMessage
+		}
+		if len(ids) > limit {
+			return nil, fmt.Errorf("guest chat supports at most %d attachments", limit)
 		}
 		clean["attachmentIds"] = ids
 	}
@@ -181,13 +185,19 @@ func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 }
 
 func (a *app) enforceGuestRate(ctx context.Context, subject string, p store.GuestAccessPolicy) (time.Duration, error) {
+	// Zero explicitly means unlimited for each limiter. Avoid requiring Redis when
+	// both dimensions are unlimited so an admin policy change takes effect on the
+	// very next request without a restart.
+	if p.RequestsPerHour == 0 && p.MinIntervalSeconds == 0 {
+		return 0, nil
+	}
 	if a.redis == nil {
 		return 0, fmt.Errorf("guest rate limiter unavailable")
 	}
 	now := time.Now().UTC()
 	hourKey := "guest-chat:hour:" + subject
 	lastKey := "guest-chat:last:" + subject
-	script := `local now=tonumber(ARGV[1]); local minGap=tonumber(ARGV[2]); local hourly=tonumber(ARGV[3]); local last=tonumber(redis.call('GET',KEYS[2]) or '0'); if last>0 and now-last<minGap then return -(minGap-(now-last)) end; local count=tonumber(redis.call('GET',KEYS[1]) or '0'); if count>=hourly then local ttl=redis.call('TTL',KEYS[1]); if ttl<1 then ttl=3600 end; return -ttl end; count=redis.call('INCR',KEYS[1]); if count==1 then redis.call('EXPIRE',KEYS[1],3600) end; redis.call('SET',KEYS[2],now,'EX',3600); return count`
+	script := `local now=tonumber(ARGV[1]); local minGap=tonumber(ARGV[2]); local hourly=tonumber(ARGV[3]); local last=tonumber(redis.call('GET',KEYS[2]) or '0'); if minGap>0 and last>0 and now-last<minGap then return -(minGap-(now-last)) end; local count=tonumber(redis.call('GET',KEYS[1]) or '0'); if hourly>0 and count>=hourly then local ttl=redis.call('TTL',KEYS[1]); if ttl<1 then ttl=3600 end; return -ttl end; if hourly>0 then count=redis.call('INCR',KEYS[1]); if count==1 then redis.call('EXPIRE',KEYS[1],3600) end end; if minGap>0 then redis.call('SET',KEYS[2],now,'EX',3600) end; return count`
 	result, err := a.redis.Eval(ctx, script, []string{hourKey, lastKey}, now.Unix(), p.MinIntervalSeconds, p.RequestsPerHour).Int64()
 	if err != nil {
 		return 0, err
@@ -200,7 +210,11 @@ func (a *app) enforceGuestRate(ctx context.Context, subject string, p store.Gues
 
 func (a *app) guestQuota(ctx context.Context, subject string, p store.GuestAccessPolicy) (quotaDecision, store.Policy, error) {
 	limit := p.TokenLimit
-	policy := store.Policy{ScopeType: "system", ScopeID: "guest", QuotaMode: "limited", TokenLimit: &limit, IntervalKind: p.IntervalKind, IntervalSeconds: p.IntervalSeconds, AllowedModels: json.RawMessage(`["fast","vision"]`)}
+	policy := store.Policy{ScopeType: "system", ScopeID: "guest", QuotaMode: p.QuotaMode, TokenLimit: &limit, IntervalKind: p.IntervalKind, IntervalSeconds: p.IntervalSeconds, AllowedModels: json.RawMessage(`["fast","vision"]`)}
+	if p.QuotaMode == "unlimited" {
+		policy.TokenLimit = nil
+		return quotaDecision{Mode: "unlimited", Interval: p.IntervalKind, CounterKey: subject}, policy, nil
+	}
 	start, reset := quotaWindow(policy, time.Now().UTC())
 	if lastReset, resetErr := a.store.GuestLastReset(ctx, subject); resetErr == nil && lastReset != nil && lastReset.After(start) {
 		start = *lastReset
@@ -247,7 +261,9 @@ func (a *app) inferenceUpstreamForRequest(r *http.Request, path string) (string,
 }
 func (a *app) guestHermesUpstream(path, profile string) (string, string, string) {
 	if a.cfg.HermesEnabled && a.cfg.HermesBase != "" {
-		if profile != "guest-skills" {
+		switch profile {
+		case "guest-skills", "vision":
+		default:
 			profile = "guest"
 		}
 		return strings.TrimRight(a.cfg.HermesBase, "/") + "/p/" + profile + path, a.cfg.HermesKey, "hermes-" + profile
@@ -374,6 +390,11 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	body, commandSelection, err = applyAutomaticAttachmentSkills(body, attachments, commandSelection, true)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unable to apply attachment skills"})
+		return
+	}
 	decision, _, err := a.guestQuota(r.Context(), subject, p)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest quota unavailable"})
@@ -462,7 +483,9 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		upstreamBody = ensureStreamUsage(upstreamBody)
 	}
 	guestProfile := "guest"
-	if commandSelectionHasSkill(commandSelection, "graft") {
+	if route.Workload == inference.WorkloadVision {
+		guestProfile = "vision"
+	} else if commandSelectionNeedsSkillsProfile(commandSelection) {
 		guestProfile = "guest-skills"
 	}
 	upstreamURL, upstreamKey, upstreamName := a.guestHermesUpstream("/v1/chat/completions", guestProfile)
@@ -483,7 +506,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		}
 		return req, nil
 	}
-	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, "guest", makeGuestRequest)
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, guestProfile, makeGuestRequest)
 	upstreamBody = recoveredBody
 	if recoveredModel != "" {
 		route.PhysicalModel = recoveredModel
@@ -528,6 +551,9 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	}
 	if len(commandSelection.Skills) > 0 {
 		w.Header().Set("x-daiki-command-skills", strings.Join(commandSelection.Skills, ","))
+	}
+	if len(commandSelection.AutoSkills) > 0 {
+		w.Header().Set("x-daiki-auto-skills", strings.Join(commandSelection.AutoSkills, ","))
 	}
 	if researchMeta.Used {
 		w.Header().Set("x-daiki-research-used", "true")

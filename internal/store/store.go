@@ -41,6 +41,7 @@ type Policy struct {
 	IntervalCount   int             `json:"intervalCount,omitempty"`
 	IntervalSeconds *int64          `json:"intervalSeconds,omitempty"`
 	ParallelLimits  json.RawMessage `json:"parallelLimits,omitempty"`
+	ResourceLimits  json.RawMessage `json:"resourceLimits,omitempty"`
 	Priority        int             `json:"priority"`
 	AllowedModels   json.RawMessage `json:"allowedModels"`
 	EffectiveFrom   time.Time       `json:"effectiveFrom"`
@@ -53,6 +54,14 @@ type QuotaLimit struct {
 	IntervalKind    string `json:"intervalKind"`
 	IntervalCount   int    `json:"intervalCount,omitempty"`
 	IntervalSeconds *int64 `json:"intervalSeconds,omitempty"`
+}
+type ResourceLimits struct {
+	MaxUploadsPerHour        int   `json:"maxUploadsPerHour,omitempty"`
+	MaxStoredFiles           int   `json:"maxStoredFiles,omitempty"`
+	MaxStoredBytes           int64 `json:"maxStoredBytes,omitempty"`
+	MaxAttachmentsPerMessage int   `json:"maxAttachmentsPerMessage,omitempty"`
+	MaxFileBytes             int64 `json:"maxFileBytes,omitempty"`
+	MaxImageBytes            int64 `json:"maxImageBytes,omitempty"`
 }
 
 type Usage struct {
@@ -183,11 +192,11 @@ func (s *Store) SetUserStatus(ctx context.Context, actor, subject, status string
 	return u, nil
 }
 
-const policyColumns = `id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_count,interval_seconds,parallel_limits,priority,allowed_models,effective_from,expires_at`
+const policyColumns = `id,scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_count,interval_seconds,parallel_limits,resource_limits,priority,allowed_models,effective_from,expires_at`
 
 func scanPolicy(row pgx.Row) (Policy, error) {
 	var p Policy
-	err := row.Scan(&p.ID, &p.ScopeType, &p.ScopeID, &p.QuotaMode, &p.TokenLimit, &p.IntervalKind, &p.IntervalCount, &p.IntervalSeconds, &p.ParallelLimits, &p.Priority, &p.AllowedModels, &p.EffectiveFrom, &p.ExpiresAt)
+	err := row.Scan(&p.ID, &p.ScopeType, &p.ScopeID, &p.QuotaMode, &p.TokenLimit, &p.IntervalKind, &p.IntervalCount, &p.IntervalSeconds, &p.ParallelLimits, &p.ResourceLimits, &p.Priority, &p.AllowedModels, &p.EffectiveFrom, &p.ExpiresAt)
 	return p, err
 }
 
@@ -230,6 +239,20 @@ func normalizePolicy(p Policy) (Policy, error) {
 	if len(p.AllowedModels) == 0 {
 		p.AllowedModels = json.RawMessage(`[]`)
 	}
+	if len(p.ResourceLimits) == 0 {
+		p.ResourceLimits = json.RawMessage(`{}`)
+	}
+	var resources ResourceLimits
+	if err := json.Unmarshal(p.ResourceLimits, &resources); err != nil {
+		return Policy{}, errors.New("resourceLimits must be an object")
+	}
+	if resources.MaxUploadsPerHour < 0 || resources.MaxStoredFiles < 0 || resources.MaxStoredBytes < 0 || resources.MaxAttachmentsPerMessage < 0 || resources.MaxFileBytes < 0 || resources.MaxImageBytes < 0 {
+		return Policy{}, errors.New("resource limits must be >= 0; 0 means unlimited")
+	}
+	if resources.MaxUploadsPerHour > 100000 || resources.MaxStoredFiles > 100000 || resources.MaxAttachmentsPerMessage > 100 || resources.MaxStoredBytes > 1<<40 || resources.MaxFileBytes > 25<<20 || resources.MaxImageBytes > 4<<20 {
+		return Policy{}, errors.New("resource limit exceeds platform safety range")
+	}
+	p.ResourceLimits, _ = json.Marshal(resources)
 	if p.QuotaMode == "unlimited" {
 		p.ParallelLimits = json.RawMessage(`[]`)
 		return p, nil
@@ -277,7 +300,7 @@ func (s *Store) UpsertUserPolicy(ctx context.Context, actor, subject string, p P
 	if err != nil {
 		return Policy{}, err
 	}
-	out, err := scanPolicy(s.DB.QueryRow(ctx, `INSERT INTO entitlement_policies(scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_count,interval_seconds,parallel_limits,priority,allowed_models,created_by) VALUES('user',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(scope_type,scope_id) DO UPDATE SET quota_mode=EXCLUDED.quota_mode,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_count=EXCLUDED.interval_count,interval_seconds=EXCLUDED.interval_seconds,parallel_limits=EXCLUDED.parallel_limits,priority=EXCLUDED.priority,allowed_models=EXCLUDED.allowed_models,updated_at=now() RETURNING `+policyColumns, subject, p.QuotaMode, p.TokenLimit, p.IntervalKind, p.IntervalCount, p.IntervalSeconds, p.ParallelLimits, p.Priority, p.AllowedModels, actor))
+	out, err := scanPolicy(s.DB.QueryRow(ctx, `INSERT INTO entitlement_policies(scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_count,interval_seconds,parallel_limits,resource_limits,priority,allowed_models,created_by) VALUES('user',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(scope_type,scope_id) DO UPDATE SET quota_mode=EXCLUDED.quota_mode,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_count=EXCLUDED.interval_count,interval_seconds=EXCLUDED.interval_seconds,parallel_limits=EXCLUDED.parallel_limits,resource_limits=EXCLUDED.resource_limits,priority=EXCLUDED.priority,allowed_models=EXCLUDED.allowed_models,updated_at=now() RETURNING `+policyColumns, subject, p.QuotaMode, p.TokenLimit, p.IntervalKind, p.IntervalCount, p.IntervalSeconds, p.ParallelLimits, p.ResourceLimits, p.Priority, p.AllowedModels, actor))
 	if err != nil {
 		return Policy{}, err
 	}
@@ -380,7 +403,7 @@ func (s *Store) UpsertPolicy(ctx context.Context, actor, scopeType, scopeID stri
 	if err != nil {
 		return Policy{}, err
 	}
-	out, err := scanPolicy(s.DB.QueryRow(ctx, `INSERT INTO entitlement_policies(scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_count,interval_seconds,parallel_limits,priority,allowed_models,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(scope_type,scope_id) DO UPDATE SET quota_mode=EXCLUDED.quota_mode,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_count=EXCLUDED.interval_count,interval_seconds=EXCLUDED.interval_seconds,parallel_limits=EXCLUDED.parallel_limits,priority=EXCLUDED.priority,allowed_models=EXCLUDED.allowed_models,updated_at=now() RETURNING `+policyColumns, scopeType, scopeID, p.QuotaMode, p.TokenLimit, p.IntervalKind, p.IntervalCount, p.IntervalSeconds, p.ParallelLimits, p.Priority, p.AllowedModels, actor))
+	out, err := scanPolicy(s.DB.QueryRow(ctx, `INSERT INTO entitlement_policies(scope_type,scope_id,quota_mode,token_limit,interval_kind,interval_count,interval_seconds,parallel_limits,resource_limits,priority,allowed_models,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(scope_type,scope_id) DO UPDATE SET quota_mode=EXCLUDED.quota_mode,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_count=EXCLUDED.interval_count,interval_seconds=EXCLUDED.interval_seconds,parallel_limits=EXCLUDED.parallel_limits,resource_limits=EXCLUDED.resource_limits,priority=EXCLUDED.priority,allowed_models=EXCLUDED.allowed_models,updated_at=now() RETURNING `+policyColumns, scopeType, scopeID, p.QuotaMode, p.TokenLimit, p.IntervalKind, p.IntervalCount, p.IntervalSeconds, p.ParallelLimits, p.ResourceLimits, p.Priority, p.AllowedModels, actor))
 	if err != nil {
 		return Policy{}, err
 	}

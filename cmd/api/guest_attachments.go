@@ -48,6 +48,42 @@ func guestAttachmentDir(identity guestIdentity) string {
 	return filepath.Join(attachmentRoot(), "guest", hex.EncodeToString(subjectHash[:8]), hex.EncodeToString(deviceHash[:8]))
 }
 
+var errGuestUploadRateExceeded = errors.New("guest upload rate exceeded")
+
+func (a *app) enforceGuestUploadRate(ctx context.Context, subject string, limit int) error {
+	if limit == 0 {
+		return nil
+	}
+	if a.redis == nil {
+		return errors.New("guest upload limiter unavailable")
+	}
+	key := "guest-upload:hour:" + subject
+	value, err := a.redis.Incr(ctx, key).Result()
+	if err != nil {
+		return err
+	}
+	if value == 1 {
+		_ = a.redis.Expire(ctx, key, time.Hour).Err()
+	}
+	if value > int64(limit) {
+		return errGuestUploadRateExceeded
+	}
+	return nil
+}
+
+func guestUploadLimit(p store.GuestAccessPolicy, image bool) int64 {
+	configured := p.MaxUploadBytes
+	hard := maxAttachmentBytes
+	if image {
+		configured = p.MaxImageUploadBytes
+		hard = maxInjectedImageBytes
+	}
+	if configured <= 0 || configured > hard {
+		return hard
+	}
+	return configured
+}
+
 func (a *app) guestUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	if a.store == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest attachments unavailable"})
@@ -62,11 +98,12 @@ func (a *app) guestUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	a.recordGuestIdentity(r.Context(), identity)
 	a.cleanupExpiredGuestAttachments(r.Context(), p)
 
-	if n, err := a.store.GuestUploadsSince(r.Context(), identity.Subject, time.Now().UTC().Add(-time.Hour)); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest upload limit unavailable"})
-		return
-	} else if n >= int64(p.MaxUploadsPerHour) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "guest_upload_rate_limited"})
+	if err := a.enforceGuestUploadRate(r.Context(), identity.Subject, p.MaxUploadsPerHour); err != nil {
+		if errors.Is(err, errGuestUploadRateExceeded) {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "guest_upload_rate_limited"})
+		} else {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest upload limit unavailable"})
+		}
 		return
 	}
 	files, bytes, err := a.store.GuestAttachmentUsage(r.Context(), identity.Subject)
@@ -74,17 +111,13 @@ func (a *app) guestUploadAttachment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest attachment quota unavailable"})
 		return
 	}
-	if files >= int64(p.MaxStoredFiles) || bytes >= p.MaxStoredBytes {
+	if (p.MaxStoredFiles > 0 && files >= int64(p.MaxStoredFiles)) || (p.MaxStoredBytes > 0 && bytes >= p.MaxStoredBytes) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "guest_attachment_storage_limit"})
 		return
 	}
 
-	maxBytes := p.MaxUploadBytes
-	if maxBytes > maxAttachmentBytes {
-		maxBytes = maxAttachmentBytes
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+(2<<20))
-	if err := r.ParseMultipartForm(maxBytes + (2 << 20)); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, maxMultipartRequestBytes)
+	if err := r.ParseMultipartForm(maxMultipartRequestBytes); err != nil {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "guest attachment exceeds upload limit"})
 		return
 	}
@@ -94,10 +127,6 @@ func (a *app) guestUploadAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = f.Close() }()
-	if hdr.Size > maxBytes || bytes+hdr.Size > p.MaxStoredBytes {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "guest attachment exceeds storage limit"})
-		return
-	}
 	name := filepath.Base(strings.TrimSpace(hdr.Filename))
 	if name == "." || name == "" {
 		name = "attachment"
@@ -105,6 +134,13 @@ func (a *app) guestUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	source := strings.ToLower(strings.TrimSpace(r.FormValue("source")))
 	if source != "image" {
 		source = "file"
+	}
+	mediaHint := strings.ToLower(hdr.Header.Get("Content-Type"))
+	isImage := source == "image" || strings.HasPrefix(mediaHint, "image/")
+	maxBytes := guestUploadLimit(p, isImage)
+	if hdr.Size > maxBytes || (p.MaxStoredBytes > 0 && bytes+hdr.Size > p.MaxStoredBytes) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "guest attachment exceeds upload or storage limit"})
+		return
 	}
 	relativePath := cleanRelativePath(r.FormValue("relativePath"), name)
 	id, err := newAttachmentID()
@@ -126,7 +162,7 @@ func (a *app) guestUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	h := sha256.New()
 	n, copyErr := io.Copy(io.MultiWriter(out, h), io.LimitReader(f, maxBytes+1))
 	closeErr := out.Close()
-	if copyErr != nil || closeErr != nil || n > maxBytes || bytes+n > p.MaxStoredBytes {
+	if copyErr != nil || closeErr != nil || n > maxBytes || (p.MaxStoredBytes > 0 && bytes+n > p.MaxStoredBytes) {
 		_ = os.Remove(storagePath)
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "guest attachment exceeds upload limit"})
 		return
@@ -240,6 +276,12 @@ func (a *app) expandGuestChatAttachments(ctx context.Context, identity guestIden
 	}
 	if len(rows) != len(ids) {
 		return nil, nil, errors.New("one or more guest attachments are missing")
+	}
+	for _, rec := range rows {
+		isImage := strings.HasPrefix(strings.ToLower(rec.MediaType), "image/")
+		if rec.SizeBytes > guestUploadLimit(p, isImage) {
+			return nil, nil, fmt.Errorf("attachment %s exceeds the current Guest size policy", rec.Name)
+		}
 	}
 	messages, _ := payload["messages"].([]any)
 	if len(messages) == 0 {

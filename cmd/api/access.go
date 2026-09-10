@@ -209,6 +209,7 @@ func (a *app) clearUserQuotaRuntimeState(ctx context.Context, subject string) {
 		"quota:blocked:user:"+subject,
 		"pending-chat:hour:"+subject,
 		"pending-chat:last:"+subject,
+		"attachment-upload:hour:user:"+subject,
 	).Err()
 }
 

@@ -132,3 +132,8 @@ func (s *Store) SearchAttachments(ctx context.Context, owner, query string, limi
 	}
 	return out, rows.Err()
 }
+
+func (s *Store) AttachmentUsage(ctx context.Context, owner string) (files int64, bytes int64, err error) {
+	err = s.DB.QueryRow(ctx, `SELECT count(*),COALESCE(sum(size_bytes),0) FROM attachments WHERE owner_subject=$1 AND deleted_at IS NULL`, owner).Scan(&files, &bytes)
+	return
+}

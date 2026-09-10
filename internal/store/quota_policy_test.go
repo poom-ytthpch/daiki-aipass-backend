@@ -43,3 +43,41 @@ func TestNormalizePolicyRejectsTooManyParallelLimits(t *testing.T) {
 		t.Fatal("expected parallel limit count validation error")
 	}
 }
+
+func TestNormalizePolicyKeepsResourceLimitsWhenTokensUnlimited(t *testing.T) {
+	p, err := normalizePolicy(Policy{
+		QuotaMode:    "unlimited",
+		IntervalKind: "month",
+		ResourceLimits: json.RawMessage(`{
+			"maxUploadsPerHour":12,
+			"maxStoredFiles":50,
+			"maxStoredBytes":104857600,
+			"maxAttachmentsPerMessage":8,
+			"maxFileBytes":10485760,
+			"maxImageBytes":4194304
+		}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resources ResourceLimits
+	if err := json.Unmarshal(p.ResourceLimits, &resources); err != nil {
+		t.Fatal(err)
+	}
+	if resources.MaxUploadsPerHour != 12 || resources.MaxAttachmentsPerMessage != 8 || resources.MaxFileBytes != 10<<20 || resources.MaxImageBytes != 4<<20 {
+		t.Fatalf("resource limits must survive unlimited token mode: %#v", resources)
+	}
+}
+
+func TestNormalizePolicyRejectsUnsafeResourceLimits(t *testing.T) {
+	for _, raw := range []string{
+		`{"maxFileBytes":26214401}`,
+		`{"maxImageBytes":4194305}`,
+		`{"maxAttachmentsPerMessage":101}`,
+		`{"maxStoredFiles":-1}`,
+	} {
+		if _, err := normalizePolicy(Policy{QuotaMode: "unlimited", IntervalKind: "month", ResourceLimits: json.RawMessage(raw)}); err == nil {
+			t.Fatalf("expected resource validation error for %s", raw)
+		}
+	}
+}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 type GuestAccessPolicy struct {
 	Enabled                  bool       `json:"enabled"`
+	QuotaMode                string     `json:"quotaMode"`
 	TokenLimit               int64      `json:"tokenLimit"`
 	IntervalKind             string     `json:"intervalKind"`
 	IntervalSeconds          *int64     `json:"intervalSeconds,omitempty"`
@@ -22,13 +24,16 @@ type GuestAccessPolicy struct {
 	AllowImageGeneration     bool       `json:"allowImageGeneration"`
 	AllowFileGeneration      bool       `json:"allowFileGeneration"`
 	MaxUploadBytes           int64      `json:"maxUploadBytes"`
+	MaxImageUploadBytes      int64      `json:"maxImageUploadBytes"`
 	MaxUploadsPerHour        int        `json:"maxUploadsPerHour"`
 	MaxStoredFiles           int        `json:"maxStoredFiles"`
 	MaxStoredBytes           int64      `json:"maxStoredBytes"`
+	MaxAttachmentsPerMessage int        `json:"maxAttachmentsPerMessage"`
 	AttachmentRetentionHours int        `json:"attachmentRetentionHours"`
 	ImageGenerationsPerDay   int        `json:"imageGenerationsPerDay"`
 	FileGenerationsPerDay    int        `json:"fileGenerationsPerDay"`
 	MaxGeneratedFileBytes    int64      `json:"maxGeneratedFileBytes"`
+	MaxGeneratedImageBytes   int64      `json:"maxGeneratedImageBytes"`
 	UpdatedBy                string     `json:"updatedBy,omitempty"`
 	UpdatedAt                *time.Time `json:"updatedAt,omitempty"`
 }
@@ -47,21 +52,27 @@ type GuestDeviceUsage struct {
 
 func DefaultGuestAccessPolicy() GuestAccessPolicy {
 	return GuestAccessPolicy{
-		Enabled: true, TokenLimit: 4000, IntervalKind: "day", RequestsPerHour: 6,
+		Enabled: true, QuotaMode: "limited", TokenLimit: 4000, IntervalKind: "day", RequestsPerHour: 6,
 		MinIntervalSeconds: 45, MaxCompletionTokens: 384, FastModel: "fast",
 		AllowUploads: true, AllowImageGeneration: true, AllowFileGeneration: true,
-		MaxUploadBytes: 10 << 20, MaxUploadsPerHour: 10, MaxStoredFiles: 20,
-		MaxStoredBytes: 50 << 20, AttachmentRetentionHours: 24,
-		ImageGenerationsPerDay: 3, FileGenerationsPerDay: 5, MaxGeneratedFileBytes: 1 << 20,
+		MaxUploadBytes: 10 << 20, MaxImageUploadBytes: 4 << 20, MaxUploadsPerHour: 10, MaxStoredFiles: 20,
+		MaxStoredBytes: 50 << 20, MaxAttachmentsPerMessage: 10, AttachmentRetentionHours: 24,
+		ImageGenerationsPerDay: 3, FileGenerationsPerDay: 5, MaxGeneratedFileBytes: 1 << 20, MaxGeneratedImageBytes: 4 << 20,
 	}
 }
 
 func validateGuestAccessPolicy(p GuestAccessPolicy) (GuestAccessPolicy, error) {
+	if p.QuotaMode == "" {
+		p.QuotaMode = "limited"
+	}
+	if p.QuotaMode != "limited" && p.QuotaMode != "unlimited" {
+		return p, errors.New("quotaMode must be limited or unlimited")
+	}
 	if p.TokenLimit < 0 {
 		return p, errors.New("tokenLimit must be >= 0")
 	}
-	if p.RequestsPerHour <= 0 || p.RequestsPerHour > 10000 {
-		return p, errors.New("requestsPerHour must be between 1 and 10000")
+	if p.RequestsPerHour < 0 || p.RequestsPerHour > 10000 {
+		return p, errors.New("requestsPerHour must be between 0 and 10000; 0 means unlimited")
 	}
 	if p.MinIntervalSeconds < 0 || p.MinIntervalSeconds > 3600 {
 		return p, errors.New("minIntervalSeconds must be between 0 and 3600")
@@ -69,17 +80,23 @@ func validateGuestAccessPolicy(p GuestAccessPolicy) (GuestAccessPolicy, error) {
 	if p.MaxCompletionTokens <= 0 || p.MaxCompletionTokens > 8192 {
 		return p, errors.New("maxCompletionTokens must be between 1 and 8192")
 	}
-	if p.MaxUploadBytes <= 0 || p.MaxUploadBytes > 100<<20 {
-		return p, errors.New("maxUploadBytes must be between 1 and 104857600")
+	if p.MaxUploadBytes < 0 || p.MaxUploadBytes > 100<<20 {
+		return p, errors.New("maxUploadBytes must be between 0 and 104857600; 0 means unlimited")
 	}
-	if p.MaxUploadsPerHour <= 0 || p.MaxUploadsPerHour > 1000 {
-		return p, errors.New("maxUploadsPerHour must be between 1 and 1000")
+	if p.MaxImageUploadBytes < 0 || p.MaxImageUploadBytes > 4<<20 {
+		return p, errors.New("maxImageUploadBytes must be between 0 and 4194304; 0 means unlimited")
 	}
-	if p.MaxStoredFiles <= 0 || p.MaxStoredFiles > 1000 {
-		return p, errors.New("maxStoredFiles must be between 1 and 1000")
+	if p.MaxUploadsPerHour < 0 || p.MaxUploadsPerHour > 1000 {
+		return p, errors.New("maxUploadsPerHour must be between 0 and 1000; 0 means unlimited")
 	}
-	if p.MaxStoredBytes <= 0 || p.MaxStoredBytes > 2<<30 {
-		return p, errors.New("maxStoredBytes must be between 1 and 2147483648")
+	if p.MaxStoredFiles < 0 || p.MaxStoredFiles > 1000 {
+		return p, errors.New("maxStoredFiles must be between 0 and 1000; 0 means unlimited")
+	}
+	if p.MaxStoredBytes < 0 || p.MaxStoredBytes > 2<<30 {
+		return p, errors.New("maxStoredBytes must be between 0 and 2147483648; 0 means unlimited")
+	}
+	if p.MaxAttachmentsPerMessage < 0 || p.MaxAttachmentsPerMessage > 10 {
+		return p, errors.New("maxAttachmentsPerMessage must be between 0 and 10; 0 means platform maximum")
 	}
 	if p.AttachmentRetentionHours <= 0 || p.AttachmentRetentionHours > 24*30 {
 		return p, errors.New("attachmentRetentionHours must be between 1 and 720")
@@ -90,8 +107,11 @@ func validateGuestAccessPolicy(p GuestAccessPolicy) (GuestAccessPolicy, error) {
 	if p.FileGenerationsPerDay < 0 || p.FileGenerationsPerDay > 1000 {
 		return p, errors.New("fileGenerationsPerDay must be between 0 and 1000")
 	}
-	if p.MaxGeneratedFileBytes <= 0 || p.MaxGeneratedFileBytes > 25<<20 {
-		return p, errors.New("maxGeneratedFileBytes must be between 1 and 26214400")
+	if p.MaxGeneratedFileBytes < 0 || p.MaxGeneratedFileBytes > 25<<20 {
+		return p, errors.New("maxGeneratedFileBytes must be between 0 and 26214400; 0 means unlimited")
+	}
+	if p.MaxGeneratedImageBytes < 0 || p.MaxGeneratedImageBytes > 4<<20 {
+		return p, errors.New("maxGeneratedImageBytes must be between 0 and 4194304; 0 means unlimited")
 	}
 	if p.IntervalKind == "" {
 		p.IntervalKind = "day"
@@ -112,11 +132,11 @@ func validateGuestAccessPolicy(p GuestAccessPolicy) (GuestAccessPolicy, error) {
 	return p, nil
 }
 
-const guestPolicyColumns = `enabled,token_limit,interval_kind,interval_seconds,requests_per_hour,min_interval_seconds,max_completion_tokens,fast_model,allow_uploads,allow_image_generation,allow_file_generation,max_upload_bytes,max_uploads_per_hour,max_stored_files,max_stored_bytes,attachment_retention_hours,image_generations_per_day,file_generations_per_day,max_generated_file_bytes,COALESCE(updated_by,''),updated_at`
+const guestPolicyColumns = `enabled,quota_mode,token_limit,interval_kind,interval_seconds,requests_per_hour,min_interval_seconds,max_completion_tokens,fast_model,allow_uploads,allow_image_generation,allow_file_generation,max_upload_bytes,max_image_upload_bytes,max_uploads_per_hour,max_stored_files,max_stored_bytes,max_attachments_per_message,attachment_retention_hours,image_generations_per_day,file_generations_per_day,max_generated_file_bytes,max_generated_image_bytes,COALESCE(updated_by,''),updated_at`
 
 func scanGuestPolicy(row pgx.Row) (GuestAccessPolicy, error) {
 	p := DefaultGuestAccessPolicy()
-	err := row.Scan(&p.Enabled, &p.TokenLimit, &p.IntervalKind, &p.IntervalSeconds, &p.RequestsPerHour, &p.MinIntervalSeconds, &p.MaxCompletionTokens, &p.FastModel, &p.AllowUploads, &p.AllowImageGeneration, &p.AllowFileGeneration, &p.MaxUploadBytes, &p.MaxUploadsPerHour, &p.MaxStoredFiles, &p.MaxStoredBytes, &p.AttachmentRetentionHours, &p.ImageGenerationsPerDay, &p.FileGenerationsPerDay, &p.MaxGeneratedFileBytes, &p.UpdatedBy, &p.UpdatedAt)
+	err := row.Scan(&p.Enabled, &p.QuotaMode, &p.TokenLimit, &p.IntervalKind, &p.IntervalSeconds, &p.RequestsPerHour, &p.MinIntervalSeconds, &p.MaxCompletionTokens, &p.FastModel, &p.AllowUploads, &p.AllowImageGeneration, &p.AllowFileGeneration, &p.MaxUploadBytes, &p.MaxImageUploadBytes, &p.MaxUploadsPerHour, &p.MaxStoredFiles, &p.MaxStoredBytes, &p.MaxAttachmentsPerMessage, &p.AttachmentRetentionHours, &p.ImageGenerationsPerDay, &p.FileGenerationsPerDay, &p.MaxGeneratedFileBytes, &p.MaxGeneratedImageBytes, &p.UpdatedBy, &p.UpdatedAt)
 	return p, err
 }
 
@@ -133,15 +153,16 @@ func (s *Store) UpsertGuestAccessPolicy(ctx context.Context, actor string, p Gue
 	if err != nil {
 		return GuestAccessPolicy{}, err
 	}
-	q := `INSERT INTO guest_access_policy(singleton,enabled,token_limit,interval_kind,interval_seconds,requests_per_hour,min_interval_seconds,max_completion_tokens,fast_model,allow_uploads,allow_image_generation,allow_file_generation,max_upload_bytes,max_uploads_per_hour,max_stored_files,max_stored_bytes,attachment_retention_hours,image_generations_per_day,file_generations_per_day,max_generated_file_bytes,updated_by)
-	VALUES(TRUE,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
-	ON CONFLICT(singleton) DO UPDATE SET enabled=EXCLUDED.enabled,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_seconds=EXCLUDED.interval_seconds,requests_per_hour=EXCLUDED.requests_per_hour,min_interval_seconds=EXCLUDED.min_interval_seconds,max_completion_tokens=EXCLUDED.max_completion_tokens,fast_model=EXCLUDED.fast_model,allow_uploads=EXCLUDED.allow_uploads,allow_image_generation=EXCLUDED.allow_image_generation,allow_file_generation=EXCLUDED.allow_file_generation,max_upload_bytes=EXCLUDED.max_upload_bytes,max_uploads_per_hour=EXCLUDED.max_uploads_per_hour,max_stored_files=EXCLUDED.max_stored_files,max_stored_bytes=EXCLUDED.max_stored_bytes,attachment_retention_hours=EXCLUDED.attachment_retention_hours,image_generations_per_day=EXCLUDED.image_generations_per_day,file_generations_per_day=EXCLUDED.file_generations_per_day,max_generated_file_bytes=EXCLUDED.max_generated_file_bytes,updated_by=EXCLUDED.updated_by,updated_at=now()
+	q := `INSERT INTO guest_access_policy(singleton,enabled,quota_mode,token_limit,interval_kind,interval_seconds,requests_per_hour,min_interval_seconds,max_completion_tokens,fast_model,allow_uploads,allow_image_generation,allow_file_generation,max_upload_bytes,max_image_upload_bytes,max_uploads_per_hour,max_stored_files,max_stored_bytes,max_attachments_per_message,attachment_retention_hours,image_generations_per_day,file_generations_per_day,max_generated_file_bytes,max_generated_image_bytes,updated_by)
+	VALUES(TRUE,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+	ON CONFLICT(singleton) DO UPDATE SET enabled=EXCLUDED.enabled,quota_mode=EXCLUDED.quota_mode,token_limit=EXCLUDED.token_limit,interval_kind=EXCLUDED.interval_kind,interval_seconds=EXCLUDED.interval_seconds,requests_per_hour=EXCLUDED.requests_per_hour,min_interval_seconds=EXCLUDED.min_interval_seconds,max_completion_tokens=EXCLUDED.max_completion_tokens,fast_model=EXCLUDED.fast_model,allow_uploads=EXCLUDED.allow_uploads,allow_image_generation=EXCLUDED.allow_image_generation,allow_file_generation=EXCLUDED.allow_file_generation,max_upload_bytes=EXCLUDED.max_upload_bytes,max_image_upload_bytes=EXCLUDED.max_image_upload_bytes,max_uploads_per_hour=EXCLUDED.max_uploads_per_hour,max_stored_files=EXCLUDED.max_stored_files,max_stored_bytes=EXCLUDED.max_stored_bytes,max_attachments_per_message=EXCLUDED.max_attachments_per_message,attachment_retention_hours=EXCLUDED.attachment_retention_hours,image_generations_per_day=EXCLUDED.image_generations_per_day,file_generations_per_day=EXCLUDED.file_generations_per_day,max_generated_file_bytes=EXCLUDED.max_generated_file_bytes,max_generated_image_bytes=EXCLUDED.max_generated_image_bytes,updated_by=EXCLUDED.updated_by,updated_at=now()
 	RETURNING ` + guestPolicyColumns
-	out, err := scanGuestPolicy(s.DB.QueryRow(ctx, q, p.Enabled, p.TokenLimit, p.IntervalKind, p.IntervalSeconds, p.RequestsPerHour, p.MinIntervalSeconds, p.MaxCompletionTokens, p.FastModel, p.AllowUploads, p.AllowImageGeneration, p.AllowFileGeneration, p.MaxUploadBytes, p.MaxUploadsPerHour, p.MaxStoredFiles, p.MaxStoredBytes, p.AttachmentRetentionHours, p.ImageGenerationsPerDay, p.FileGenerationsPerDay, p.MaxGeneratedFileBytes, actor))
+	out, err := scanGuestPolicy(s.DB.QueryRow(ctx, q, p.Enabled, p.QuotaMode, p.TokenLimit, p.IntervalKind, p.IntervalSeconds, p.RequestsPerHour, p.MinIntervalSeconds, p.MaxCompletionTokens, p.FastModel, p.AllowUploads, p.AllowImageGeneration, p.AllowFileGeneration, p.MaxUploadBytes, p.MaxImageUploadBytes, p.MaxUploadsPerHour, p.MaxStoredFiles, p.MaxStoredBytes, p.MaxAttachmentsPerMessage, p.AttachmentRetentionHours, p.ImageGenerationsPerDay, p.FileGenerationsPerDay, p.MaxGeneratedFileBytes, p.MaxGeneratedImageBytes, actor))
 	if err != nil {
 		return GuestAccessPolicy{}, err
 	}
-	_, _ = s.DB.Exec(ctx, `INSERT INTO access_audit_log(actor_subject,action,target_type,target_id,new_value) VALUES($1,'guest.policy.upsert','guest','default',jsonb_build_object('enabled',$2,'tokenLimit',$3,'requestsPerHour',$4,'minIntervalSeconds',$5,'maxCompletionTokens',$6,'allowUploads',$7,'allowImageGeneration',$8,'allowFileGeneration',$9,'maxUploadBytes',$10,'maxUploadsPerHour',$11,'maxStoredFiles',$12,'maxStoredBytes',$13,'attachmentRetentionHours',$14,'imageGenerationsPerDay',$15,'fileGenerationsPerDay',$16,'maxGeneratedFileBytes',$17))`, actor, out.Enabled, out.TokenLimit, out.RequestsPerHour, out.MinIntervalSeconds, out.MaxCompletionTokens, out.AllowUploads, out.AllowImageGeneration, out.AllowFileGeneration, out.MaxUploadBytes, out.MaxUploadsPerHour, out.MaxStoredFiles, out.MaxStoredBytes, out.AttachmentRetentionHours, out.ImageGenerationsPerDay, out.FileGenerationsPerDay, out.MaxGeneratedFileBytes)
+	newJSON, _ := json.Marshal(out)
+	_, _ = s.DB.Exec(ctx, `INSERT INTO access_audit_log(actor_subject,action,target_type,target_id,new_value) VALUES($1,'guest.policy.upsert','guest','default',$2)`, actor, newJSON)
 	return out, nil
 }
 

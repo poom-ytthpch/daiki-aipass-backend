@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS entitlement_policies (
 	interval_count INTEGER NOT NULL DEFAULT 1 CHECK (interval_count > 0),
     interval_seconds BIGINT CHECK (interval_seconds IS NULL OR interval_seconds > 0),
 	parallel_limits JSONB NOT NULL DEFAULT '[]'::jsonb,
+    resource_limits JSONB NOT NULL DEFAULT '{}'::jsonb,
     priority INTEGER NOT NULL DEFAULT 0,
     allowed_models JSONB NOT NULL DEFAULT '[]'::jsonb,
     concurrency_limit INTEGER,
@@ -52,42 +53,71 @@ CREATE TABLE IF NOT EXISTS entitlement_policies (
 );
 ALTER TABLE entitlement_policies ADD COLUMN IF NOT EXISTS interval_count INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE entitlement_policies ADD COLUMN IF NOT EXISTS parallel_limits JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE entitlement_policies ADD COLUMN IF NOT EXISTS resource_limits JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS entitlement_policies_active_idx ON entitlement_policies (scope_type, scope_id, effective_from, expires_at);
 CREATE TABLE IF NOT EXISTS guest_access_policy (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    quota_mode TEXT NOT NULL DEFAULT 'limited' CHECK (quota_mode IN ('limited','unlimited')),
     token_limit BIGINT NOT NULL DEFAULT 4000 CHECK (token_limit >= 0),
     interval_kind TEXT NOT NULL DEFAULT 'day' CHECK (interval_kind IN ('hour','day','week','month','rolling','custom','lifetime')),
     interval_seconds BIGINT CHECK (interval_seconds IS NULL OR interval_seconds > 0),
-    requests_per_hour INTEGER NOT NULL DEFAULT 6 CHECK (requests_per_hour > 0),
+    requests_per_hour INTEGER NOT NULL DEFAULT 6 CHECK (requests_per_hour >= 0),
     min_interval_seconds INTEGER NOT NULL DEFAULT 45 CHECK (min_interval_seconds >= 0),
     max_completion_tokens INTEGER NOT NULL DEFAULT 384 CHECK (max_completion_tokens > 0),
     fast_model TEXT NOT NULL DEFAULT 'fast',
     allow_uploads BOOLEAN NOT NULL DEFAULT TRUE,
     allow_image_generation BOOLEAN NOT NULL DEFAULT TRUE,
     allow_file_generation BOOLEAN NOT NULL DEFAULT TRUE,
-    max_upload_bytes BIGINT NOT NULL DEFAULT 10485760 CHECK (max_upload_bytes > 0),
-    max_uploads_per_hour INTEGER NOT NULL DEFAULT 10 CHECK (max_uploads_per_hour > 0),
-    max_stored_files INTEGER NOT NULL DEFAULT 20 CHECK (max_stored_files > 0),
-    max_stored_bytes BIGINT NOT NULL DEFAULT 52428800 CHECK (max_stored_bytes > 0),
+    max_upload_bytes BIGINT NOT NULL DEFAULT 10485760 CHECK (max_upload_bytes >= 0),
+    max_image_upload_bytes BIGINT NOT NULL DEFAULT 4194304 CHECK (max_image_upload_bytes >= 0),
+    max_uploads_per_hour INTEGER NOT NULL DEFAULT 10 CHECK (max_uploads_per_hour >= 0),
+    max_stored_files INTEGER NOT NULL DEFAULT 20 CHECK (max_stored_files >= 0),
+    max_stored_bytes BIGINT NOT NULL DEFAULT 52428800 CHECK (max_stored_bytes >= 0),
+    max_attachments_per_message INTEGER NOT NULL DEFAULT 10 CHECK (max_attachments_per_message >= 0),
     attachment_retention_hours INTEGER NOT NULL DEFAULT 24 CHECK (attachment_retention_hours > 0),
     image_generations_per_day INTEGER NOT NULL DEFAULT 3 CHECK (image_generations_per_day >= 0),
     file_generations_per_day INTEGER NOT NULL DEFAULT 5 CHECK (file_generations_per_day >= 0),
-    max_generated_file_bytes BIGINT NOT NULL DEFAULT 1048576 CHECK (max_generated_file_bytes > 0),
+    max_generated_file_bytes BIGINT NOT NULL DEFAULT 1048576 CHECK (max_generated_file_bytes >= 0),
+    max_generated_image_bytes BIGINT NOT NULL DEFAULT 4194304 CHECK (max_generated_image_bytes >= 0),
     updated_by TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS quota_mode TEXT NOT NULL DEFAULT 'limited';
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS allow_uploads BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS allow_image_generation BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS allow_file_generation BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_upload_bytes BIGINT NOT NULL DEFAULT 10485760;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_image_upload_bytes BIGINT NOT NULL DEFAULT 4194304;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_uploads_per_hour INTEGER NOT NULL DEFAULT 10;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_stored_files INTEGER NOT NULL DEFAULT 20;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_stored_bytes BIGINT NOT NULL DEFAULT 52428800;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_attachments_per_message INTEGER NOT NULL DEFAULT 10;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS attachment_retention_hours INTEGER NOT NULL DEFAULT 24;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS image_generations_per_day INTEGER NOT NULL DEFAULT 3;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS file_generations_per_day INTEGER NOT NULL DEFAULT 5;
 ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_generated_file_bytes BIGINT NOT NULL DEFAULT 1048576;
+ALTER TABLE guest_access_policy ADD COLUMN IF NOT EXISTS max_generated_image_bytes BIGINT NOT NULL DEFAULT 4194304;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_quota_mode_check;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_requests_per_hour_check;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_max_upload_bytes_check;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_max_uploads_per_hour_check;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_max_stored_files_check;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_max_stored_bytes_check;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_max_generated_file_bytes_check;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_max_image_upload_bytes_check;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_max_generated_image_bytes_check;
+ALTER TABLE guest_access_policy DROP CONSTRAINT IF EXISTS guest_access_policy_max_attachments_per_message_check;
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_quota_mode_check CHECK (quota_mode IN ('limited','unlimited'));
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_requests_per_hour_check CHECK (requests_per_hour >= 0);
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_max_upload_bytes_check CHECK (max_upload_bytes >= 0);
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_max_uploads_per_hour_check CHECK (max_uploads_per_hour >= 0);
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_max_stored_files_check CHECK (max_stored_files >= 0);
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_max_stored_bytes_check CHECK (max_stored_bytes >= 0);
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_max_generated_file_bytes_check CHECK (max_generated_file_bytes >= 0);
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_max_image_upload_bytes_check CHECK (max_image_upload_bytes >= 0);
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_max_generated_image_bytes_check CHECK (max_generated_image_bytes >= 0);
+ALTER TABLE guest_access_policy ADD CONSTRAINT guest_access_policy_max_attachments_per_message_check CHECK (max_attachments_per_message >= 0);
 CREATE TABLE IF NOT EXISTS guest_devices (
     guest_subject TEXT NOT NULL,
     device_id TEXT NOT NULL,

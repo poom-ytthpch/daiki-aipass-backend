@@ -24,8 +24,8 @@ import (
 var generatedImageDataRE = regexp.MustCompile(`data:(image/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)`)
 
 func (a *app) enforceGuestDailyCapability(ctx context.Context, capability, subject string, limit int) error {
-	if limit <= 0 {
-		return fmt.Errorf("%s disabled", capability)
+	if limit == 0 {
+		return nil
 	}
 	if a.redis == nil {
 		return errors.New("guest capability limiter unavailable")
@@ -189,7 +189,7 @@ func (a *app) storeGeneratedGuestAttachment(ctx context.Context, identity guestI
 	if err != nil {
 		return store.GuestAttachment{}, err
 	}
-	if files >= int64(p.MaxStoredFiles) || bytes+int64(len(data)) > p.MaxStoredBytes {
+	if (p.MaxStoredFiles > 0 && files >= int64(p.MaxStoredFiles)) || (p.MaxStoredBytes > 0 && bytes+int64(len(data)) > p.MaxStoredBytes) {
 		return store.GuestAttachment{}, errors.New("guest attachment storage limit exceeded")
 	}
 	id, err := newAttachmentID()
@@ -266,7 +266,7 @@ func (a *app) guestGenerateFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "guest_file_generation_empty"})
 		return
 	}
-	if int64(len(data)) > p.MaxGeneratedFileBytes {
+	if p.MaxGeneratedFileBytes > 0 && int64(len(data)) > p.MaxGeneratedFileBytes {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "generated_file_exceeds_limit"})
 		return
 	}
@@ -315,7 +315,7 @@ func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "generated_image_invalid"})
 		return
 	}
-	if int64(len(data)) > p.MaxUploadBytes || int64(len(data)) > maxAttachmentBytes {
+	if (p.MaxGeneratedImageBytes > 0 && int64(len(data)) > p.MaxGeneratedImageBytes) || int64(len(data)) > maxInjectedImageBytes {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "generated_image_exceeds_limit"})
 		return
 	}
