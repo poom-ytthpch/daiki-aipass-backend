@@ -150,3 +150,51 @@ func TestHermesModelScopedSessionKeyChangesWithFallbackModel(t *testing.T) {
 		t.Fatal("same model must produce stable session key")
 	}
 }
+
+func TestProviderFailureStatusDetectsHermesSoft401(t *testing.T) {
+	raw := []byte(`{"choices":[{"delta":{},"finish_reason":"error"}],"error":{"message":"HTTP 401: litellm.AuthenticationError: OpenAIException - User not found"}}`)
+	if got := providerFailureStatus(raw); got != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", got)
+	}
+	if failureKindForStatus(http.StatusUnauthorized) != "provider_auth" {
+		t.Fatal("expected provider_auth failure kind")
+	}
+}
+
+func TestInspectHermesSoftFailureDetectsNonStreaming401(t *testing.T) {
+	body := `{"id":"x","choices":[{"message":{"role":"assistant","content":"API call failed after 1 retries: HTTP 401: litellm.AuthenticationError - User not found"}}]}`
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body))}
+	raw, status, err := inspectHermesSoftFailure(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusUnauthorized {
+		t.Fatalf("expected soft 401, got %d body=%s", status, raw)
+	}
+}
+
+func TestInspectHermesSoftFailureDetectsStreaming401BeforeToken(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}],\"error\":{\"message\":\"HTTP 401: litellm.AuthenticationError - User not found\"}}\n\n"
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body)), ContentLength: -1}
+	raw, status, err := inspectHermesSoftFailure(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusUnauthorized {
+		t.Fatalf("expected streaming soft 401, got %d body=%s", status, raw)
+	}
+}
+
+func TestModelCanFallbackOnAdaptiveProviderFailure(t *testing.T) {
+	m := store.ProviderModel{FallbackModelName: "groq-openai-gpt-oss-20b"}
+	if !modelCanFallback(m, "broken-model", "adaptive") {
+		t.Fatal("adaptive model should fallback")
+	}
+	if modelCanFallback(m, "broken-model", "trim") {
+		t.Fatal("trim-only model must not switch providers")
+	}
+	if modelCanFallback(m, "groq-openai-gpt-oss-20b", "adaptive") {
+		t.Fatal("fallback loop must be rejected")
+	}
+}

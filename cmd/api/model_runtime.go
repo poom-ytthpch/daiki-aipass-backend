@@ -24,6 +24,8 @@ type modelRecoveryMeta struct {
 	ObservedRateLimit     int    `json:"observedRateLimit,omitempty"`
 	ObservedRequested     int    `json:"observedRequested,omitempty"`
 	ObservedRateKind      string `json:"observedRateKind,omitempty"`
+	ObservedHTTPStatus    int    `json:"observedHttpStatus,omitempty"`
+	FailureKind           string `json:"failureKind,omitempty"`
 	FallbackFrom          string `json:"fallbackFrom,omitempty"`
 	PreflightFallback     bool   `json:"preflightFallback,omitempty"`
 	PredictedInputTokens  int    `json:"predictedInputTokens,omitempty"`
@@ -40,6 +42,50 @@ type rateLimitObservation struct {
 }
 
 var providerLimitPattern = regexp.MustCompile(`(?i)limit\s+([0-9][0-9,]*)\s*,\s*requested\s+([0-9][0-9,]*)`)
+var providerHTTPStatusPattern = regexp.MustCompile(`(?i)\bHTTP\s+([1-5][0-9]{2})\b`)
+var providerJSONCodePattern = regexp.MustCompile(`(?i)"code"\s*:\s*"?([1-5][0-9]{2})"?`)
+
+func recoverableProviderStatus(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+}
+
+func providerFailureStatus(raw []byte) int {
+	text := string(raw)
+	for _, re := range []*regexp.Regexp{providerHTTPStatusPattern, providerJSONCodePattern} {
+		if m := re.FindStringSubmatch(text); len(m) == 2 {
+			status, _ := strconv.Atoi(m[1])
+			if recoverableProviderStatus(status) {
+				return status
+			}
+		}
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "authenticationerror") || strings.Contains(lower, "authentication error") || strings.Contains(lower, "user not found") {
+		return http.StatusUnauthorized
+	}
+	if strings.Contains(lower, "ratelimiterror") || strings.Contains(lower, "rate limit") {
+		return http.StatusTooManyRequests
+	}
+	return 0
+}
+
+func failureKindForStatus(status int) string {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "provider_auth"
+	case http.StatusNotFound:
+		return "provider_model"
+	case http.StatusRequestTimeout:
+		return "provider_timeout"
+	case http.StatusTooManyRequests:
+		return "provider_rate_limit"
+	default:
+		if status >= 500 {
+			return "provider_upstream"
+		}
+	}
+	return "provider_error"
+}
 
 func parsePositiveInt(s string) int {
 	s = strings.ReplaceAll(strings.TrimSpace(s), ",", "")
@@ -373,9 +419,9 @@ func sseEventHasVisibleContent(raw []byte) bool {
 // an SSE `finish_reason:error` carrying the provider's 429. If that happens before
 // visible content, Daiki can still recover without leaking the failed attempt to
 // the browser.
-func inspectHermesSoftFailure(resp *http.Response) ([]byte, bool, error) {
+func inspectHermesSoftFailure(resp *http.Response) ([]byte, int, error) {
 	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
-		return nil, false, nil
+		return nil, 0, nil
 	}
 	contentType := strings.ToLower(resp.Header.Get("content-type"))
 	if strings.Contains(contentType, "text/event-stream") {
@@ -390,46 +436,46 @@ func inspectHermesSoftFailure(resp *http.Response) ([]byte, bool, error) {
 				payload := bytes.TrimSpace([]byte(strings.TrimPrefix(trimmed, "data:")))
 				if bytes.Equal(payload, []byte("[DONE]")) {
 					resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(captured.Bytes()), reader), closer: original}
-					return nil, false, nil
+					return nil, 0, nil
 				}
 				// Once a real token exists, the response is committed; replay everything
 				// captured so the browser receives the role/keepalive/content events intact.
 				if sseEventHasVisibleContent(payload) {
 					resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(captured.Bytes()), reader), closer: original}
-					return nil, false, nil
+					return nil, 0, nil
 				}
-				if responseLooksLikeRateLimitFailure(payload) {
+				if status := providerFailureStatus(payload); status != 0 {
 					_ = original.Close()
-					return append([]byte(nil), payload...), true, nil
+					return append([]byte(nil), payload...), status, nil
 				}
 			}
 			if err != nil {
 				if err == io.EOF {
 					resp.Body = io.NopCloser(bytes.NewReader(captured.Bytes()))
 					_ = original.Close()
-					return nil, false, nil
+					return nil, 0, nil
 				}
 				_ = original.Close()
-				return nil, false, err
+				return nil, 0, err
 			}
 		}
 		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(captured.Bytes()), reader), closer: original}
-		return nil, false, nil
+		return nil, 0, nil
 	}
 	if strings.Contains(contentType, "application/json") || resp.ContentLength >= 0 && resp.ContentLength <= 2<<20 {
 		original := resp.Body
 		raw, err := io.ReadAll(io.LimitReader(original, 2<<20))
 		if err != nil {
 			_ = original.Close()
-			return nil, false, err
+			return nil, 0, err
 		}
-		if responseLooksLikeRateLimitFailure(raw) {
+		if status := providerFailureStatus(raw); status != 0 {
 			_ = original.Close()
-			return raw, true, nil
+			return raw, status, nil
 		}
 		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(raw), original), closer: original}
 	}
-	return nil, false, nil
+	return nil, 0, nil
 }
 
 func runtimeAgentOverhead(m store.ProviderModel, profile string) int {
@@ -503,6 +549,29 @@ func shouldPreflightFallback(m store.ProviderModel, body []byte, overhead int) b
 
 type inferenceRequestFactory func(body []byte) (*http.Request, error)
 
+func modelCanFallback(m store.ProviderModel, currentModel, strategy string) bool {
+	return (strategy == "adaptive" || strategy == "fallback") && strings.TrimSpace(m.FallbackModelName) != "" && m.FallbackModelName != currentModel
+}
+
+func applyFallbackModel(ctx context.Context, a *app, body []byte, currentModel, profile string, m store.ProviderModel, meta *modelRecoveryMeta) ([]byte, string, store.ProviderModel, int, string) {
+	if meta.FallbackFrom == "" {
+		meta.FallbackFrom = currentModel
+	}
+	meta.FallbackTo = m.FallbackModelName
+	currentModel = m.FallbackModelName
+	body = setRequestModel(body, currentModel)
+	m = a.runtimeModel(ctx, currentModel)
+	overhead := runtimeAgentOverhead(m, profile)
+	meta.AppliedOverheadTokens = overhead
+	meta.FinalModel = currentModel
+	body = applyModelOutputCap(body, m.MaxOutputTokens)
+	strategy := m.ContextStrategy
+	if strategy == "" {
+		strategy = "adaptive"
+	}
+	return body, currentModel, m, overhead, strategy
+}
+
 func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model, profile string, makeReq inferenceRequestFactory) (*http.Response, []byte, string, modelRecoveryMeta, error) {
 	m := a.runtimeModel(ctx, model)
 	overhead := runtimeAgentOverhead(m, profile)
@@ -566,24 +635,29 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		}
 		resp, err := a.inferenceHTTP.Do(req)
 		if err != nil {
+			meta.FailureKind = "hermes_transport"
+			if attempt < maxRetries && strategy != "reject" && modelCanFallback(m, currentModel, strategy) {
+				body, currentModel, m, overhead, strategy = applyFallbackModel(ctx, a, body, currentModel, profile, m, &meta)
+				continue
+			}
 			return resp, body, currentModel, meta, err
 		}
 
 		var errBody []byte
 		statusForRecovery := resp.StatusCode
 		if resp.StatusCode == http.StatusOK {
-			softBody, softRateLimit, inspectErr := inspectHermesSoftFailure(resp)
+			softBody, softStatus, inspectErr := inspectHermesSoftFailure(resp)
 			if inspectErr != nil {
 				return resp, body, currentModel, meta, inspectErr
 			}
-			if softRateLimit {
+			if softStatus != 0 {
 				errBody = softBody
-				statusForRecovery = http.StatusTooManyRequests
-				resp.StatusCode = http.StatusTooManyRequests
-				resp.Status = "429 Too Many Requests"
+				statusForRecovery = softStatus
+				resp.StatusCode = softStatus
+				resp.Status = fmt.Sprintf("%d %s", softStatus, http.StatusText(softStatus))
 			}
 		}
-		if statusForRecovery != http.StatusTooManyRequests {
+		if !recoverableProviderStatus(statusForRecovery) {
 			meta.FinalInputTokens = estimateChatInputTokens(body)
 			meta.FinalModel = currentModel
 			return resp, body, currentModel, meta, nil
@@ -592,15 +666,19 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 			errBody, _ = io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 			_ = resp.Body.Close()
 		}
-		obs := parseRateLimitObservation(http.StatusTooManyRequests, errBody)
-		meta.ObservedRateKind, meta.ObservedRateLimit, meta.ObservedRequested = obs.Kind, obs.Limit, obs.Requested
+		meta.ObservedHTTPStatus = statusForRecovery
+		meta.FailureKind = failureKindForStatus(statusForRecovery)
+		obs := parseRateLimitObservation(statusForRecovery, errBody)
+		if statusForRecovery == http.StatusTooManyRequests {
+			meta.ObservedRateKind, meta.ObservedRateLimit, meta.ObservedRequested = obs.Kind, obs.Limit, obs.Requested
+		}
 		if attempt >= maxRetries || strategy == "reject" {
 			resp.Body = io.NopCloser(bytes.NewReader(errBody))
 			resp.Header.Set("content-type", "application/json")
 			return resp, body, currentModel, meta, nil
 		}
 		recovered := false
-		if (strategy == "adaptive" || strategy == "trim") && (obs.Kind == "itpm" || obs.Kind == "tpm" || obs.Requested > obs.Limit && obs.Limit > 0) {
+		if statusForRecovery == http.StatusTooManyRequests && (strategy == "adaptive" || strategy == "trim") && (obs.Kind == "itpm" || obs.Kind == "tpm" || obs.Requested > obs.Limit && obs.Limit > 0) {
 			target := runtimeMessageTarget(m, obs.Limit, 1-float64(attempt)*0.18, overhead)
 			if target == 0 && obs.Limit > 0 && overhead < int(float64(obs.Limit)*0.90) {
 				target = max(256, int(float64(obs.Limit)*0.72)-overhead)
@@ -619,21 +697,8 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 				}
 			}
 		}
-		if !recovered && (strategy == "adaptive" || strategy == "fallback") && m.FallbackModelName != "" && m.FallbackModelName != currentModel {
-			if meta.FallbackFrom == "" {
-				meta.FallbackFrom = currentModel
-			}
-			meta.FallbackTo = m.FallbackModelName
-			currentModel = m.FallbackModelName
-			body = setRequestModel(body, currentModel)
-			m = a.runtimeModel(ctx, currentModel)
-			overhead = runtimeAgentOverhead(m, profile)
-			meta.AppliedOverheadTokens = overhead
-			body = applyModelOutputCap(body, m.MaxOutputTokens)
-			strategy = m.ContextStrategy
-			if strategy == "" {
-				strategy = "adaptive"
-			}
+		if !recovered && modelCanFallback(m, currentModel, strategy) {
+			body, currentModel, m, overhead, strategy = applyFallbackModel(ctx, a, body, currentModel, profile, m, &meta)
 			recovered = true
 		}
 		if !recovered {
