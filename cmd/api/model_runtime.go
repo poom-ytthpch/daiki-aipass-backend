@@ -596,6 +596,38 @@ func (a *app) clearModelCircuit(ctx context.Context, model string) {
 	_ = a.redis.Del(ctx, modelCircuitKey(model)).Err()
 }
 
+func chatPayloadHasImage(body []byte) bool {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return bytes.Contains(body, []byte(`"image_url"`)) || bytes.Contains(body, []byte(`"input_image"`))
+	}
+	var walk func(any) bool
+	walk = func(v any) bool {
+		switch x := v.(type) {
+		case []any:
+			for _, item := range x {
+				if walk(item) {
+					return true
+				}
+			}
+		case map[string]any:
+			if typ, _ := x["type"].(string); typ == "image_url" || typ == "input_image" || typ == "image" {
+				return true
+			}
+			for key, item := range x {
+				if key == "image_url" || key == "input_image" {
+					return true
+				}
+				if walk(item) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(payload["messages"])
+}
+
 func modelCanFallback(m store.ProviderModel, currentModel, strategy string) bool {
 	return (strategy == "adaptive" || strategy == "fallback") && strings.TrimSpace(m.FallbackModelName) != "" && m.FallbackModelName != currentModel
 }
@@ -625,6 +657,10 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 	meta := modelRecoveryMeta{Attempts: 0, OriginalInputTokens: estimateChatInputTokens(body), FinalModel: model, RuntimeProfile: profile, AppliedOverheadTokens: overhead}
 	meta.PredictedInputTokens = meta.OriginalInputTokens + overhead
 	currentModel := model
+	// Never downgrade an image request to a text-only model fallback. The dedicated
+	// Vision alias must resolve to a model that can actually inspect pixels; a clear
+	// vision failure is safer than a plausible answer produced without seeing the image.
+	allowModelFallback := !chatPayloadHasImage(body)
 	strategy := m.ContextStrategy
 	if strategy == "" {
 		strategy = "adaptive"
@@ -633,7 +669,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 	// A recent deterministic provider failure opens a short shared circuit. Keep
 	// the configured alias intact, but route new requests straight to its model-level
 	// fallback until the circuit expires or an admin save/sync clears it.
-	if a.modelCircuitOpen(ctx, currentModel) && modelCanFallback(m, currentModel, strategy) {
+	if allowModelFallback && a.modelCircuitOpen(ctx, currentModel) && modelCanFallback(m, currentModel, strategy) {
 		meta.PreflightFallback = true
 		meta.CircuitBypass = true
 		meta.CircuitModel = currentModel
@@ -643,7 +679,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 	// A model whose Hermes/tool overhead already consumes its provider token budget cannot
 	// succeed even with an empty conversation. Route around it before spending a
 	// provider attempt or exposing an SSE stream.
-	if !meta.PreflightFallback && shouldPreflightFallback(m, body, overhead) {
+	if allowModelFallback && !meta.PreflightFallback && shouldPreflightFallback(m, body, overhead) {
 		meta.PreflightFallback = true
 		meta.FallbackFrom = currentModel
 		meta.FallbackTo = m.FallbackModelName
@@ -694,7 +730,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		if err != nil {
 			meta.FailureKind = "hermes_transport"
 			a.openModelCircuit(ctx, currentModel, 0, meta.FailureKind)
-			if attempt < maxRetries && strategy != "reject" && modelCanFallback(m, currentModel, strategy) {
+			if allowModelFallback && attempt < maxRetries && strategy != "reject" && modelCanFallback(m, currentModel, strategy) {
 				body, currentModel, m, overhead, strategy = applyFallbackModel(ctx, a, body, currentModel, profile, m, &meta)
 				continue
 			}
@@ -759,7 +795,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 				}
 			}
 		}
-		if !recovered && modelCanFallback(m, currentModel, strategy) {
+		if allowModelFallback && !recovered && modelCanFallback(m, currentModel, strategy) {
 			body, currentModel, m, overhead, strategy = applyFallbackModel(ctx, a, body, currentModel, profile, m, &meta)
 			recovered = true
 		}

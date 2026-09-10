@@ -223,3 +223,14 @@ func TestModelCircuitTTLByFailureClass(t *testing.T) {
 		t.Fatalf("transport circuit ttl=%s", got)
 	}
 }
+
+func TestChatPayloadHasImagePreventsSemanticFallback(t *testing.T) {
+	text := []byte(`{"model":"fast","messages":[{"role":"user","content":"hello"}]}`)
+	image := []byte(`{"model":"vision","messages":[{"role":"user","content":[{"type":"text","text":"read it"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`)
+	if chatPayloadHasImage(text) {
+		t.Fatal("text payload must not be treated as vision")
+	}
+	if !chatPayloadHasImage(image) {
+		t.Fatal("image payload must be detected")
+	}
+}
