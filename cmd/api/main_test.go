@@ -388,8 +388,13 @@ func TestThinkingModeAppliesBudgetAndRemovesInternalField(t *testing.T) {
 	if _, exists := payload["thinkingMode"]; exists {
 		t.Fatal("thinkingMode must not be forwarded")
 	}
-	if payload["reasoning_effort"] != "high" {
-		t.Fatalf("unexpected reasoning effort %#v", payload["reasoning_effort"])
+	if _, exists := payload["reasoning_effort"]; exists {
+		t.Fatalf("provider reasoning field must not bypass Hermes model_options: %#v", payload["reasoning_effort"])
+	}
+	options, _ := payload["model_options"].(map[string]any)
+	reasoning, _ := options["reasoning"].(map[string]any)
+	if reasoning["enabled"] != true || reasoning["effort"] != "high" {
+		t.Fatalf("unexpected Hermes reasoning options %#v", reasoning)
 	}
 	if payload["max_completion_tokens"] != float64(4096) {
 		t.Fatalf("unexpected completion budget %#v", payload["max_completion_tokens"])
@@ -443,7 +448,12 @@ func TestThinkingOffDoesNotSendUnsupportedReasoningEffort(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, exists := payload["reasoning_effort"]; exists {
-		t.Fatalf("off mode must omit reasoning_effort: %#v", payload["reasoning_effort"])
+		t.Fatalf("off mode must omit top-level reasoning_effort: %#v", payload["reasoning_effort"])
+	}
+	options, _ := payload["model_options"].(map[string]any)
+	reasoning, _ := options["reasoning"].(map[string]any)
+	if reasoning["enabled"] != false || reasoning["effort"] != "none" {
+		t.Fatalf("off mode must explicitly disable Hermes reasoning: %#v", reasoning)
 	}
 }
 

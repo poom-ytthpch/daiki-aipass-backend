@@ -705,6 +705,16 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	w.Header().Set("x-daiki-retry-attempts", strconv.Itoa(max(0, recovery.Attempts-1)))
 	w.Header().Set("x-daiki-admission-wait-ms", strconv.FormatInt(recovery.AdmissionWaitMS, 10))
 	w.Header().Set("x-daiki-admission-tokens", strconv.Itoa(recovery.AdmissionTokens))
+	if recovery.RequestedReasoningEffort != "" {
+		w.Header().Set("x-daiki-reasoning-requested", recovery.RequestedReasoningEffort)
+	}
+	if recovery.EffectiveReasoningEffort != "" {
+		w.Header().Set("x-daiki-reasoning-effective", recovery.EffectiveReasoningEffort)
+	}
+	w.Header().Set("x-daiki-reasoning-native", strconv.FormatBool(recovery.NativeReasoning))
+	if recovery.ReasoningModel != "" {
+		w.Header().Set("x-daiki-reasoning-model", recovery.ReasoningModel)
+	}
 	if recovery.AdmissionSpillover {
 		w.Header().Set("x-daiki-admission-spillover", "true")
 	}

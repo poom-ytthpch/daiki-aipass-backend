@@ -17,7 +17,7 @@ type thinkingProfile struct {
 
 var thinkingProfiles = map[string]thinkingProfile{
 	"off": {
-		Mode: "off", Label: "Off", ReasoningBudget: 0, MaxCompletionTokens: 1024, NativeReasoningEffort: "",
+		Mode: "off", Label: "Off", ReasoningBudget: 0, MaxCompletionTokens: 1024, NativeReasoningEffort: "none",
 		Instruction: "Answer directly. Do not spend extra tokens on deliberate reasoning unless needed for correctness.",
 	},
 	"low": {
@@ -61,19 +61,28 @@ func applyThinkingMode(body []byte) ([]byte, thinkingProfile, error) {
 	mode := normalizeThinkingMode(payload["thinkingMode"])
 	profile := thinkingProfileFor(mode)
 	delete(payload, "thinkingMode")
-
-	if profile.NativeReasoningEffort != "" {
-		payload["reasoning_effort"] = profile.NativeReasoningEffort
-	} else {
-		delete(payload, "reasoning_effort")
+	// Hermes API Server consumes per-request reasoning from model_options. Keep
+	// provider wire fields out of the top-level request here; the runtime adapter
+	// applies only fields supported by the resolved physical model.
+	delete(payload, "reasoning_effort")
+	delete(payload, "reasoning_format")
+	delete(payload, "include_reasoning")
+	modelOptions, _ := payload["model_options"].(map[string]any)
+	if modelOptions == nil {
+		modelOptions = map[string]any{}
 	}
+	modelOptions["reasoning"] = map[string]any{
+		"enabled": profile.Mode != "off",
+		"effort":  profile.NativeReasoningEffort,
+	}
+	payload["model_options"] = modelOptions
 	if existing, ok := payload["max_completion_tokens"].(float64); !ok || int64(existing) <= 0 || int64(existing) > profile.MaxCompletionTokens {
 		payload["max_completion_tokens"] = profile.MaxCompletionTokens
 	}
 	delete(payload, "max_tokens")
 
 	messages, _ := payload["messages"].([]any)
-	instruction := "THINKING MODE: " + strings.ToUpper(profile.Mode) + ". " + profile.Instruction + " Hidden reasoning is private; never print or summarize chain-of-thought."
+	instruction := "THINKING MODE: " + strings.ToUpper(profile.Mode) + ". " + profile.Instruction + " The provider receives the matching native reasoning effort when supported. Keep hidden reasoning private and return only the useful answer/rationale."
 	if len(messages) > 0 {
 		if first, ok := messages[0].(map[string]any); ok && strings.EqualFold(strings.TrimSpace(fmt.Sprint(first["role"])), "system") {
 			first["content"] = strings.TrimSpace(fmt.Sprint(first["content"])) + "\n\n" + instruction

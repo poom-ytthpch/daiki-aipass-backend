@@ -19,27 +19,31 @@ import (
 )
 
 type modelRecoveryMeta struct {
-	Attempts              int    `json:"attempts"`
-	ContextTrimmed        bool   `json:"contextTrimmed"`
-	OriginalInputTokens   int    `json:"originalInputTokens"`
-	FinalInputTokens      int    `json:"finalInputTokens"`
-	ObservedRateLimit     int    `json:"observedRateLimit,omitempty"`
-	ObservedRequested     int    `json:"observedRequested,omitempty"`
-	ObservedRateKind      string `json:"observedRateKind,omitempty"`
-	ObservedHTTPStatus    int    `json:"observedHttpStatus,omitempty"`
-	FailureKind           string `json:"failureKind,omitempty"`
-	CircuitBypass         bool   `json:"circuitBypass,omitempty"`
-	CircuitModel          string `json:"circuitModel,omitempty"`
-	FallbackFrom          string `json:"fallbackFrom,omitempty"`
-	PreflightFallback     bool   `json:"preflightFallback,omitempty"`
-	PredictedInputTokens  int    `json:"predictedInputTokens,omitempty"`
-	FallbackTo            string `json:"fallbackTo,omitempty"`
-	FinalModel            string `json:"finalModel"`
-	RuntimeProfile        string `json:"runtimeProfile,omitempty"`
-	AppliedOverheadTokens int    `json:"appliedOverheadTokens,omitempty"`
-	AdmissionWaitMS       int64  `json:"admissionWaitMs,omitempty"`
-	AdmissionSpillover    bool   `json:"admissionSpillover,omitempty"`
-	AdmissionTokens       int    `json:"admissionTokens,omitempty"`
+	Attempts                 int    `json:"attempts"`
+	ContextTrimmed           bool   `json:"contextTrimmed"`
+	OriginalInputTokens      int    `json:"originalInputTokens"`
+	FinalInputTokens         int    `json:"finalInputTokens"`
+	ObservedRateLimit        int    `json:"observedRateLimit,omitempty"`
+	ObservedRequested        int    `json:"observedRequested,omitempty"`
+	ObservedRateKind         string `json:"observedRateKind,omitempty"`
+	ObservedHTTPStatus       int    `json:"observedHttpStatus,omitempty"`
+	FailureKind              string `json:"failureKind,omitempty"`
+	CircuitBypass            bool   `json:"circuitBypass,omitempty"`
+	CircuitModel             string `json:"circuitModel,omitempty"`
+	FallbackFrom             string `json:"fallbackFrom,omitempty"`
+	PreflightFallback        bool   `json:"preflightFallback,omitempty"`
+	PredictedInputTokens     int    `json:"predictedInputTokens,omitempty"`
+	FallbackTo               string `json:"fallbackTo,omitempty"`
+	FinalModel               string `json:"finalModel"`
+	RuntimeProfile           string `json:"runtimeProfile,omitempty"`
+	AppliedOverheadTokens    int    `json:"appliedOverheadTokens,omitempty"`
+	AdmissionWaitMS          int64  `json:"admissionWaitMs,omitempty"`
+	AdmissionSpillover       bool   `json:"admissionSpillover,omitempty"`
+	AdmissionTokens          int    `json:"admissionTokens,omitempty"`
+	RequestedReasoningEffort string `json:"requestedReasoningEffort,omitempty"`
+	EffectiveReasoningEffort string `json:"effectiveReasoningEffort,omitempty"`
+	NativeReasoning          bool   `json:"nativeReasoning"`
+	ReasoningModel           string `json:"reasoningModel,omitempty"`
 }
 
 type rateLimitObservation struct {
@@ -732,6 +736,90 @@ func chatPayloadHasImage(body []byte) bool {
 	return walk(payload["messages"])
 }
 
+func requestedReasoningEffort(body []byte) string {
+	var payload struct {
+		ModelOptions struct {
+			Reasoning struct {
+				Enabled *bool  `json:"enabled"`
+				Effort  string `json:"effort"`
+			} `json:"reasoning"`
+		} `json:"model_options"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return ""
+	}
+	effort := strings.ToLower(strings.TrimSpace(payload.ModelOptions.Reasoning.Effort))
+	if payload.ModelOptions.Reasoning.Enabled != nil && !*payload.ModelOptions.Reasoning.Enabled {
+		return "none"
+	}
+	return effort
+}
+
+func reasoningEffortForModel(model, requested string) (string, bool) {
+	model = strings.ToLower(strings.TrimSpace(model))
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if requested == "off" {
+		requested = "none"
+	}
+	if requested == "" {
+		return "", false
+	}
+	if strings.Contains(model, "qwen3.8") {
+		switch requested {
+		case "none", "low", "medium", "high":
+			return requested, true
+		case "minimal":
+			return "low", true
+		case "xhigh", "max", "ultra":
+			return "high", true
+		default:
+			return "", false
+		}
+	}
+	if strings.Contains(model, "gpt-oss-20b") || strings.Contains(model, "gpt-oss-120b") {
+		switch requested {
+		case "none", "minimal":
+			// Groq GPT-OSS does not accept `none`; preserve availability with the
+			// weakest native reasoning level if a non-reasoning Qwen request falls back.
+			return "low", true
+		case "low", "medium", "high":
+			return requested, true
+		case "xhigh", "max", "ultra":
+			return "high", true
+		default:
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func applyReasoningForModel(body []byte, model, requested string) ([]byte, string, bool, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, "", false, err
+	}
+	delete(payload, "reasoning_effort")
+	delete(payload, "reasoning_format")
+	delete(payload, "include_reasoning")
+	options, _ := payload["model_options"].(map[string]any)
+	if options == nil {
+		options = map[string]any{}
+	}
+	effective, native := reasoningEffortForModel(model, requested)
+	if native {
+		options["reasoning"] = map[string]any{"enabled": effective != "none", "effort": effective}
+	} else {
+		delete(options, "reasoning")
+	}
+	if len(options) == 0 {
+		delete(payload, "model_options")
+	} else {
+		payload["model_options"] = options
+	}
+	out, err := json.Marshal(payload)
+	return out, effective, native, err
+}
+
 func modelCanFallback(m store.ProviderModel, currentModel, strategy string) bool {
 	return (strategy == "adaptive" || strategy == "fallback") && strings.TrimSpace(m.FallbackModelName) != "" && m.FallbackModelName != currentModel
 }
@@ -816,6 +904,8 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		meta.FinalInputTokens = estimateChatInputTokens(body)
 	}
 	meta.FinalModel = currentModel
+	requestedReasoning := requestedReasoningEffort(body)
+	meta.RequestedReasoningEffort = requestedReasoning
 	maxRetries := m.MaxRetries
 	if maxRetries < 0 {
 		maxRetries = 0
@@ -826,6 +916,12 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 
 	for attempt := 0; ; attempt++ {
 		meta.Attempts++
+		var reasoningErr error
+		body, meta.EffectiveReasoningEffort, meta.NativeReasoning, reasoningErr = applyReasoningForModel(body, currentModel, requestedReasoning)
+		meta.ReasoningModel = currentModel
+		if reasoningErr != nil {
+			return nil, body, currentModel, meta, reasoningErr
+		}
 		admitted, primaryWait, admissionTokens, admissionErr := a.tryModelAdmission(ctx, currentModel, body, m, profile)
 		if admissionErr != nil {
 			return nil, body, currentModel, meta, admissionErr

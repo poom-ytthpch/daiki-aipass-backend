@@ -278,3 +278,62 @@ func TestRuntimeAgentOverheadUsesLeanVisionBudget(t *testing.T) {
 		t.Fatalf("vision overhead=%d want 800", got)
 	}
 }
+
+func TestReasoningEffortForModel(t *testing.T) {
+	cases := []struct {
+		model, requested, want string
+		native                 bool
+	}{
+		{"groq-qwen-qwen3.8-27b", "none", "none", true},
+		{"groq-qwen-qwen3.8-27b", "low", "low", true},
+		{"groq-qwen-qwen3.8-27b", "medium", "medium", true},
+		{"groq-qwen-qwen3.8-27b", "high", "high", true},
+		{"groq-openai-gpt-oss-20b", "none", "low", true},
+		{"groq-openai-gpt-oss-20b", "high", "high", true},
+		{"groq-openai-gpt-oss-120b", "medium", "medium", true},
+		{"unknown-model", "high", "", false},
+	}
+	for _, tc := range cases {
+		got, native := reasoningEffortForModel(tc.model, tc.requested)
+		if got != tc.want || native != tc.native {
+			t.Fatalf("%s/%s got effort=%q native=%v want %q/%v", tc.model, tc.requested, got, native, tc.want, tc.native)
+		}
+	}
+}
+
+func TestApplyReasoningForModelUsesHermesModelOptions(t *testing.T) {
+	body := []byte(`{"model":"groq-qwen-qwen3.8-27b","model_options":{"reasoning":{"enabled":true,"effort":"high"}},"messages":[{"role":"user","content":"solve"}]}`)
+	out, effective, native, err := applyReasoningForModel(body, "groq-qwen-qwen3.8-27b", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective != "high" || !native {
+		t.Fatalf("effective=%q native=%v", effective, native)
+	}
+	var payload map[string]any
+	if json.Unmarshal(out, &payload) != nil {
+		t.Fatal("invalid output")
+	}
+	if _, exists := payload["reasoning_effort"]; exists {
+		t.Fatal("top-level reasoning_effort must stay absent")
+	}
+	options := payload["model_options"].(map[string]any)
+	reasoning := options["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" || reasoning["enabled"] != true {
+		t.Fatalf("reasoning=%#v", reasoning)
+	}
+}
+
+func TestApplyReasoningForGPTOSSClampsOffToLow(t *testing.T) {
+	body := []byte(`{"model_options":{"reasoning":{"enabled":false,"effort":"none"}},"messages":[{"role":"user","content":"hello"}]}`)
+	out, effective, native, err := applyReasoningForModel(body, "groq-openai-gpt-oss-20b", "none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective != "low" || !native {
+		t.Fatalf("effective=%q native=%v", effective, native)
+	}
+	if requestedReasoningEffort(out) != "low" {
+		t.Fatalf("expected clamped low in payload, got %q", requestedReasoningEffort(out))
+	}
+}

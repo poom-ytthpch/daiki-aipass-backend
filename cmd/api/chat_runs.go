@@ -323,9 +323,16 @@ func safeRunResearchActivity(meta researchMetadata) map[string]any {
 }
 
 func (a *app) chatRunActivity(ctx context.Context, requestID string, headers http.Header, started, ended time.Time, prompt, completion, reasoning, total int64) map[string]any {
+	thinkingActivity := map[string]any{
+		"mode":            headers.Get("x-daiki-thinking-mode"),
+		"requestedEffort": headers.Get("x-daiki-reasoning-requested"),
+		"effectiveEffort": headers.Get("x-daiki-reasoning-effective"),
+		"nativeReasoning": strings.EqualFold(headers.Get("x-daiki-reasoning-native"), "true"),
+		"model":           headers.Get("x-daiki-reasoning-model"),
+	}
 	activity := map[string]any{
 		"phase": "completed", "durationMs": ended.Sub(started).Milliseconds(), "requestId": requestID,
-		"thinking": map[string]any{"mode": headers.Get("x-daiki-thinking-mode")},
+		"thinking": thinkingActivity,
 		"tokens":   map[string]any{"input": prompt, "reasoning": reasoning, "answer": max(int64(0), completion-reasoning), "total": total},
 	}
 	if requestID == "" {
@@ -356,8 +363,25 @@ func (a *app) chatRunActivity(ctx context.Context, requestID string, headers htt
 		activity["research"] = safe
 	}
 	if thinking, ok := meta["thinking"].(map[string]any); ok {
-		activity["thinking"] = map[string]any{"mode": thinking["mode"], "reasoningBudget": thinking["reasoningBudget"], "estimate": thinking["estimate"]}
+		thinkingActivity["mode"] = thinking["mode"]
+		thinkingActivity["reasoningBudget"] = thinking["reasoningBudget"]
+		thinkingActivity["estimate"] = thinking["estimate"]
 	}
+	if recovery, ok := meta["modelRecovery"].(map[string]any); ok {
+		if value := strings.TrimSpace(fmt.Sprint(recovery["requestedReasoningEffort"])); value != "" {
+			thinkingActivity["requestedEffort"] = value
+		}
+		if value := strings.TrimSpace(fmt.Sprint(recovery["effectiveReasoningEffort"])); value != "" {
+			thinkingActivity["effectiveEffort"] = value
+		}
+		if value := strings.TrimSpace(fmt.Sprint(recovery["reasoningModel"])); value != "" {
+			thinkingActivity["model"] = value
+		}
+		if native, exists := recovery["nativeReasoning"].(bool); exists {
+			thinkingActivity["nativeReasoning"] = native
+		}
+	}
+	activity["thinking"] = thinkingActivity
 	return activity
 }
 
