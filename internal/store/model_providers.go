@@ -45,6 +45,7 @@ type ProviderModel struct {
 	RetryBackoffMS       int       `json:"retryBackoffMs"`
 	ContextStrategy      string    `json:"contextStrategy"`
 	ContextTargetTokens  int       `json:"contextTargetTokens"`
+	AgentOverheadTokens  int       `json:"agentOverheadTokens"`
 	FallbackModelName    string    `json:"fallbackModelName"`
 	CreatedAt            time.Time `json:"createdAt"`
 	UpdatedAt            time.Time `json:"updatedAt"`
@@ -96,11 +97,11 @@ func (s *Store) DeleteModelProvider(ctx context.Context, id string) error {
 
 func scanProviderModel(row pgx.Row) (ProviderModel, error) {
 	var x ProviderModel
-	err := row.Scan(&x.ID, &x.ProviderID, &x.UpstreamModel, &x.LiteLLMModelName, &x.LiteLLMModelID, &x.Status, &x.LastError, &x.MaxInputTokens, &x.MaxOutputTokens, &x.TPMLimit, &x.ITPMLimit, &x.OTPMLimit, &x.RPMLimit, &x.TimeoutSeconds, &x.StreamTimeoutSeconds, &x.MaxRetries, &x.ProviderMaxRetries, &x.RetryBackoffMS, &x.ContextStrategy, &x.ContextTargetTokens, &x.FallbackModelName, &x.CreatedAt, &x.UpdatedAt)
+	err := row.Scan(&x.ID, &x.ProviderID, &x.UpstreamModel, &x.LiteLLMModelName, &x.LiteLLMModelID, &x.Status, &x.LastError, &x.MaxInputTokens, &x.MaxOutputTokens, &x.TPMLimit, &x.ITPMLimit, &x.OTPMLimit, &x.RPMLimit, &x.TimeoutSeconds, &x.StreamTimeoutSeconds, &x.MaxRetries, &x.ProviderMaxRetries, &x.RetryBackoffMS, &x.ContextStrategy, &x.ContextTargetTokens, &x.AgentOverheadTokens, &x.FallbackModelName, &x.CreatedAt, &x.UpdatedAt)
 	return x, err
 }
 func (s *Store) ProviderModels(ctx context.Context, providerID string) ([]ProviderModel, error) {
-	q := `SELECT id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,fallback_model_name,created_at,updated_at FROM provider_models`
+	q := `SELECT id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,agent_overhead_tokens,fallback_model_name,created_at,updated_at FROM provider_models`
 	args := []any{}
 	if providerID != "" {
 		q += ` WHERE provider_id=$1`
@@ -123,14 +124,14 @@ func (s *Store) ProviderModels(ctx context.Context, providerID string) ([]Provid
 	return out, rows.Err()
 }
 func (s *Store) ProviderModel(ctx context.Context, id string) (ProviderModel, error) {
-	return scanProviderModel(s.DB.QueryRow(ctx, `SELECT id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,fallback_model_name,created_at,updated_at FROM provider_models WHERE id=$1`, id))
+	return scanProviderModel(s.DB.QueryRow(ctx, `SELECT id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,agent_overhead_tokens,fallback_model_name,created_at,updated_at FROM provider_models WHERE id=$1`, id))
 }
 func (s *Store) UpsertProviderModel(ctx context.Context, x ProviderModel) (ProviderModel, error) {
-	return scanProviderModel(s.DB.QueryRow(ctx, `INSERT INTO provider_models(id,provider_id,upstream_model,litellm_model_name,litellm_model_id,status,last_error) VALUES($1,$2,$3,$4,NULLIF($5,''),$6,$7) ON CONFLICT(provider_id,upstream_model) DO UPDATE SET litellm_model_name=EXCLUDED.litellm_model_name,litellm_model_id=COALESCE(EXCLUDED.litellm_model_id,provider_models.litellm_model_id),status=EXCLUDED.status,last_error=EXCLUDED.last_error,updated_at=now() RETURNING id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,fallback_model_name,created_at,updated_at`, x.ID, x.ProviderID, x.UpstreamModel, x.LiteLLMModelName, x.LiteLLMModelID, x.Status, x.LastError))
+	return scanProviderModel(s.DB.QueryRow(ctx, `INSERT INTO provider_models(id,provider_id,upstream_model,litellm_model_name,litellm_model_id,status,last_error) VALUES($1,$2,$3,$4,NULLIF($5,''),$6,$7) ON CONFLICT(provider_id,upstream_model) DO UPDATE SET litellm_model_name=EXCLUDED.litellm_model_name,litellm_model_id=COALESCE(EXCLUDED.litellm_model_id,provider_models.litellm_model_id),status=EXCLUDED.status,last_error=EXCLUDED.last_error,updated_at=now() RETURNING id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,agent_overhead_tokens,fallback_model_name,created_at,updated_at`, x.ID, x.ProviderID, x.UpstreamModel, x.LiteLLMModelName, x.LiteLLMModelID, x.Status, x.LastError))
 }
 
 func (s *Store) ProviderModelByLiteLLMName(ctx context.Context, name string) (ProviderModel, error) {
-	return scanProviderModel(s.DB.QueryRow(ctx, `SELECT id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,fallback_model_name,created_at,updated_at FROM provider_models WHERE litellm_model_name=$1`, name))
+	return scanProviderModel(s.DB.QueryRow(ctx, `SELECT id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,agent_overhead_tokens,fallback_model_name,created_at,updated_at FROM provider_models WHERE litellm_model_name=$1`, name))
 }
 
 func (s *Store) UpdateProviderModelRuntime(ctx context.Context, actor string, x ProviderModel) (ProviderModel, error) {
@@ -149,7 +150,7 @@ func (s *Store) UpdateProviderModelRuntime(ctx context.Context, actor string, x 
 	if x.RetryBackoffMS < 0 || x.RetryBackoffMS > 30000 {
 		return ProviderModel{}, errors.New("retryBackoffMs must be between 0 and 30000")
 	}
-	for _, v := range []int{x.MaxInputTokens, x.MaxOutputTokens, x.TPMLimit, x.ITPMLimit, x.OTPMLimit, x.RPMLimit, x.ContextTargetTokens} {
+	for _, v := range []int{x.MaxInputTokens, x.MaxOutputTokens, x.TPMLimit, x.ITPMLimit, x.OTPMLimit, x.RPMLimit, x.ContextTargetTokens, x.AgentOverheadTokens} {
 		if v < 0 {
 			return ProviderModel{}, errors.New("token/rate limits must be >= 0")
 		}
@@ -159,7 +160,7 @@ func (s *Store) UpdateProviderModelRuntime(ctx context.Context, actor string, x 
 	default:
 		return ProviderModel{}, errors.New("contextStrategy must be adaptive, trim, fallback, or reject")
 	}
-	out, err := scanProviderModel(s.DB.QueryRow(ctx, `UPDATE provider_models SET max_input_tokens=$2,max_output_tokens=$3,tpm_limit=$4,itpm_limit=$5,otpm_limit=$6,rpm_limit=$7,timeout_seconds=$8,stream_timeout_seconds=$9,max_retries=$10,provider_max_retries=$11,retry_backoff_ms=$12,context_strategy=$13,context_target_tokens=$14,fallback_model_name=$15,updated_at=now() WHERE id=$1 RETURNING id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,fallback_model_name,created_at,updated_at`, x.ID, x.MaxInputTokens, x.MaxOutputTokens, x.TPMLimit, x.ITPMLimit, x.OTPMLimit, x.RPMLimit, x.TimeoutSeconds, x.StreamTimeoutSeconds, x.MaxRetries, x.ProviderMaxRetries, x.RetryBackoffMS, x.ContextStrategy, x.ContextTargetTokens, x.FallbackModelName))
+	out, err := scanProviderModel(s.DB.QueryRow(ctx, `UPDATE provider_models SET max_input_tokens=$2,max_output_tokens=$3,tpm_limit=$4,itpm_limit=$5,otpm_limit=$6,rpm_limit=$7,timeout_seconds=$8,stream_timeout_seconds=$9,max_retries=$10,provider_max_retries=$11,retry_backoff_ms=$12,context_strategy=$13,context_target_tokens=$14,agent_overhead_tokens=$15,fallback_model_name=$16,updated_at=now() WHERE id=$1 RETURNING id,provider_id,upstream_model,litellm_model_name,COALESCE(litellm_model_id,''),status,last_error,max_input_tokens,max_output_tokens,tpm_limit,itpm_limit,otpm_limit,rpm_limit,timeout_seconds,stream_timeout_seconds,max_retries,provider_max_retries,retry_backoff_ms,context_strategy,context_target_tokens,agent_overhead_tokens,fallback_model_name,created_at,updated_at`, x.ID, x.MaxInputTokens, x.MaxOutputTokens, x.TPMLimit, x.ITPMLimit, x.OTPMLimit, x.RPMLimit, x.TimeoutSeconds, x.StreamTimeoutSeconds, x.MaxRetries, x.ProviderMaxRetries, x.RetryBackoffMS, x.ContextStrategy, x.ContextTargetTokens, x.AgentOverheadTokens, x.FallbackModelName))
 	if err != nil {
 		return ProviderModel{}, err
 	}

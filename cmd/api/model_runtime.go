@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -16,16 +17,18 @@ import (
 )
 
 type modelRecoveryMeta struct {
-	Attempts            int    `json:"attempts"`
-	ContextTrimmed      bool   `json:"contextTrimmed"`
-	OriginalInputTokens int    `json:"originalInputTokens"`
-	FinalInputTokens    int    `json:"finalInputTokens"`
-	ObservedRateLimit   int    `json:"observedRateLimit,omitempty"`
-	ObservedRequested   int    `json:"observedRequested,omitempty"`
-	ObservedRateKind    string `json:"observedRateKind,omitempty"`
-	FallbackFrom        string `json:"fallbackFrom,omitempty"`
-	FallbackTo          string `json:"fallbackTo,omitempty"`
-	FinalModel          string `json:"finalModel"`
+	Attempts             int    `json:"attempts"`
+	ContextTrimmed       bool   `json:"contextTrimmed"`
+	OriginalInputTokens  int    `json:"originalInputTokens"`
+	FinalInputTokens     int    `json:"finalInputTokens"`
+	ObservedRateLimit    int    `json:"observedRateLimit,omitempty"`
+	ObservedRequested    int    `json:"observedRequested,omitempty"`
+	ObservedRateKind     string `json:"observedRateKind,omitempty"`
+	FallbackFrom         string `json:"fallbackFrom,omitempty"`
+	PreflightFallback    bool   `json:"preflightFallback,omitempty"`
+	PredictedInputTokens int    `json:"predictedInputTokens,omitempty"`
+	FallbackTo           string `json:"fallbackTo,omitempty"`
+	FinalModel           string `json:"finalModel"`
 }
 
 type rateLimitObservation struct {
@@ -324,22 +327,183 @@ func (a *app) runtimeModel(ctx context.Context, name string) store.ProviderModel
 	return m
 }
 
+type replayReadCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r *replayReadCloser) Close() error {
+	if r.closer != nil {
+		return r.closer.Close()
+	}
+	return nil
+}
+
+func responseLooksLikeRateLimitFailure(raw []byte) bool {
+	text := strings.ToLower(string(raw))
+	return strings.Contains(text, "http 429") &&
+		(strings.Contains(text, "ratelimit") || strings.Contains(text, "rate limit")) &&
+		(strings.Contains(text, "limit") || strings.Contains(text, "requested"))
+}
+
+func sseEventHasVisibleContent(raw []byte) bool {
+	var event map[string]any
+	if json.Unmarshal(raw, &event) != nil {
+		return false
+	}
+	choices, _ := event["choices"].([]any)
+	for _, item := range choices {
+		choice, _ := item.(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if text, _ := delta["content"].(string); strings.TrimSpace(text) != "" {
+			return true
+		}
+		message, _ := choice["message"].(map[string]any)
+		if text, _ := message["content"].(string); strings.TrimSpace(text) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// inspectHermesSoftFailure keeps the upstream response private until Hermes has
+// produced a real assistant token. Hermes may answer HTTP 200 and only later emit
+// an SSE `finish_reason:error` carrying the provider's 429. If that happens before
+// visible content, Daiki can still recover without leaking the failed attempt to
+// the browser.
+func inspectHermesSoftFailure(resp *http.Response) ([]byte, bool, error) {
+	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
+		return nil, false, nil
+	}
+	contentType := strings.ToLower(resp.Header.Get("content-type"))
+	if strings.Contains(contentType, "text/event-stream") {
+		original := resp.Body
+		reader := bufio.NewReader(original)
+		var captured bytes.Buffer
+		for captured.Len() < 512<<10 {
+			line, err := reader.ReadString('\n')
+			captured.WriteString(line)
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "data:") {
+				payload := bytes.TrimSpace([]byte(strings.TrimPrefix(trimmed, "data:")))
+				if bytes.Equal(payload, []byte("[DONE]")) {
+					resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(captured.Bytes()), reader), closer: original}
+					return nil, false, nil
+				}
+				// Once a real token exists, the response is committed; replay everything
+				// captured so the browser receives the role/keepalive/content events intact.
+				if sseEventHasVisibleContent(payload) {
+					resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(captured.Bytes()), reader), closer: original}
+					return nil, false, nil
+				}
+				if responseLooksLikeRateLimitFailure(payload) {
+					_ = original.Close()
+					return append([]byte(nil), payload...), true, nil
+				}
+			}
+			if err != nil {
+				if err == io.EOF {
+					resp.Body = io.NopCloser(bytes.NewReader(captured.Bytes()))
+					_ = original.Close()
+					return nil, false, nil
+				}
+				_ = original.Close()
+				return nil, false, err
+			}
+		}
+		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(captured.Bytes()), reader), closer: original}
+		return nil, false, nil
+	}
+	if strings.Contains(contentType, "application/json") || resp.ContentLength >= 0 && resp.ContentLength <= 2<<20 {
+		original := resp.Body
+		raw, err := io.ReadAll(io.LimitReader(original, 2<<20))
+		if err != nil {
+			_ = original.Close()
+			return nil, false, err
+		}
+		if responseLooksLikeRateLimitFailure(raw) {
+			_ = original.Close()
+			return raw, true, nil
+		}
+		resp.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(raw), original), closer: original}
+	}
+	return nil, false, nil
+}
+
+func runtimeSafeITPMBudget(m store.ProviderModel) int {
+	if m.ITPMLimit <= 0 {
+		return 0
+	}
+	return max(256, int(float64(m.ITPMLimit)*0.90))
+}
+
+func runtimeMessageTarget(m store.ProviderModel, observed int, factor float64) int {
+	target := runtimeContextTarget(m, observed, factor)
+	limit := m.ITPMLimit
+	if observed > 0 && (limit == 0 || observed < limit) {
+		limit = observed
+	}
+	if limit > 0 && m.AgentOverheadTokens > 0 {
+		messageBudget := int(float64(limit)*0.90) - m.AgentOverheadTokens
+		if messageBudget <= 0 {
+			return 0
+		}
+		if target == 0 || messageBudget < target {
+			target = messageBudget
+		}
+	}
+	if target <= 0 {
+		return 0
+	}
+	return max(256, target)
+}
+
+func shouldPreflightFallback(m store.ProviderModel, body []byte) bool {
+	budget := runtimeSafeITPMBudget(m)
+	if budget <= 0 || m.AgentOverheadTokens <= 0 || strings.TrimSpace(m.FallbackModelName) == "" {
+		return false
+	}
+	predicted := estimateChatInputTokens(body) + m.AgentOverheadTokens
+	return predicted > budget && (m.ContextStrategy == "adaptive" || m.ContextStrategy == "fallback")
+}
+
 type inferenceRequestFactory func(body []byte) (*http.Request, error)
 
 func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model string, makeReq inferenceRequestFactory) (*http.Response, []byte, string, modelRecoveryMeta, error) {
 	m := a.runtimeModel(ctx, model)
 	meta := modelRecoveryMeta{Attempts: 0, OriginalInputTokens: estimateChatInputTokens(body), FinalModel: model}
-	body = applyModelOutputCap(body, m.MaxOutputTokens)
+	meta.PredictedInputTokens = meta.OriginalInputTokens + m.AgentOverheadTokens
+	currentModel := model
 	strategy := m.ContextStrategy
 	if strategy == "" {
 		strategy = "adaptive"
 	}
+
+	// A model whose Hermes/tool overhead already consumes its provider ITPM cannot
+	// succeed even with an empty conversation. Route around it before spending a
+	// provider attempt or exposing an SSE stream.
+	if shouldPreflightFallback(m, body) {
+		meta.PreflightFallback = true
+		meta.FallbackFrom = currentModel
+		meta.FallbackTo = m.FallbackModelName
+		currentModel = m.FallbackModelName
+		body = setRequestModel(body, currentModel)
+		m = a.runtimeModel(ctx, currentModel)
+		strategy = m.ContextStrategy
+		if strategy == "" {
+			strategy = "adaptive"
+		}
+	}
+
+	body = applyModelOutputCap(body, m.MaxOutputTokens)
 	if strategy == "adaptive" || strategy == "trim" {
-		if target := runtimeContextTarget(m, 0, 1); target > 0 {
+		if target := runtimeMessageTarget(m, 0, 1); target > 0 {
 			trimmed, orig, final, err := trimChatContext(body, target)
 			if err == nil {
 				body = trimmed
-				meta.OriginalInputTokens = orig
+				if !meta.PreflightFallback {
+					meta.OriginalInputTokens = orig
+				}
 				meta.FinalInputTokens = final
 				meta.ContextTrimmed = final < orig
 			}
@@ -348,7 +512,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 	if meta.FinalInputTokens == 0 {
 		meta.FinalInputTokens = estimateChatInputTokens(body)
 	}
-	currentModel := model
+	meta.FinalModel = currentModel
 	maxRetries := m.MaxRetries
 	if maxRetries < 0 {
 		maxRetries = 0
@@ -356,6 +520,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 	if maxRetries > 4 {
 		maxRetries = 4
 	}
+
 	for attempt := 0; ; attempt++ {
 		meta.Attempts++
 		req, err := makeReq(body)
@@ -366,28 +531,47 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		if err != nil {
 			return resp, body, currentModel, meta, err
 		}
-		if resp.StatusCode != http.StatusTooManyRequests {
+
+		var errBody []byte
+		statusForRecovery := resp.StatusCode
+		if resp.StatusCode == http.StatusOK {
+			softBody, softRateLimit, inspectErr := inspectHermesSoftFailure(resp)
+			if inspectErr != nil {
+				return resp, body, currentModel, meta, inspectErr
+			}
+			if softRateLimit {
+				errBody = softBody
+				statusForRecovery = http.StatusTooManyRequests
+				resp.StatusCode = http.StatusTooManyRequests
+				resp.Status = "429 Too Many Requests"
+			}
+		}
+		if statusForRecovery != http.StatusTooManyRequests {
 			meta.FinalInputTokens = estimateChatInputTokens(body)
 			meta.FinalModel = currentModel
 			return resp, body, currentModel, meta, nil
 		}
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-		_ = resp.Body.Close()
-		obs := parseRateLimitObservation(resp.StatusCode, errBody)
+		if len(errBody) == 0 {
+			errBody, _ = io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+			_ = resp.Body.Close()
+		}
+		obs := parseRateLimitObservation(http.StatusTooManyRequests, errBody)
 		meta.ObservedRateKind, meta.ObservedRateLimit, meta.ObservedRequested = obs.Kind, obs.Limit, obs.Requested
 		if attempt >= maxRetries || strategy == "reject" {
 			resp.Body = io.NopCloser(bytes.NewReader(errBody))
+			resp.Header.Set("content-type", "application/json")
 			return resp, body, currentModel, meta, nil
 		}
 		recovered := false
 		if (strategy == "adaptive" || strategy == "trim") && (obs.Kind == "itpm" || obs.Kind == "tpm" || obs.Requested > obs.Limit && obs.Limit > 0) {
-			target := runtimeContextTarget(m, obs.Limit, 1-float64(attempt)*0.18)
-			if target == 0 && obs.Limit > 0 {
-				target = max(256, int(float64(obs.Limit)*0.72))
+			target := runtimeMessageTarget(m, obs.Limit, 1-float64(attempt)*0.18)
+			if target == 0 && obs.Limit > 0 && m.AgentOverheadTokens < int(float64(obs.Limit)*0.90) {
+				target = max(256, int(float64(obs.Limit)*0.72)-m.AgentOverheadTokens)
 			}
 			if target > 0 {
+				before := estimateChatInputTokens(body)
 				trimmed, orig, final, trimErr := trimChatContext(body, target)
-				if trimErr == nil && final < estimateChatInputTokens(body) {
+				if trimErr == nil && final < before {
 					body = trimmed
 					if meta.OriginalInputTokens == 0 {
 						meta.OriginalInputTokens = orig
@@ -399,19 +583,24 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 			}
 		}
 		if !recovered && (strategy == "adaptive" || strategy == "fallback") && m.FallbackModelName != "" && m.FallbackModelName != currentModel {
-			meta.FallbackFrom = currentModel
+			if meta.FallbackFrom == "" {
+				meta.FallbackFrom = currentModel
+			}
 			meta.FallbackTo = m.FallbackModelName
 			currentModel = m.FallbackModelName
 			body = setRequestModel(body, currentModel)
 			m = a.runtimeModel(ctx, currentModel)
 			body = applyModelOutputCap(body, m.MaxOutputTokens)
 			strategy = m.ContextStrategy
+			if strategy == "" {
+				strategy = "adaptive"
+			}
 			recovered = true
 		}
 		if !recovered {
-			// RPM/opaque rate limits: retry once with bounded backoff; do not sleep on huge provider Retry-After values.
 			if m.RetryBackoffMS <= 0 {
 				resp.Body = io.NopCloser(bytes.NewReader(errBody))
+				resp.Header.Set("content-type", "application/json")
 				return resp, body, currentModel, meta, nil
 			}
 			select {
@@ -433,6 +622,6 @@ func friendlyRateLimitError(body []byte, meta modelRecoveryMeta) []byte {
 	if obs.Kind == "itpm" && obs.Limit > 0 {
 		message = fmt.Sprintf("This model's input limit is %d tokens/minute. Daiki compacted the conversation and retried automatically, but the provider is still rate limited. Your chat is preserved; send the next message normally.", obs.Limit)
 	}
-	out, _ := json.Marshal(map[string]any{"error": "provider_rate_limited", "message": message, "retryable": true, "recovery": meta})
+	out, _ := json.Marshal(map[string]any{"error": map[string]any{"code": "provider_rate_limited", "message": message}, "retryable": true, "recovery": meta})
 	return out
 }

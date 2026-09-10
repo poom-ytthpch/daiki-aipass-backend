@@ -506,6 +506,7 @@ func providerLiteLLMModelInfo(m store.ProviderModel, id string) map[string]any {
 	}
 	info["daiki_context_strategy"] = m.ContextStrategy
 	info["daiki_context_target_tokens"] = m.ContextTargetTokens
+	info["daiki_agent_overhead_tokens"] = m.AgentOverheadTokens
 	info["daiki_fallback_model"] = m.FallbackModelName
 	return info
 }
@@ -530,6 +531,7 @@ func (a *app) adminUpdateProviderModel(w http.ResponseWriter, r *http.Request) {
 		RetryBackoffMS       int    `json:"retryBackoffMs"`
 		ContextStrategy      string `json:"contextStrategy"`
 		ContextTargetTokens  int    `json:"contextTargetTokens"`
+		AgentOverheadTokens  int    `json:"agentOverheadTokens"`
 		FallbackModelName    string `json:"fallbackModelName"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in) != nil {
@@ -549,6 +551,7 @@ func (a *app) adminUpdateProviderModel(w http.ResponseWriter, r *http.Request) {
 	currentModel.RetryBackoffMS = in.RetryBackoffMS
 	currentModel.ContextStrategy = strings.TrimSpace(in.ContextStrategy)
 	currentModel.ContextTargetTokens = in.ContextTargetTokens
+	currentModel.AgentOverheadTokens = in.AgentOverheadTokens
 	currentModel.FallbackModelName = strings.TrimSpace(in.FallbackModelName)
 	if currentModel.TimeoutSeconds == 0 {
 		currentModel.TimeoutSeconds = 300

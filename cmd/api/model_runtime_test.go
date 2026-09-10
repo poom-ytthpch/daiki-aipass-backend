@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
 )
 
 func TestParseRateLimitObservationITPM(t *testing.T) {
@@ -64,5 +66,58 @@ func TestModelRequestRecoversITPMBeforeReturning(t *testing.T) {
 	}
 	if !meta.ContextTrimmed || secondTokens >= 7000 {
 		t.Fatalf("retry did not compact below limit tokens=%d meta=%#v", secondTokens, meta)
+	}
+}
+
+func TestPreflightFallbackIncludesHermesOverhead(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{"model": "groq-qwen-qwen3.8-27b", "messages": []map[string]any{{"role": "user", "content": "hello"}}})
+	m := store.ProviderModel{
+		LiteLLMModelName:    "groq-qwen-qwen3.8-27b",
+		ITPMLimit:           7000,
+		AgentOverheadTokens: 7600,
+		ContextStrategy:     "adaptive",
+		FallbackModelName:   "groq-openai-gpt-oss-20b",
+	}
+	if !shouldPreflightFallback(m, body) {
+		t.Fatalf("expected preflight fallback: estimated=%d overhead=%d budget=%d", estimateChatInputTokens(body), m.AgentOverheadTokens, runtimeSafeITPMBudget(m))
+	}
+}
+
+func TestModelRequestRecoversHermesSSESoft429BeforeVisibleToken(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("content-type", "text/event-stream")
+		if calls == 1 {
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n")
+			_, _ = io.WriteString(w, ": keepalive\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}],\"usage\":{\"total_tokens\":0},\"error\":{\"message\":\"HTTP 429: litellm.RateLimitError input tokens per minute (ITPM): Limit 7000, Requested 10157\",\"type\":\"agent_error\"},\"hermes\":{\"failed\":true}}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"RECOVERED\"},\"finish_reason\":null}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	a := &app{inferenceHTTP: srv.Client()}
+	payload, _ := json.Marshal(map[string]any{"model": "qwen", "messages": []map[string]any{{"role": "user", "content": "search overdrive.qd.je"}}, "stream": true})
+	makeReq := func(body []byte) (*http.Request, error) {
+		return http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader(string(body)))
+	}
+	resp, _, _, meta, err := a.doModelRequestWithRecovery(context.Background(), payload, "qwen", makeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if calls != 2 {
+		t.Fatalf("expected internal recovery before returning stream, calls=%d meta=%#v", calls, meta)
+	}
+	if strings.Contains(string(raw), "10157") || strings.Contains(string(raw), "RateLimitError") {
+		t.Fatalf("failed Hermes attempt leaked to client stream: %s", raw)
+	}
+	if !strings.Contains(string(raw), "RECOVERED") {
+		t.Fatalf("recovered stream missing content: %s", raw)
 	}
 }
