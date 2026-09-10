@@ -37,6 +37,8 @@ type modelRecoveryMeta struct {
 	FinalModel            string `json:"finalModel"`
 	RuntimeProfile        string `json:"runtimeProfile,omitempty"`
 	AppliedOverheadTokens int    `json:"appliedOverheadTokens,omitempty"`
+	AdmissionWaitMS       int64  `json:"admissionWaitMs,omitempty"`
+	AdmissionTokens       int    `json:"admissionTokens,omitempty"`
 }
 
 type rateLimitObservation struct {
@@ -491,6 +493,88 @@ func runtimeAgentOverhead(m store.ProviderModel, profile string) int {
 	}
 	return m.AgentOverheadTokens
 }
+func runtimeTokenLimit(m store.ProviderModel) int {
+	limit := m.TPMLimit
+	if limit <= 0 || (m.ITPMLimit > 0 && m.ITPMLimit < limit) {
+		limit = m.ITPMLimit
+	}
+	return limit
+}
+
+func requestCompletionReserve(body []byte, m store.ProviderModel) int {
+	var payload struct {
+		MaxTokens           int `json:"max_tokens"`
+		MaxCompletionTokens int `json:"max_completion_tokens"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	out := payload.MaxCompletionTokens
+	if out <= 0 {
+		out = payload.MaxTokens
+	}
+	if out <= 0 {
+		out = m.MaxOutputTokens
+	}
+	if out <= 0 {
+		out = 256
+	}
+	// Admission protects throughput, not the user's quota. Reserving a bounded
+	// completion tail tracks provider TPM closely without making a large configured
+	// max_output_tokens stall every short chat turn for a full minute.
+	return min(out, 256)
+}
+
+func modelAdmissionCost(body []byte, m store.ProviderModel, profile string) int {
+	limit := runtimeTokenLimit(m)
+	if limit <= 0 {
+		return 0
+	}
+	cost := estimateChatInputTokens(body) + runtimeAgentOverhead(m, profile) + requestCompletionReserve(body, m)
+	capacity := max(1, int(float64(limit)*0.85))
+	if cost > capacity {
+		cost = capacity
+	}
+	return max(1, cost)
+}
+
+func (a *app) waitForModelAdmission(ctx context.Context, model string, body []byte, m store.ProviderModel, profile string) (time.Duration, int, error) {
+	if a.redis == nil {
+		return 0, 0, nil
+	}
+	limit := runtimeTokenLimit(m)
+	cost := modelAdmissionCost(body, m, profile)
+	if limit <= 0 || cost <= 0 {
+		return 0, 0, nil
+	}
+	// Keep 15% headroom for provider-side token accounting differences, title/
+	// auxiliary calls and traffic that may not pass through this backend process.
+	capacity := max(1, int(float64(limit)*0.85))
+	refillPerMS := float64(limit) / 60000.0
+	if refillPerMS <= 0 {
+		return 0, cost, nil
+	}
+	key := "model:tpm:" + strings.TrimPrefix(modelCircuitKey(model), "model:circuit:")
+	script := `local now=tonumber(ARGV[1]); local capacity=tonumber(ARGV[2]); local refill=tonumber(ARGV[3]); local cost=tonumber(ARGV[4]); local tokens=tonumber(redis.call('HGET',KEYS[1],'tokens')); local last=tonumber(redis.call('HGET',KEYS[1],'last')); if not tokens or not last then tokens=capacity; last=now end; tokens=math.min(capacity,tokens); if now>last then tokens=math.min(capacity,tokens+((now-last)*refill)); last=now end; if tokens>=cost then tokens=tokens-cost; redis.call('HSET',KEYS[1],'tokens',tokens,'last',last); redis.call('PEXPIRE',KEYS[1],120000); return 0 end; local need=cost-tokens; local wait=math.ceil(need/refill); redis.call('HSET',KEYS[1],'tokens',tokens,'last',last); redis.call('PEXPIRE',KEYS[1],120000); return wait`
+	started := time.Now()
+	for {
+		nowMS := time.Now().UnixMilli()
+		waitMS, err := a.redis.Eval(ctx, script, []string{key}, nowMS, capacity, refillPerMS, cost).Int64()
+		if err != nil {
+			// Admission is an availability optimization. Redis queue/quota failures are
+			// handled elsewhere; do not take inference down solely because this optional
+			// pacing layer cannot read its bucket.
+			return time.Since(started), cost, nil
+		}
+		if waitMS <= 0 {
+			return time.Since(started), cost, nil
+		}
+		select {
+		case <-ctx.Done():
+			return time.Since(started), cost, ctx.Err()
+		case <-time.After(time.Duration(min(int(waitMS), 15000)) * time.Millisecond):
+		}
+	}
+}
+
 func runtimeSafeInputBudget(m store.ProviderModel, overhead int) int {
 	limit := m.ITPMLimit
 	if limit <= 0 || (m.TPMLimit > 0 && m.TPMLimit < limit) {
@@ -722,6 +806,12 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 
 	for attempt := 0; ; attempt++ {
 		meta.Attempts++
+		waited, admissionTokens, admissionErr := a.waitForModelAdmission(ctx, currentModel, body, m, profile)
+		meta.AdmissionWaitMS += waited.Milliseconds()
+		meta.AdmissionTokens = admissionTokens
+		if admissionErr != nil {
+			return nil, body, currentModel, meta, admissionErr
+		}
 		req, err := makeReq(body)
 		if err != nil {
 			return nil, body, currentModel, meta, err

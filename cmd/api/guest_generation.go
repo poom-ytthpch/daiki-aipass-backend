@@ -127,9 +127,8 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 		}
 		req.Header.Set("x-daiki-request-id", requestID)
 		req.Header.Set("x-daiki-principal", "guest")
-		req.Header.Set("X-Hermes-Session-Id", newHermesSessionID())
 		baseKey := "daiki-guest:" + strings.TrimPrefix(identity.Subject, "guest:") + ":" + identity.DeviceID + ":" + capability + ":p:" + profile
-		req.Header.Set("X-Hermes-Session-Key", hermesModelScopedSessionKey(baseKey, payload))
+		applyHermesSessionScope(req, baseKey, payload)
 		return req, nil
 	}
 	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(ctx, body, alias.LiteLLMModelName, profile, makeReq)

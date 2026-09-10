@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"strings"
 
 	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/inference"
@@ -24,12 +25,10 @@ func wantsHermesSkillProfile(body []byte, selected []smartSkill) bool {
 	) {
 		return true
 	}
-	for _, skill := range selected {
-		switch skill.ID {
-		case "coding", "data-analysis", "document-qa", "planning":
-			return true
-		}
-	}
+	// Domain classification alone is intentionally NOT enough to load Hermes'
+	// heavy skills catalog. Normal coding/data/document/planning requests stay on
+	// the lean user profile; only explicit skill-learning/use intent opts in.
+	_ = selected
 	return false
 }
 
@@ -38,6 +37,16 @@ func wantsHermesAgentProfile(body []byte) bool {
 		"delegate", "subagent", "sub-agent", "multi-agent", "multiple agents", "parallel agents", "agent team",
 		"หลาย agent", "หลายเอเจนต์", "แบ่งงานให้ agent", "ทำงานขนาน", "parallel task", "orchestrate agents",
 	)
+}
+
+func applyHermesSessionScope(req *http.Request, baseKey string, payload []byte) {
+	// Daiki/PostgreSQL owns transcript history. Supplying X-Hermes-Session-Id
+	// makes Hermes replace the request messages[] history with its own state.db
+	// history for that id, so normal Daiki inference must leave it unset.
+	req.Header.Del("X-Hermes-Session-Id")
+	if key := hermesModelScopedSessionKey(baseKey, payload); key != "" {
+		req.Header.Set("X-Hermes-Session-Key", key)
+	}
 }
 
 func chooseHermesProfile(body []byte, research researchMetadata, route inference.Route, selected []smartSkill) string {

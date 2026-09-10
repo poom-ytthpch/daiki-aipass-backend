@@ -234,3 +234,25 @@ func TestChatPayloadHasImagePreventsSemanticFallback(t *testing.T) {
 		t.Fatal("image payload must be detected")
 	}
 }
+
+func TestModelAdmissionCostUsesProfileOverheadAndBoundedOutput(t *testing.T) {
+	m := store.ProviderModel{TPMLimit: 8000, AgentOverheadTokens: 1200, ResearchOverheadTokens: 300, MaxOutputTokens: 4096}
+	body := []byte(`{"messages":[{"role":"user","content":"hello"}],"max_completion_tokens":4096}`)
+	user := modelAdmissionCost(body, m, "user")
+	research := modelAdmissionCost(body, m, "research")
+	if user <= research {
+		t.Fatalf("user cost %d must include higher agent overhead than research %d", user, research)
+	}
+	if user > int(float64(m.TPMLimit)*0.85) {
+		t.Fatalf("admission cost must be capped to bucket capacity: %d", user)
+	}
+}
+
+func TestRuntimeTokenLimitUsesTighterInputOrTotalLimit(t *testing.T) {
+	if got := runtimeTokenLimit(store.ProviderModel{TPMLimit: 8000, ITPMLimit: 7000}); got != 7000 {
+		t.Fatalf("got %d", got)
+	}
+	if got := runtimeTokenLimit(store.ProviderModel{TPMLimit: 8000}); got != 8000 {
+		t.Fatalf("got %d", got)
+	}
+}

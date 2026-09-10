@@ -687,14 +687,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		req.Header.Set("x-daiki-request-id", requestID)
 		req.Header.Set("x-daiki-principal", currentPrincipal(r).AuthKind)
 		if upstreamName == "hermes" {
-			req.Header.Set("X-Hermes-Session-Id", newHermesSessionID())
 			baseKey := hermesSessionKey(r)
 			if baseKey != "" {
 				baseKey += ":p:" + hermesProfile
 			}
-			if key := hermesModelScopedSessionKey(baseKey, payload); key != "" {
-				req.Header.Set("X-Hermes-Session-Key", key)
-			}
+			applyHermesSessionScope(req, baseKey, payload)
 		}
 		return req, nil
 	}
@@ -706,6 +703,8 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	}
 	w.Header().Set("x-daiki-model-physical", route.PhysicalModel)
 	w.Header().Set("x-daiki-retry-attempts", strconv.Itoa(max(0, recovery.Attempts-1)))
+	w.Header().Set("x-daiki-admission-wait-ms", strconv.FormatInt(recovery.AdmissionWaitMS, 10))
+	w.Header().Set("x-daiki-admission-tokens", strconv.Itoa(recovery.AdmissionTokens))
 	if recovery.ContextTrimmed {
 		w.Header().Set("x-daiki-context-trimmed", "true")
 	}
