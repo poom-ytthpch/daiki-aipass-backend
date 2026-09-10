@@ -116,29 +116,43 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 		_ = a.store.FinishUsage(ctx, requestID, "failed", store.Usage{})
 		return nil, upstreamName, errors.New("Hermes unavailable")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, strings.NewReader(string(body)))
-	if err != nil {
-		a.releaseReservation(ctx, requestID, decision, reserved)
-		_ = a.store.FinishUsage(ctx, requestID, "failed", store.Usage{})
-		return nil, upstreamName, err
+	makeReq := func(payload []byte) (*http.Request, error) {
+		req, buildErr := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, strings.NewReader(string(payload)))
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		req.Header.Set("content-type", "application/json")
+		if a.cfg.HermesKey != "" {
+			req.Header.Set("authorization", "Bearer "+a.cfg.HermesKey)
+		}
+		req.Header.Set("x-daiki-request-id", requestID)
+		req.Header.Set("x-daiki-principal", "guest")
+		req.Header.Set("X-Hermes-Session-Id", newHermesSessionID())
+		baseKey := "daiki-guest:" + strings.TrimPrefix(identity.Subject, "guest:") + ":" + identity.DeviceID + ":" + capability + ":p:" + profile
+		req.Header.Set("X-Hermes-Session-Key", hermesModelScopedSessionKey(baseKey, payload))
+		return req, nil
 	}
-	req.Header.Set("content-type", "application/json")
-	if a.cfg.HermesKey != "" {
-		req.Header.Set("authorization", "Bearer "+a.cfg.HermesKey)
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(ctx, body, alias.LiteLLMModelName, profile, makeReq)
+	_ = recoveredBody
+	if recoveredModel != "" {
+		_ = a.store.MergeUsageMetadata(ctx, requestID, map[string]any{"physicalModel": recoveredModel})
 	}
-	req.Header.Set("X-Hermes-Session-Id", requestID)
-	req.Header.Set("X-Hermes-Session-Key", "daiki-guest:"+strings.TrimPrefix(identity.Subject, "guest:")+":"+identity.DeviceID+":"+capability)
-	resp, err := a.inferenceHTTP.Do(req)
+	_ = a.store.MergeUsageMetadata(ctx, requestID, recoveryMetadata(recovery))
 	if err != nil {
 		a.releaseReservation(ctx, requestID, decision, reserved)
 		_ = a.store.FinishUsage(context.Background(), requestID, "failed", store.Usage{})
 		return nil, upstreamName, err
 	}
+	if resp == nil || resp.Body == nil {
+		a.releaseReservation(ctx, requestID, decision, reserved)
+		_ = a.store.FinishUsage(context.Background(), requestID, "failed", store.Usage{})
+		return nil, upstreamName, errors.New("Hermes returned no response")
+	}
 	defer resp.Body.Close()
 	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 12<<20))
 	usage := parseUsagePayload(responseBody)
 	status := "completed"
-	if readErr != nil || resp.StatusCode >= 400 {
+	if readErr != nil || resp.StatusCode >= 400 || providerFailureStatus(responseBody) != 0 {
 		status = "failed"
 		if resp.StatusCode >= 400 {
 			usage = store.Usage{}
@@ -155,9 +169,11 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 	if resp.StatusCode >= 400 {
 		return responseBody, upstreamName, fmt.Errorf("Hermes returned status %d", resp.StatusCode)
 	}
+	if providerFailureStatus(responseBody) != 0 {
+		return responseBody, upstreamName, errors.New("Hermes generation provider failed")
+	}
 	return responseBody, upstreamName, nil
 }
-
 func generatedName(name, fallback string) string {
 	name = filepath.Base(strings.TrimSpace(name))
 	if name == "" || name == "." {

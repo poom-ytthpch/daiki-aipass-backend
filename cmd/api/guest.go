@@ -124,6 +124,8 @@ func (a *app) recordGuestIdentity(ctx context.Context, id guestIdentity) {
 	}
 }
 
+const guestContinuitySystemPrompt = `You are Daiki in Guest mode. Use the conversation messages supplied in this request as authoritative context. Resolve short follow-ups, pronouns, and references from the immediately preceding user/assistant turns instead of asking what topic the user means when the topic is already present. Do not claim memory beyond the supplied messages. Guest mode has no general tools or skills; answer only from supplied text and attachments.`
+
 func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -133,7 +135,11 @@ func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 	if !ok || len(rawMessages) == 0 {
 		return nil, fmt.Errorf("guest chat requires messages")
 	}
-	messages := make([]any, 0, len(rawMessages))
+	messages := make([]any, 0, len(rawMessages)+1)
+	// User-provided system/developer roles remain forbidden. This bounded Daiki-owned
+	// instruction exists only to make frontend-supplied conversation history reliably
+	// resolve short follow-ups without enabling any Guest tools or persistence.
+	messages = append(messages, map[string]any{"role": "system", "content": guestContinuitySystemPrompt})
 	for _, raw := range rawMessages {
 		message, ok := raw.(map[string]any)
 		if !ok {

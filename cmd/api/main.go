@@ -513,10 +513,15 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		return
 	}
 	skills := selectSmartSkills(body)
-	body, err = applySmartSkills(body, skills)
-	if err != nil {
-		writeJSON(w, 400, map[string]string{"error": "unable to prepare smart skills"})
-		return
+	// Hermes owns agent skills/tooling. Keep the legacy small-model instruction only
+	// for direct-LiteLLM compatibility mode; injecting it into Hermes both wastes
+	// tokens and incorrectly tells 20B/27B models that they are a 4B model.
+	if !a.cfg.HermesEnabled {
+		body, err = applySmartSkills(body, skills)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "unable to prepare smart skills"})
+			return
+		}
 	}
 	tokenEstimate := estimateTokens(body, thinkingProfile)
 	route, upstreamBody, err := a.router.RouteChat(body)
@@ -667,10 +672,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	w.Header().Set("x-daiki-token-estimate-output", fmt.Sprint(tokenEstimate.VisibleBudget))
 	w.Header().Set("x-daiki-token-estimate-total", fmt.Sprint(tokenEstimate.TotalBudget))
 	w.Header().Set("x-daiki-queue-wait-ms", fmt.Sprint(ticket.AcquiredAt.Sub(ticket.EnqueuedAt).Milliseconds()))
-	hermesProfile := "user"
-	if researchUsesHermesProfile(researchMeta) {
-		hermesProfile = "research"
-	}
+	hermesProfile := chooseHermesProfile(upstreamBody, researchMeta, route, skills)
 	upstreamURL, upstreamKey, upstreamName := a.authenticatedHermesUpstream(path, hermesProfile)
 	w.Header().Set("x-daiki-hermes-profile", hermesProfile)
 	makeUpstreamRequest := func(payload []byte) (*http.Request, error) {

@@ -39,6 +39,30 @@ func TestRestrictGuestChatForcesFastAndStripsCapabilities(t *testing.T) {
 	}
 }
 
+func TestRestrictGuestChatAddsBoundedContinuityInstruction(t *testing.T) {
+	p := store.DefaultGuestAccessPolicy()
+	body, err := restrictGuestChat([]byte(`{"messages":[{"role":"user","content":"The codename is ORCHID-731"},{"role":"assistant","content":"Understood"},{"role":"user","content":"What was it?"}]}`), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	messages, _ := payload["messages"].([]any)
+	if len(messages) != 4 {
+		t.Fatalf("expected internal system + 3 conversation messages, got %d", len(messages))
+	}
+	first, _ := messages[0].(map[string]any)
+	if first["role"] != "system" || !strings.Contains(first["content"].(string), "authoritative context") {
+		t.Fatalf("missing continuity system instruction: %#v", first)
+	}
+	last, _ := messages[len(messages)-1].(map[string]any)
+	if last["content"] != "What was it?" {
+		t.Fatalf("latest follow-up changed: %#v", last)
+	}
+}
+
 func TestRestrictGuestChatRejectsImages(t *testing.T) {
 	p := store.DefaultGuestAccessPolicy()
 	_, err := restrictGuestChat([]byte(`{"model":"fast","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,x"}}]}]}`), p)
