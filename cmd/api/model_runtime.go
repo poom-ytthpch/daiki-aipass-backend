@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +28,8 @@ type modelRecoveryMeta struct {
 	ObservedRateKind      string `json:"observedRateKind,omitempty"`
 	ObservedHTTPStatus    int    `json:"observedHttpStatus,omitempty"`
 	FailureKind           string `json:"failureKind,omitempty"`
+	CircuitBypass         bool   `json:"circuitBypass,omitempty"`
+	CircuitModel          string `json:"circuitModel,omitempty"`
 	FallbackFrom          string `json:"fallbackFrom,omitempty"`
 	PreflightFallback     bool   `json:"preflightFallback,omitempty"`
 	PredictedInputTokens  int    `json:"predictedInputTokens,omitempty"`
@@ -549,6 +553,49 @@ func shouldPreflightFallback(m store.ProviderModel, body []byte, overhead int) b
 
 type inferenceRequestFactory func(body []byte) (*http.Request, error)
 
+func modelCircuitKey(model string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(model)))
+	return "model:circuit:" + hex.EncodeToString(sum[:12])
+}
+
+func modelCircuitTTL(status int, kind string) time.Duration {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return 10 * time.Minute
+	case http.StatusRequestTimeout:
+		return 45 * time.Second
+	}
+	if status >= 500 {
+		return 45 * time.Second
+	}
+	if kind == "hermes_transport" {
+		return 45 * time.Second
+	}
+	return 30 * time.Second
+}
+
+func (a *app) modelCircuitOpen(ctx context.Context, model string) bool {
+	if a == nil || a.redis == nil || strings.TrimSpace(model) == "" {
+		return false
+	}
+	n, err := a.redis.Exists(ctx, modelCircuitKey(model)).Result()
+	return err == nil && n > 0
+}
+
+func (a *app) openModelCircuit(ctx context.Context, model string, status int, kind string) {
+	if a == nil || a.redis == nil || strings.TrimSpace(model) == "" || status == http.StatusTooManyRequests {
+		return
+	}
+	_ = a.redis.Set(ctx, modelCircuitKey(model), first(kind, failureKindForStatus(status)), modelCircuitTTL(status, kind)).Err()
+}
+
+func (a *app) clearModelCircuit(ctx context.Context, model string) {
+	if a == nil || a.redis == nil || strings.TrimSpace(model) == "" {
+		return
+	}
+	_ = a.redis.Del(ctx, modelCircuitKey(model)).Err()
+}
+
 func modelCanFallback(m store.ProviderModel, currentModel, strategy string) bool {
 	return (strategy == "adaptive" || strategy == "fallback") && strings.TrimSpace(m.FallbackModelName) != "" && m.FallbackModelName != currentModel
 }
@@ -583,10 +630,20 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		strategy = "adaptive"
 	}
 
-	// A model whose Hermes/tool overhead already consumes its provider ITPM cannot
+	// A recent deterministic provider failure opens a short shared circuit. Keep
+	// the configured alias intact, but route new requests straight to its model-level
+	// fallback until the circuit expires or an admin save/sync clears it.
+	if a.modelCircuitOpen(ctx, currentModel) && modelCanFallback(m, currentModel, strategy) {
+		meta.PreflightFallback = true
+		meta.CircuitBypass = true
+		meta.CircuitModel = currentModel
+		body, currentModel, m, overhead, strategy = applyFallbackModel(ctx, a, body, currentModel, profile, m, &meta)
+	}
+
+	// A model whose Hermes/tool overhead already consumes its provider token budget cannot
 	// succeed even with an empty conversation. Route around it before spending a
 	// provider attempt or exposing an SSE stream.
-	if shouldPreflightFallback(m, body, overhead) {
+	if !meta.PreflightFallback && shouldPreflightFallback(m, body, overhead) {
 		meta.PreflightFallback = true
 		meta.FallbackFrom = currentModel
 		meta.FallbackTo = m.FallbackModelName
@@ -636,6 +693,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		resp, err := a.inferenceHTTP.Do(req)
 		if err != nil {
 			meta.FailureKind = "hermes_transport"
+			a.openModelCircuit(ctx, currentModel, 0, meta.FailureKind)
 			if attempt < maxRetries && strategy != "reject" && modelCanFallback(m, currentModel, strategy) {
 				body, currentModel, m, overhead, strategy = applyFallbackModel(ctx, a, body, currentModel, profile, m, &meta)
 				continue
@@ -658,6 +716,9 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 			}
 		}
 		if !recoverableProviderStatus(statusForRecovery) {
+			if statusForRecovery < 400 {
+				a.clearModelCircuit(ctx, currentModel)
+			}
 			meta.FinalInputTokens = estimateChatInputTokens(body)
 			meta.FinalModel = currentModel
 			return resp, body, currentModel, meta, nil
@@ -668,6 +729,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		}
 		meta.ObservedHTTPStatus = statusForRecovery
 		meta.FailureKind = failureKindForStatus(statusForRecovery)
+		a.openModelCircuit(ctx, currentModel, statusForRecovery, meta.FailureKind)
 		obs := parseRateLimitObservation(statusForRecovery, errBody)
 		if statusForRecovery == http.StatusTooManyRequests {
 			meta.ObservedRateKind, meta.ObservedRateLimit, meta.ObservedRequested = obs.Kind, obs.Limit, obs.Requested

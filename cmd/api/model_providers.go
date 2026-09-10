@@ -489,6 +489,7 @@ func (a *app) syncProviderModels(ctx context.Context, p store.ModelProvider) err
 			return fmt.Errorf("update %s: %w", m.LiteLLMModelName, err)
 		}
 		_ = a.store.SetProviderModelState(ctx, m.ID, "active", "", "")
+		a.clearModelCircuit(ctx, m.LiteLLMModelName)
 	}
 	return nil
 }
@@ -601,6 +602,7 @@ func (a *app) adminUpdateProviderModel(w http.ResponseWriter, r *http.Request) {
 	_ = a.store.SetProviderModelState(r.Context(), updated.ID, "active", "", "")
 	updated.Status = "active"
 	updated.LastError = ""
+	a.clearModelCircuit(r.Context(), updated.LiteLLMModelName)
 	writeJSON(w, 200, map[string]any{"model": updated})
 }
 

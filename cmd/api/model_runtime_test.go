@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
 )
@@ -196,5 +197,29 @@ func TestModelCanFallbackOnAdaptiveProviderFailure(t *testing.T) {
 	}
 	if modelCanFallback(m, "groq-openai-gpt-oss-20b", "adaptive") {
 		t.Fatal("fallback loop must be rejected")
+	}
+}
+
+func TestModelCircuitKeyIsStableAndOpaque(t *testing.T) {
+	model := "daiki-aipass-openrouter-google-gemma-4-26b-a4b-it-free"
+	a := modelCircuitKey(model)
+	b := modelCircuitKey(model)
+	if a != b || !strings.HasPrefix(a, "model:circuit:") {
+		t.Fatalf("unexpected circuit key: %q %q", a, b)
+	}
+	if strings.Contains(a, "gemma") || strings.Contains(a, "openrouter") {
+		t.Fatalf("circuit key leaks model identity: %q", a)
+	}
+}
+
+func TestModelCircuitTTLByFailureClass(t *testing.T) {
+	if got := modelCircuitTTL(http.StatusUnauthorized, "provider_auth"); got != 10*time.Minute {
+		t.Fatalf("auth circuit ttl=%s", got)
+	}
+	if got := modelCircuitTTL(http.StatusBadGateway, "provider_upstream"); got != 45*time.Second {
+		t.Fatalf("upstream circuit ttl=%s", got)
+	}
+	if got := modelCircuitTTL(0, "hermes_transport"); got != 45*time.Second {
+		t.Fatalf("transport circuit ttl=%s", got)
 	}
 }
