@@ -271,7 +271,12 @@ func hermesSessionKey(r *http.Request) string {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(raw))
-	return "daiki:" + hex.EncodeToString(sum[:16])
+	key := "daiki:" + hex.EncodeToString(sum[:16])
+	if chatSession := strings.TrimSpace(r.Header.Get("x-daiki-chat-session-id")); chatSession != "" {
+		conversationSum := sha256.Sum256([]byte(chatSession))
+		key += ":c:" + hex.EncodeToString(conversationSum[:12])
+	}
+	return key
 }
 
 func (a *app) guestChat(w http.ResponseWriter, r *http.Request) { a.proxyGuestInference(w, r, false) }

@@ -191,6 +191,7 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 	invoke := func(body []byte) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat", bytes.NewReader(body)).WithContext(ctx)
 		req.Header.Set("x-daiki-chat-run-id", run.ID)
+		req.Header.Set("x-daiki-chat-session-id", run.SessionID)
 		req = req.WithContext(context.WithValue(req.Context(), claimsKey, identity.Claims))
 		req = req.WithContext(context.WithValue(req.Context(), appUserKey, identity.User))
 		req = req.WithContext(context.WithValue(req.Context(), principalKey, identity.Principal))
@@ -303,7 +304,10 @@ func (a *app) failBackgroundRun(run store.ChatRun, started time.Time, message, r
 }
 
 func safeRunResearchActivity(meta researchMetadata) map[string]any {
-	out := map[string]any{"mode": meta.Mode, "query": meta.Query, "used": meta.Used, "error": meta.Error}
+	out := map[string]any{"mode": meta.Mode, "query": meta.Query, "used": meta.Used, "error": meta.Error, "contextInherited": meta.ContextInherited}
+	if meta.ResolvedQuery != "" && meta.ResolvedQuery != meta.Query {
+		out["resolvedQuery"] = clipText(meta.ResolvedQuery, 900)
+	}
 	if len(meta.Sources) > 0 {
 		sources := make([]map[string]any, 0, min(len(meta.Sources), 8))
 		for _, source := range meta.Sources {

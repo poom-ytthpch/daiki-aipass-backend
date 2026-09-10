@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
 )
 
 func TestNormalizeResearchMode(t *testing.T) {
@@ -263,5 +265,79 @@ func TestResearchUsesHermesProfile(t *testing.T) {
 		if got := researchUsesHermesProfile(tc.meta); got != tc.want {
 			t.Fatalf("meta=%+v got=%v want=%v", tc.meta, got, tc.want)
 		}
+	}
+}
+
+func TestContextualFollowUpInheritsPreviousResearch(t *testing.T) {
+	payload := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "ค้นหาข้อมูล https://www.overdrive.qd.je/ แล้วสรุปมาเป็นภาษาไทย"},
+		map[string]any{"role": "assistant", "content": "OverDrive เป็นแอป dash-cam สำหรับรถ BYD และต้องติดตั้งผ่าน ADB"},
+		map[string]any{"role": "user", "content": "อันตรายต่อการใช้งานไหม"},
+	}}
+	query, resolved, useWeb, inherited, ctx := contextualResearchPlan(payload, "auto")
+	if query != "อันตรายต่อการใช้งานไหม" {
+		t.Fatalf("query=%q", query)
+	}
+	if !useWeb || !inherited || !ctx.IsFollowUp {
+		t.Fatalf("expected inherited web follow-up, useWeb=%v inherited=%v ctx=%#v", useWeb, inherited, ctx)
+	}
+	if !strings.Contains(resolved, "https://www.overdrive.qd.je/") || !strings.Contains(resolved, "อันตรายต่อการใช้งานไหม") {
+		t.Fatalf("resolved query lost topic: %q", resolved)
+	}
+	instruction := continuityInstruction(ctx)
+	if !strings.Contains(instruction, "OverDrive") || !strings.Contains(instruction, "อันตรายต่อการใช้งานไหม") {
+		t.Fatalf("continuity instruction missing context: %q", instruction)
+	}
+}
+
+func TestContextualFollowUpDoesNotOverrideResearchOff(t *testing.T) {
+	payload := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "ค้นหาข้อมูล https://www.overdrive.qd.je/"},
+		map[string]any{"role": "assistant", "content": "OverDrive information"},
+		map[string]any{"role": "user", "content": "อันตรายไหม"},
+	}}
+	_, _, useWeb, inherited, _ := contextualResearchPlan(payload, "off")
+	if useWeb || inherited {
+		t.Fatalf("research off must stay off, useWeb=%v inherited=%v", useWeb, inherited)
+	}
+}
+
+func TestNewTopicDoesNotInheritPreviousResearch(t *testing.T) {
+	payload := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "ค้นหาข้อมูล https://www.overdrive.qd.je/"},
+		map[string]any{"role": "assistant", "content": "OverDrive information"},
+		map[string]any{"role": "user", "content": "เขียน SQL join ตารางสินค้าให้หน่อย"},
+	}}
+	_, _, useWeb, inherited, ctx := contextualResearchPlan(payload, "auto")
+	if useWeb || inherited || ctx.IsFollowUp {
+		t.Fatalf("new topic must not inherit previous research: useWeb=%v inherited=%v ctx=%#v", useWeb, inherited, ctx)
+	}
+}
+
+func TestHermesSessionKeyIsScopedByChatSession(t *testing.T) {
+	a := httptest.NewRequest(http.MethodPost, "/v1/chat", nil)
+	b := httptest.NewRequest(http.MethodPost, "/v1/chat", nil)
+	user := store.User{Subject: "same-user"}
+	principal := principal{AuthKind: "oidc"}
+	for _, tc := range []struct {
+		r       *http.Request
+		session string
+	}{{a, "chat-a"}, {b, "chat-b"}} {
+		ctx := context.WithValue(tc.r.Context(), appUserKey, user)
+		ctx = context.WithValue(ctx, principalKey, principal)
+		tc.r = tc.r.WithContext(ctx)
+		tc.r.Header.Set("x-daiki-chat-session-id", tc.session)
+		if tc.session == "chat-a" {
+			a = tc.r
+		} else {
+			b = tc.r
+		}
+	}
+	ka, kb := hermesSessionKey(a), hermesSessionKey(b)
+	if ka == "" || kb == "" || ka == kb {
+		t.Fatalf("chat sessions must have distinct Hermes keys: %q %q", ka, kb)
+	}
+	if strings.Contains(ka, "chat-a") || strings.Contains(kb, "chat-b") {
+		t.Fatalf("raw session ids must not appear in Hermes keys")
 	}
 }
