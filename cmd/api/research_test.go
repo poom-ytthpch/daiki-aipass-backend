@@ -248,3 +248,20 @@ func TestApplySmartSkillsMergesExistingResearchSystemMessage(t *testing.T) {
 		t.Fatalf("merged system context missing research or smart prompt: %q", content)
 	}
 }
+
+func TestResearchUsesHermesProfile(t *testing.T) {
+	cases := []struct {
+		meta researchMetadata
+		want bool
+	}{
+		{researchMetadata{Mode: "web", Query: "anything"}, true},
+		{researchMetadata{Mode: "auto", Query: "ค้นหาข้อมูล https://www.overdrive.qd.je/"}, true},
+		{researchMetadata{Mode: "auto", Query: "hello"}, false},
+		{researchMetadata{Mode: "off", Query: "https://www.overdrive.qd.je/"}, false},
+	}
+	for _, tc := range cases {
+		if got := researchUsesHermesProfile(tc.meta); got != tc.want {
+			t.Fatalf("meta=%+v got=%v want=%v", tc.meta, got, tc.want)
+		}
+	}
+}

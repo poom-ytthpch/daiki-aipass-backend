@@ -56,7 +56,7 @@ func TestModelRequestRecoversITPMBeforeReturning(t *testing.T) {
 	makeReq := func(body []byte) (*http.Request, error) {
 		return http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader(string(body)))
 	}
-	resp, _, _, meta, err := a.doModelRequestWithRecovery(context.Background(), payload, "qwen", makeReq)
+	resp, _, _, meta, err := a.doModelRequestWithRecovery(context.Background(), payload, "qwen", "user", makeReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,8 +78,25 @@ func TestPreflightFallbackIncludesHermesOverhead(t *testing.T) {
 		ContextStrategy:     "adaptive",
 		FallbackModelName:   "groq-openai-gpt-oss-20b",
 	}
-	if !shouldPreflightFallback(m, body) {
-		t.Fatalf("expected preflight fallback: estimated=%d overhead=%d budget=%d", estimateChatInputTokens(body), m.AgentOverheadTokens, runtimeSafeITPMBudget(m))
+	overhead := runtimeAgentOverhead(m, "user")
+	if !shouldPreflightFallback(m, body, overhead) {
+		t.Fatalf("expected preflight fallback: estimated=%d overhead=%d budget=%d", estimateChatInputTokens(body), overhead, runtimeSafeInputBudget(m, overhead))
+	}
+}
+
+func TestResearchProfileUsesResearchOverhead(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{"model": "qwen", "messages": []map[string]any{{"role": "user", "content": strings.Repeat("research ", 700)}}})
+	m := store.ProviderModel{ITPMLimit: 7000, AgentOverheadTokens: 5300, ResearchOverheadTokens: 800, ContextStrategy: "adaptive", FallbackModelName: "fallback"}
+	userOverhead := runtimeAgentOverhead(m, "user")
+	researchOverhead := runtimeAgentOverhead(m, "research")
+	if userOverhead != 5300 || researchOverhead != 800 {
+		t.Fatalf("unexpected overheads user=%d research=%d", userOverhead, researchOverhead)
+	}
+	if !shouldPreflightFallback(m, body, userOverhead) {
+		t.Fatal("user profile should fallback with the larger agent overhead")
+	}
+	if shouldPreflightFallback(m, body, researchOverhead) {
+		t.Fatal("research profile should retain headroom for the same payload")
 	}
 }
 
@@ -105,7 +122,7 @@ func TestModelRequestRecoversHermesSSESoft429BeforeVisibleToken(t *testing.T) {
 	makeReq := func(body []byte) (*http.Request, error) {
 		return http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader(string(body)))
 	}
-	resp, _, _, meta, err := a.doModelRequestWithRecovery(context.Background(), payload, "qwen", makeReq)
+	resp, _, _, meta, err := a.doModelRequestWithRecovery(context.Background(), payload, "qwen", "user", makeReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,5 +136,17 @@ func TestModelRequestRecoversHermesSSESoft429BeforeVisibleToken(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "RECOVERED") {
 		t.Fatalf("recovered stream missing content: %s", raw)
+	}
+}
+
+func TestHermesModelScopedSessionKeyChangesWithFallbackModel(t *testing.T) {
+	base := "daiki:user"
+	a := hermesModelScopedSessionKey(base, []byte(`{"model":"groq-qwen-qwen3.8-27b"}`))
+	b := hermesModelScopedSessionKey(base, []byte(`{"model":"groq-openai-gpt-oss-20b"}`))
+	if a == b || a == base || b == base {
+		t.Fatalf("expected model-scoped keys, got %q %q", a, b)
+	}
+	if a != hermesModelScopedSessionKey(base, []byte(`{"model":"groq-qwen-qwen3.8-27b"}`)) {
+		t.Fatal("same model must produce stable session key")
 	}
 }

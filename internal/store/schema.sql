@@ -282,6 +282,7 @@ CREATE TABLE IF NOT EXISTS provider_models (
     context_strategy TEXT NOT NULL DEFAULT 'adaptive' CHECK (context_strategy IN ('adaptive','trim','fallback','reject')),
     context_target_tokens INTEGER NOT NULL DEFAULT 0 CHECK (context_target_tokens >= 0),
     agent_overhead_tokens INTEGER NOT NULL DEFAULT 0 CHECK (agent_overhead_tokens >= 0),
+    research_overhead_tokens INTEGER NOT NULL DEFAULT 0 CHECK (research_overhead_tokens >= 0),
     fallback_model_name TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -301,6 +302,7 @@ ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS retry_backoff_ms INTEGER NO
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS context_strategy TEXT NOT NULL DEFAULT 'adaptive';
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS context_target_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS agent_overhead_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS research_overhead_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS fallback_model_name TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS model_aliases (

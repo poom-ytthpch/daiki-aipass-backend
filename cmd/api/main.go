@@ -667,7 +667,12 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	w.Header().Set("x-daiki-token-estimate-output", fmt.Sprint(tokenEstimate.VisibleBudget))
 	w.Header().Set("x-daiki-token-estimate-total", fmt.Sprint(tokenEstimate.TotalBudget))
 	w.Header().Set("x-daiki-queue-wait-ms", fmt.Sprint(ticket.AcquiredAt.Sub(ticket.EnqueuedAt).Milliseconds()))
-	upstreamURL, upstreamKey, upstreamName := a.inferenceUpstreamForRequest(r, path)
+	hermesProfile := "user"
+	if researchUsesHermesProfile(researchMeta) {
+		hermesProfile = "research"
+	}
+	upstreamURL, upstreamKey, upstreamName := a.authenticatedHermesUpstream(path, hermesProfile)
+	w.Header().Set("x-daiki-hermes-profile", hermesProfile)
 	makeUpstreamRequest := func(payload []byte) (*http.Request, error) {
 		req, buildErr := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, strings.NewReader(string(payload)))
 		if buildErr != nil {
@@ -681,14 +686,18 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		req.Header.Set("x-daiki-principal", currentPrincipal(r).AuthKind)
 		if upstreamName == "hermes" {
 			req.Header.Set("X-Hermes-Session-Id", requestID)
-			if key := hermesSessionKey(r); key != "" {
+			baseKey := hermesSessionKey(r)
+			if baseKey != "" {
+				baseKey += ":p:" + hermesProfile
+			}
+			if key := hermesModelScopedSessionKey(baseKey, payload); key != "" {
 				req.Header.Set("X-Hermes-Session-Key", key)
 			}
 		}
 		return req, nil
 	}
 	w.Header().Set("x-daiki-inference-upstream", upstreamName)
-	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, makeUpstreamRequest)
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, hermesProfile, makeUpstreamRequest)
 	upstreamBody = recoveredBody
 	if recoveredModel != "" {
 		route.PhysicalModel = recoveredModel

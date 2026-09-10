@@ -108,7 +108,7 @@ func TestAllAuthenticatedInferenceUsesHermes(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/v1/chat", nil)
 		r = r.WithContext(context.WithValue(r.Context(), appUserKey, store.User{Subject: status + "-user", Status: status}))
 		url, key, name := a.inferenceUpstreamForRequest(r, "/v1/chat/completions")
-		if url != "http://hermes:8642/v1/chat/completions" || key != "hermes" || name != "hermes" {
+		if url != "http://hermes:8642/p/user/v1/chat/completions" || key != "hermes" || name != "hermes" {
 			t.Fatalf("%s user must use Hermes: %q %q %q", status, url, key, name)
 		}
 	}

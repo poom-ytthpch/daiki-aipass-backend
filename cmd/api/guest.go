@@ -217,16 +217,45 @@ func shouldFallbackFromHermes(upstreamName string, enabled bool, statusCode int,
 	return strings.HasPrefix(upstreamName, "hermes") && enabled && (err != nil || statusCode >= 500)
 }
 
+func (a *app) authenticatedHermesUpstream(path, profile string) (string, string, string) {
+	if a.cfg.HermesEnabled && a.cfg.HermesBase != "" {
+		profile = strings.Trim(strings.TrimSpace(profile), "/")
+		if profile == "" {
+			profile = "user"
+		}
+		return strings.TrimRight(a.cfg.HermesBase, "/") + "/p/" + profile + path, a.cfg.HermesKey, "hermes"
+	}
+	return a.liteLLMUpstream(path)
+}
 func (a *app) inferenceUpstreamForRequest(r *http.Request, path string) (string, string, string) {
-	// Every authenticated inference request enters Hermes. Daiki still owns auth,
-	// quota and model policy; Hermes owns the agent/tool/skill loop.
-	return a.inferenceUpstream(path)
+	// Compatibility helper: authenticated chat defaults to the slim user profile.
+	return a.authenticatedHermesUpstream(path, "user")
 }
 func (a *app) guestHermesUpstream(path string) (string, string, string) {
 	if a.cfg.HermesEnabled && a.cfg.HermesBase != "" {
 		return strings.TrimRight(a.cfg.HermesBase, "/") + "/p/guest" + path, a.cfg.HermesKey, "hermes-guest"
 	}
 	return a.liteLLMUpstream(path)
+}
+
+func hermesRequestModel(payload []byte) string {
+	var body map[string]any
+	if json.Unmarshal(payload, &body) != nil {
+		return ""
+	}
+	model, _ := body["model"].(string)
+	return strings.TrimSpace(model)
+}
+func hermesModelScopedSessionKey(base string, payload []byte) string {
+	if base == "" {
+		return ""
+	}
+	model := hermesRequestModel(payload)
+	if model == "" {
+		return base
+	}
+	sum := sha256.Sum256([]byte(model))
+	return base + ":m:" + hex.EncodeToString(sum[:8])
 }
 
 func hermesSessionKey(r *http.Request) string {
@@ -362,11 +391,12 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		req.Header.Set("x-daiki-principal", "guest")
 		if strings.HasPrefix(upstreamName, "hermes") {
 			req.Header.Set("X-Hermes-Session-Id", requestID)
-			req.Header.Set("X-Hermes-Session-Key", "daiki-guest:"+strings.TrimPrefix(identity.Subject, "guest:")+":"+identity.DeviceID)
+			baseKey := "daiki-guest:" + strings.TrimPrefix(identity.Subject, "guest:") + ":" + identity.DeviceID
+			req.Header.Set("X-Hermes-Session-Key", hermesModelScopedSessionKey(baseKey, payload))
 		}
 		return req, nil
 	}
-	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, makeGuestRequest)
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, "guest", makeGuestRequest)
 	upstreamBody = recoveredBody
 	if recoveredModel != "" {
 		route.PhysicalModel = recoveredModel

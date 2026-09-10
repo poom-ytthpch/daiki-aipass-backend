@@ -17,18 +17,20 @@ import (
 )
 
 type modelRecoveryMeta struct {
-	Attempts             int    `json:"attempts"`
-	ContextTrimmed       bool   `json:"contextTrimmed"`
-	OriginalInputTokens  int    `json:"originalInputTokens"`
-	FinalInputTokens     int    `json:"finalInputTokens"`
-	ObservedRateLimit    int    `json:"observedRateLimit,omitempty"`
-	ObservedRequested    int    `json:"observedRequested,omitempty"`
-	ObservedRateKind     string `json:"observedRateKind,omitempty"`
-	FallbackFrom         string `json:"fallbackFrom,omitempty"`
-	PreflightFallback    bool   `json:"preflightFallback,omitempty"`
-	PredictedInputTokens int    `json:"predictedInputTokens,omitempty"`
-	FallbackTo           string `json:"fallbackTo,omitempty"`
-	FinalModel           string `json:"finalModel"`
+	Attempts              int    `json:"attempts"`
+	ContextTrimmed        bool   `json:"contextTrimmed"`
+	OriginalInputTokens   int    `json:"originalInputTokens"`
+	FinalInputTokens      int    `json:"finalInputTokens"`
+	ObservedRateLimit     int    `json:"observedRateLimit,omitempty"`
+	ObservedRequested     int    `json:"observedRequested,omitempty"`
+	ObservedRateKind      string `json:"observedRateKind,omitempty"`
+	FallbackFrom          string `json:"fallbackFrom,omitempty"`
+	PreflightFallback     bool   `json:"preflightFallback,omitempty"`
+	PredictedInputTokens  int    `json:"predictedInputTokens,omitempty"`
+	FallbackTo            string `json:"fallbackTo,omitempty"`
+	FinalModel            string `json:"finalModel"`
+	RuntimeProfile        string `json:"runtimeProfile,omitempty"`
+	AppliedOverheadTokens int    `json:"appliedOverheadTokens,omitempty"`
 }
 
 type rateLimitObservation struct {
@@ -430,21 +432,48 @@ func inspectHermesSoftFailure(resp *http.Response) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
-func runtimeSafeITPMBudget(m store.ProviderModel) int {
-	if m.ITPMLimit <= 0 {
+func runtimeAgentOverhead(m store.ProviderModel, profile string) int {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "research", "guest":
+		if m.ResearchOverheadTokens > 0 {
+			return m.ResearchOverheadTokens
+		}
+	}
+	return m.AgentOverheadTokens
+}
+func runtimeSafeInputBudget(m store.ProviderModel, overhead int) int {
+	limit := m.ITPMLimit
+	if limit <= 0 || (m.TPMLimit > 0 && m.TPMLimit < limit) {
+		limit = m.TPMLimit
+	}
+	if limit <= 0 {
 		return 0
 	}
-	return max(256, int(float64(m.ITPMLimit)*0.90))
+	budget := int(float64(limit) * 0.90)
+	if m.TPMLimit > 0 && m.MaxOutputTokens > 0 {
+		reserve := min(m.MaxOutputTokens, max(128, int(float64(m.TPMLimit)*0.20)))
+		budget -= reserve
+	}
+	messageBudget := budget - overhead
+	if messageBudget <= 0 {
+		return -1
+	}
+	return max(256, messageBudget)
 }
-
-func runtimeMessageTarget(m store.ProviderModel, observed int, factor float64) int {
+func runtimeMessageTarget(m store.ProviderModel, observed int, factor float64, overhead int) int {
 	target := runtimeContextTarget(m, observed, factor)
 	limit := m.ITPMLimit
+	if limit <= 0 || (m.TPMLimit > 0 && m.TPMLimit < limit) {
+		limit = m.TPMLimit
+	}
 	if observed > 0 && (limit == 0 || observed < limit) {
 		limit = observed
 	}
-	if limit > 0 && m.AgentOverheadTokens > 0 {
-		messageBudget := int(float64(limit)*0.90) - m.AgentOverheadTokens
+	if limit > 0 {
+		messageBudget := int(float64(limit)*0.90) - overhead
+		if m.TPMLimit > 0 && m.MaxOutputTokens > 0 {
+			messageBudget -= min(m.MaxOutputTokens, max(128, int(float64(m.TPMLimit)*0.20)))
+		}
 		if messageBudget <= 0 {
 			return 0
 		}
@@ -457,22 +486,28 @@ func runtimeMessageTarget(m store.ProviderModel, observed int, factor float64) i
 	}
 	return max(256, target)
 }
-
-func shouldPreflightFallback(m store.ProviderModel, body []byte) bool {
-	budget := runtimeSafeITPMBudget(m)
-	if budget <= 0 || m.AgentOverheadTokens <= 0 || strings.TrimSpace(m.FallbackModelName) == "" {
+func shouldPreflightFallback(m store.ProviderModel, body []byte, overhead int) bool {
+	budget := runtimeSafeInputBudget(m, overhead)
+	if strings.TrimSpace(m.FallbackModelName) == "" || !(m.ContextStrategy == "adaptive" || m.ContextStrategy == "fallback") {
 		return false
 	}
-	predicted := estimateChatInputTokens(body) + m.AgentOverheadTokens
-	return predicted > budget && (m.ContextStrategy == "adaptive" || m.ContextStrategy == "fallback")
+	if budget < 0 {
+		return true
+	}
+	if budget == 0 {
+		return false
+	}
+	predictedMessages := estimateChatInputTokens(body)
+	return predictedMessages > budget
 }
 
 type inferenceRequestFactory func(body []byte) (*http.Request, error)
 
-func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model string, makeReq inferenceRequestFactory) (*http.Response, []byte, string, modelRecoveryMeta, error) {
+func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model, profile string, makeReq inferenceRequestFactory) (*http.Response, []byte, string, modelRecoveryMeta, error) {
 	m := a.runtimeModel(ctx, model)
-	meta := modelRecoveryMeta{Attempts: 0, OriginalInputTokens: estimateChatInputTokens(body), FinalModel: model}
-	meta.PredictedInputTokens = meta.OriginalInputTokens + m.AgentOverheadTokens
+	overhead := runtimeAgentOverhead(m, profile)
+	meta := modelRecoveryMeta{Attempts: 0, OriginalInputTokens: estimateChatInputTokens(body), FinalModel: model, RuntimeProfile: profile, AppliedOverheadTokens: overhead}
+	meta.PredictedInputTokens = meta.OriginalInputTokens + overhead
 	currentModel := model
 	strategy := m.ContextStrategy
 	if strategy == "" {
@@ -482,13 +517,15 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 	// A model whose Hermes/tool overhead already consumes its provider ITPM cannot
 	// succeed even with an empty conversation. Route around it before spending a
 	// provider attempt or exposing an SSE stream.
-	if shouldPreflightFallback(m, body) {
+	if shouldPreflightFallback(m, body, overhead) {
 		meta.PreflightFallback = true
 		meta.FallbackFrom = currentModel
 		meta.FallbackTo = m.FallbackModelName
 		currentModel = m.FallbackModelName
 		body = setRequestModel(body, currentModel)
 		m = a.runtimeModel(ctx, currentModel)
+		overhead = runtimeAgentOverhead(m, profile)
+		meta.AppliedOverheadTokens = overhead
 		strategy = m.ContextStrategy
 		if strategy == "" {
 			strategy = "adaptive"
@@ -497,7 +534,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 
 	body = applyModelOutputCap(body, m.MaxOutputTokens)
 	if strategy == "adaptive" || strategy == "trim" {
-		if target := runtimeMessageTarget(m, 0, 1); target > 0 {
+		if target := runtimeMessageTarget(m, 0, 1, overhead); target > 0 {
 			trimmed, orig, final, err := trimChatContext(body, target)
 			if err == nil {
 				body = trimmed
@@ -564,9 +601,9 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		}
 		recovered := false
 		if (strategy == "adaptive" || strategy == "trim") && (obs.Kind == "itpm" || obs.Kind == "tpm" || obs.Requested > obs.Limit && obs.Limit > 0) {
-			target := runtimeMessageTarget(m, obs.Limit, 1-float64(attempt)*0.18)
-			if target == 0 && obs.Limit > 0 && m.AgentOverheadTokens < int(float64(obs.Limit)*0.90) {
-				target = max(256, int(float64(obs.Limit)*0.72)-m.AgentOverheadTokens)
+			target := runtimeMessageTarget(m, obs.Limit, 1-float64(attempt)*0.18, overhead)
+			if target == 0 && obs.Limit > 0 && overhead < int(float64(obs.Limit)*0.90) {
+				target = max(256, int(float64(obs.Limit)*0.72)-overhead)
 			}
 			if target > 0 {
 				before := estimateChatInputTokens(body)
@@ -590,6 +627,8 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 			currentModel = m.FallbackModelName
 			body = setRequestModel(body, currentModel)
 			m = a.runtimeModel(ctx, currentModel)
+			overhead = runtimeAgentOverhead(m, profile)
+			meta.AppliedOverheadTokens = overhead
 			body = applyModelOutputCap(body, m.MaxOutputTokens)
 			strategy = m.ContextStrategy
 			if strategy == "" {
