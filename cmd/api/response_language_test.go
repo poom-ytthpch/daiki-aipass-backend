@@ -63,3 +63,19 @@ func TestResponseLanguageUsesLatestSubstantiveUserLanguage(t *testing.T) {
 		t.Fatalf("pref=%+v", pref)
 	}
 }
+
+func TestResponseLanguageUsesDominantConversationLanguage(t *testing.T) {
+	body := languageBody(t,
+		map[string]any{"role": "user", "content": "สวัสดี ตอนนี้คุยกันเป็นภาษาไทยนะ"},
+		map[string]any{"role": "assistant", "content": "ได้ครับ"},
+		map[string]any{"role": "user", "content": "ช่วยดู promotion_status กับ batch นี้ให้หน่อย"},
+		map[string]any{"role": "assistant", "content": "ได้ครับ"},
+		map[string]any{"role": "user", "content": "Analyze SKU CSV-TARGET-7319 and promotion_type with normal_price and selling_price"},
+		map[string]any{"role": "assistant", "content": "กำลังดูให้ครับ"},
+		map[string]any{"role": "user", "content": "Please review the attached content."},
+	)
+	pref := resolveResponseLanguage(body)
+	if pref.Code != "th-TH" {
+		t.Fatalf("pref=%+v", pref)
+	}
+}
