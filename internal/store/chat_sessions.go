@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -41,6 +42,36 @@ func (s *Store) ChatSessions(ctx context.Context, owner string, limit int) ([]Ch
 		limit = 100
 	}
 	rows, err := s.DB.Query(ctx, `SELECT id,owner_subject,title,model_alias,created_at,updated_at FROM chat_sessions WHERE owner_subject=$1 ORDER BY updated_at DESC LIMIT $2`, owner, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ChatSession{}
+	for rows.Next() {
+		var x ChatSession
+		if err := rows.Scan(&x.ID, &x.OwnerSubject, &x.Title, &x.ModelAlias, &x.CreatedAt, &x.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SearchChatSessions(ctx context.Context, owner, query string, limit int) ([]ChatSession, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return s.ChatSessions(ctx, owner, limit)
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	rows, err := s.DB.Query(ctx, `SELECT s.id,s.owner_subject,s.title,s.model_alias,s.created_at,s.updated_at
+		FROM chat_sessions s
+		WHERE s.owner_subject=$1
+		  AND (strpos(lower(s.title), lower($2)) > 0
+		       OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.session_id=s.id AND strpos(lower(m.content), lower($2)) > 0))
+		ORDER BY s.updated_at DESC
+		LIMIT $3`, owner, query, limit)
 	if err != nil {
 		return nil, err
 	}

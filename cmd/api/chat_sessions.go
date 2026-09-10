@@ -30,7 +30,19 @@ func validChatModel(v string) string {
 	return "auto"
 }
 func (a *app) listChatSessions(w http.ResponseWriter, r *http.Request) {
-	xs, err := a.store.ChatSessions(r.Context(), current(r).Sub, 100)
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if runes := []rune(query); len(runes) > 200 {
+		query = string(runes[:200])
+	}
+	var (
+		xs  []store.ChatSession
+		err error
+	)
+	if query == "" {
+		xs, err = a.store.ChatSessions(r.Context(), current(r).Sub, 100)
+	} else {
+		xs, err = a.store.SearchChatSessions(r.Context(), current(r).Sub, query, 100)
+	}
 	if err != nil {
 		writeJSON(w, 503, map[string]string{"error": "chat history unavailable"})
 		return
