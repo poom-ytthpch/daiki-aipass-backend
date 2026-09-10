@@ -19,7 +19,8 @@ func TestChooseHermesProfile(t *testing.T) {
 	}{
 		{"plain chat", `{"messages":[{"role":"user","content":"สวัสดี เป็นยังไงบ้าง"}]}`, researchMetadata{}, inference.WorkloadFast, "user"},
 		{"research", `{"messages":[{"role":"user","content":"ค้นหาข้อมูลล่าสุด"}]}`, researchMetadata{Mode: "web", Query: "latest", Used: true}, inference.WorkloadFast, "research"},
-		{"vision stays lean", `{"messages":[{"role":"user","content":"review image"}]}`, researchMetadata{}, inference.WorkloadVision, "user"},
+		{"vision uses dedicated native profile", `{"messages":[{"role":"user","content":"review image"}]}`, researchMetadata{}, inference.WorkloadVision, "vision"},
+		{"vision wins over research", `{"messages":[{"role":"user","content":"review image with web evidence"}]}`, researchMetadata{Mode: "web", Used: true}, inference.WorkloadVision, "vision"},
 		{"explicit upskill", `{"messages":[{"role":"user","content":"ช่วย upskill เรื่อง Kubernetes ให้หน่อย"}]}`, researchMetadata{}, inference.WorkloadFast, "skills"},
 		{"coding domain stays lean", `{"messages":[{"role":"user","content":"debug this Go API bug"}]}`, researchMetadata{}, inference.WorkloadFast, "user"},
 		{"delegation", `{"messages":[{"role":"user","content":"delegate this to multiple agents in parallel"}]}`, researchMetadata{}, inference.WorkloadFast, "agent"},

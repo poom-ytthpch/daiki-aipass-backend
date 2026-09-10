@@ -48,6 +48,28 @@ func TestAutoResearchSignals(t *testing.T) {
 	}
 }
 
+func TestAttachmentReviewDoesNotTriggerUnrelatedAutoResearch(t *testing.T) {
+	payload := map[string]any{
+		"attachmentIds": []any{"att_image"},
+		"messages":      []any{map[string]any{"role": "user", "content": "Please review the attached content."}},
+	}
+	query, _, useWeb, _, _ := contextualResearchPlan(payload, "auto")
+	if query != "Please review the attached content." || useWeb {
+		t.Fatalf("generic attachment review must stay grounded in the attachment, query=%q useWeb=%v", query, useWeb)
+	}
+}
+
+func TestAttachmentCanStillRequestExplicitWebResearch(t *testing.T) {
+	payload := map[string]any{
+		"attachmentIds": []any{"att_image"},
+		"messages":      []any{map[string]any{"role": "user", "content": "Review the attached image and search the web for current safety information."}},
+	}
+	_, _, useWeb, _, _ := contextualResearchPlan(payload, "auto")
+	if !useWeb {
+		t.Fatal("explicit web research with an attachment must remain enabled")
+	}
+}
+
 func TestExtractResearchURLs(t *testing.T) {
 	got := extractResearchURLs("อ่าน https://aipass.go.th/ ให้หน่อย และ https://example.com/docs).")
 	if len(got) != 2 || got[0] != "https://aipass.go.th/" || got[1] != "https://example.com/docs" {

@@ -205,11 +205,50 @@ Previous assistant answer: %s
 Latest follow-up: %s`, clipText(ctx.PreviousUser, 500), clipText(ctx.PreviousAssistant, 1200), clipText(ctx.LatestUser, 400))
 }
 
+func payloadHasAttachmentIDs(payload map[string]any) bool {
+	raw, ok := payload["attachmentIds"].([]any)
+	return ok && len(raw) > 0
+}
+
+func attachmentAutoResearchSuppressed(payload map[string]any, query string) bool {
+	if !payloadHasAttachmentIDs(payload) {
+		return false
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" || len(extractResearchURLs(q)) > 0 || isAIPassIntent(q) || isWebCapabilityQuestion(q) {
+		return false
+	}
+	// A generic request to review an attached artifact is about the artifact, not
+	// about the phrase used to ask for the review. Do not search the public web just
+	// because shouldAutoResearch() sees the generic keyword "review"/"รีวิว".
+	attachmentWords := []string{"attach", "image", "file", "document", "screenshot", "content", "รูป", "ไฟล์", "เอกสาร", "ภาพ"}
+	hasAttachmentReference := false
+	for _, word := range attachmentWords {
+		if strings.Contains(q, word) {
+			hasAttachmentReference = true
+			break
+		}
+	}
+	if !hasAttachmentReference {
+		return false
+	}
+	explicitWebSignals := []string{
+		"latest", "current", "today", "tonight", "this week", "this month", "news", "recent", "price", "release", "version", "research", "search the web", "search online", "internet", "availability", "outage", "weather", "market",
+		"ล่าสุด", "ปัจจุบัน", "วันนี้", "สัปดาห์นี้", "เดือนนี้", "ข่าว", "ราคา", "เวอร์ชัน", "ค้นเว็บ", "ค้นออนไลน์", "อินเทอร์เน็ต", "เว็บ", "มีขาย", "อัปเดต",
+	}
+	for _, signal := range explicitWebSignals {
+		if strings.Contains(q, signal) {
+			return false
+		}
+	}
+	return strings.Contains(q, "review") || strings.Contains(q, "รีวิว") || strings.Contains(q, "analy") || strings.Contains(q, "ตรวจ") || strings.Contains(q, "ดู")
+}
+
 func contextualResearchPlan(payload map[string]any, mode string) (latestQuery, resolvedQuery string, useWeb, inherited bool, continuity continuityContext) {
 	continuity = continuityContextFor(payload)
 	latestQuery = continuity.LatestUser
 	resolvedQuery = latestQuery
-	useWeb = mode == "web" || (mode == "auto" && (shouldAutoResearch(latestQuery) || isWebCapabilityQuestion(latestQuery)))
+	useWeb = mode == "web" || (mode == "auto" && !attachmentAutoResearchSuppressed(payload, latestQuery) && (shouldAutoResearch(latestQuery) || isWebCapabilityQuestion(latestQuery)))
 	if !useWeb && mode == "auto" && continuity.IsFollowUp && continuity.PreviousResearch != "" {
 		useWeb = true
 		inherited = true

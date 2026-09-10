@@ -50,13 +50,16 @@ func applyHermesSessionScope(req *http.Request, baseKey string, payload []byte) 
 }
 
 func chooseHermesProfile(body []byte, research researchMetadata, route inference.Route, selected []smartSkill) string {
+	// Vision must win over research. The research profile is intentionally text-only;
+	// routing an image turn there makes Hermes pre-analyze data URLs through its sandbox
+	// fallback instead of passing pixels natively to the vision-capable model. Web
+	// evidence, when explicitly requested, is already embedded in the request body and
+	// can be synthesized by the dedicated lean vision profile.
+	if route.Workload == inference.WorkloadVision {
+		return "vision"
+	}
 	if researchUsesHermesProfile(research) {
 		return "research"
-	}
-	// Native multimodal is already handled by the model route; keep the lean user
-	// profile so image pixels are not accompanied by unrelated skill/tool schemas.
-	if route.Workload == inference.WorkloadVision {
-		return "user"
 	}
 	if wantsHermesAgentProfile(body) {
 		return "agent"

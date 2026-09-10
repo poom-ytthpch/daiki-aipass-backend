@@ -487,7 +487,7 @@ func inspectHermesSoftFailure(resp *http.Response) ([]byte, int, error) {
 
 func runtimeAgentOverhead(m store.ProviderModel, profile string) int {
 	switch strings.ToLower(strings.TrimSpace(profile)) {
-	case "research", "guest":
+	case "research", "guest", "vision":
 		if m.ResearchOverheadTokens > 0 {
 			return m.ResearchOverheadTokens
 		}

@@ -271,3 +271,10 @@ func TestShouldSpillModelAdmissionPrefersMeaningfulCapacityGain(t *testing.T) {
 		t.Fatal("minor wait difference should not churn models")
 	}
 }
+
+func TestRuntimeAgentOverheadUsesLeanVisionBudget(t *testing.T) {
+	m := store.ProviderModel{AgentOverheadTokens: 3800, ResearchOverheadTokens: 800}
+	if got := runtimeAgentOverhead(m, "vision"); got != 800 {
+		t.Fatalf("vision overhead=%d want 800", got)
+	}
+}
