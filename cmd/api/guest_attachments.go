@@ -138,18 +138,7 @@ func (a *app) guestUploadAttachment(w http.ResponseWriter, r *http.Request) {
 	if mediaType == "" {
 		mediaType = "application/octet-stream"
 	}
-	extractStatus, extractedText := "stored", ""
-	if textAttachment(name, mediaType) {
-		if content, readErr := os.ReadFile(storagePath); readErr == nil {
-			if len(content) > maxExtractedTextBytes {
-				content = content[:maxExtractedTextBytes]
-				extractStatus = "text-truncated"
-			} else {
-				extractStatus = "text-ready"
-			}
-			extractedText = string(content)
-		}
-	}
+	extractStatus, extractedText := extractAttachmentContent(storagePath, name, mediaType)
 	rec, err := a.store.CreateGuestAttachment(r.Context(), store.GuestAttachment{
 		ID: id, GuestSubject: identity.Subject, DeviceID: identity.DeviceID, Name: name,
 		RelativePath: relativePath, Source: source, MediaType: mediaType, SizeBytes: n,
@@ -260,7 +249,8 @@ func (a *app) expandGuestChatAttachments(ctx context.Context, identity guestIden
 	if last == nil || last["role"] != "user" {
 		return nil, nil, errors.New("guest attachments must be sent with a user message")
 	}
-	textBudget := maxInjectedTextBytes
+	query := latestUserText(body)
+	textBudget := maxAttachmentContextBytes
 	contentParts := []any{}
 	if content, ok := last["content"].(string); ok && content != "" {
 		contentParts = append(contentParts, map[string]any{"type": "text", "text": content})
@@ -271,14 +261,24 @@ func (a *app) expandGuestChatAttachments(ctx context.Context, identity guestIden
 		if strings.HasPrefix(strings.ToLower(rec.MediaType), "image/") {
 			kind = "image"
 		}
+		if rec.ExtractedText == "" && rec.ExtractStatus == "stored" && !strings.HasPrefix(strings.ToLower(rec.MediaType), "image/") {
+			status, text := extractAttachmentContent(rec.StoragePath, rec.Name, rec.MediaType)
+			if status != "stored" {
+				rec.ExtractStatus, rec.ExtractedText = status, text
+				_ = a.store.UpdateGuestAttachmentExtraction(ctx, identity.Subject, identity.DeviceID, rec.ID, status, text)
+			}
+		}
 		summary = append(summary, expandedAttachment{ID: rec.ID, Name: rec.Name, RelativePath: rec.RelativePath, MediaType: rec.MediaType, SizeBytes: rec.SizeBytes, Kind: kind})
 		if rec.ExtractedText != "" && textBudget > 0 {
-			text := rec.ExtractedText
-			if len(text) > textBudget {
-				text = text[:textBudget]
+			limit := min(textBudget, maxAttachmentExcerptBytes)
+			excerpt, clipped := attachmentExcerpt(rec.ExtractedText, query, limit)
+			textBudget -= len(excerpt)
+			context := fmt.Sprintf("\n\n--- Daiki attachment context ---\nFile: %s\nMedia type: %s\nExtraction: %s\n", rec.RelativePath, rec.MediaType, rec.ExtractStatus)
+			if clipped || strings.Contains(rec.ExtractStatus, "truncated") {
+				context += "Note: This is a bounded relevant excerpt, not the entire file. Do not claim unseen rows/pages were reviewed.\n"
 			}
-			textBudget -= len(text)
-			contentParts = append(contentParts, map[string]any{"type": "text", "text": "\n\n--- Attached file: " + rec.RelativePath + " ---\n" + text})
+			context += "Content excerpt:\n" + excerpt
+			contentParts = append(contentParts, map[string]any{"type": "text", "text": context})
 			continue
 		}
 		if strings.HasPrefix(strings.ToLower(rec.MediaType), "image/") {

@@ -177,13 +177,21 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 	}
 	payloadMessages := make([]map[string]any, 0, len(messages))
 	var attachmentIDs []string
+	var recentAttachmentIDs []string
 	lastUserText := ""
 	for _, m := range messages {
 		payloadMessages = append(payloadMessages, map[string]any{"role": m.Role, "content": m.Content})
 		if m.Role == "user" {
 			attachmentIDs = append([]string{}, m.AttachmentIDs...)
+			if len(m.AttachmentIDs) > 0 {
+				recentAttachmentIDs = append([]string{}, m.AttachmentIDs...)
+			}
 			lastUserText = m.Content
 		}
+	}
+	if len(attachmentIDs) == 0 && len(recentAttachmentIDs) > 0 && looksAttachmentFollowUp(lastUserText) {
+		attachmentIDs = recentAttachmentIDs
+		_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"attachmentContextInherited": true})
 	}
 	profile := thinkingProfileFor(run.ThinkingMode)
 	_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"research": map[string]any{"mode": run.ResearchMode, "query": clipText(lastUserText, 500)}, "thinking": map[string]any{"mode": run.ThinkingMode, "reasoningBudget": profile.ReasoningBudget}})

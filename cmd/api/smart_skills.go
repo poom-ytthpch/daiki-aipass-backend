@@ -112,10 +112,10 @@ func selectSmartSkills(body []byte) []smartSkill {
 	if containsAny("translate", "translation", "แปล", "ภาษาอังกฤษ", "ภาษาไทย") {
 		add("translate")
 	}
-	if containsAny("csv", "json", "table", "dataset", "average", "percent", "percentage", "ratio", "trend", "วิเคราะห์ข้อมูล", "ค่าเฉลี่ย", "เปอร์เซ็นต์", "ตาราง") {
+	if containsAny("csv", "xlsx", "excel", "spreadsheet", "sheet", "json", "table", "dataset", "average", "percent", "percentage", "ratio", "trend", "วิเคราะห์ข้อมูล", "ค่าเฉลี่ย", "เปอร์เซ็นต์", "ตาราง", "เอ็กเซล", "สเปรดชีต", "ชีต") {
 		add("data-analysis")
 	}
-	if containsAny("file", "document", "attachment", "pdf", "docx", "folder", "ไฟล์", "เอกสาร", "โฟลเดอร์", "แนบ") {
+	if containsAny("file", "document", "attachment", "pdf", "docx", "pptx", "xlsx", "excel", "spreadsheet", "csv", "folder", "ไฟล์", "เอกสาร", "โฟลเดอร์", "แนบ", "เอ็กเซล", "สเปรดชีต") {
 		add("document-qa")
 	}
 	if containsAny("plan", "roadmap", "steps", "checklist", "แผน", "ขั้นตอน", "ทำยังไง", "ทำอย่างไร") {

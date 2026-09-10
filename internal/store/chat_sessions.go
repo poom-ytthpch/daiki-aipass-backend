@@ -9,12 +9,13 @@ import (
 )
 
 type ChatSession struct {
-	ID           string    `json:"id"`
-	OwnerSubject string    `json:"-"`
-	Title        string    `json:"title"`
-	ModelAlias   string    `json:"modelAlias"`
-	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	ID           string     `json:"id"`
+	OwnerSubject string     `json:"-"`
+	Title        string     `json:"title"`
+	ModelAlias   string     `json:"modelAlias"`
+	PinnedAt     *time.Time `json:"pinnedAt,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	UpdatedAt    time.Time  `json:"updatedAt"`
 }
 
 type ChatMessage struct {
@@ -29,19 +30,19 @@ type ChatMessage struct {
 
 func scanChatSession(row pgx.Row) (ChatSession, error) {
 	var x ChatSession
-	err := row.Scan(&x.ID, &x.OwnerSubject, &x.Title, &x.ModelAlias, &x.CreatedAt, &x.UpdatedAt)
+	err := row.Scan(&x.ID, &x.OwnerSubject, &x.Title, &x.ModelAlias, &x.PinnedAt, &x.CreatedAt, &x.UpdatedAt)
 	return x, err
 }
 
 func (s *Store) CreateChatSession(ctx context.Context, x ChatSession) (ChatSession, error) {
-	return scanChatSession(s.DB.QueryRow(ctx, `INSERT INTO chat_sessions(id,owner_subject,title,model_alias) VALUES($1,$2,$3,$4) RETURNING id,owner_subject,title,model_alias,created_at,updated_at`, x.ID, x.OwnerSubject, x.Title, x.ModelAlias))
+	return scanChatSession(s.DB.QueryRow(ctx, `INSERT INTO chat_sessions(id,owner_subject,title,model_alias) VALUES($1,$2,$3,$4) RETURNING id,owner_subject,title,model_alias,pinned_at,created_at,updated_at`, x.ID, x.OwnerSubject, x.Title, x.ModelAlias))
 }
 
 func (s *Store) ChatSessions(ctx context.Context, owner string, limit int) ([]ChatSession, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 100
 	}
-	rows, err := s.DB.Query(ctx, `SELECT id,owner_subject,title,model_alias,created_at,updated_at FROM chat_sessions WHERE owner_subject=$1 ORDER BY updated_at DESC LIMIT $2`, owner, limit)
+	rows, err := s.DB.Query(ctx, `SELECT id,owner_subject,title,model_alias,pinned_at,created_at,updated_at FROM chat_sessions WHERE owner_subject=$1 ORDER BY pinned_at DESC NULLS LAST,updated_at DESC LIMIT $2`, owner, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +50,7 @@ func (s *Store) ChatSessions(ctx context.Context, owner string, limit int) ([]Ch
 	out := []ChatSession{}
 	for rows.Next() {
 		var x ChatSession
-		if err := rows.Scan(&x.ID, &x.OwnerSubject, &x.Title, &x.ModelAlias, &x.CreatedAt, &x.UpdatedAt); err != nil {
+		if err := rows.Scan(&x.ID, &x.OwnerSubject, &x.Title, &x.ModelAlias, &x.PinnedAt, &x.CreatedAt, &x.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, x)
@@ -65,12 +66,12 @@ func (s *Store) SearchChatSessions(ctx context.Context, owner, query string, lim
 	if limit <= 0 || limit > 200 {
 		limit = 100
 	}
-	rows, err := s.DB.Query(ctx, `SELECT s.id,s.owner_subject,s.title,s.model_alias,s.created_at,s.updated_at
+	rows, err := s.DB.Query(ctx, `SELECT s.id,s.owner_subject,s.title,s.model_alias,s.pinned_at,s.created_at,s.updated_at
 		FROM chat_sessions s
 		WHERE s.owner_subject=$1
 		  AND (strpos(lower(s.title), lower($2)) > 0
 		       OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.session_id=s.id AND strpos(lower(m.content), lower($2)) > 0))
-		ORDER BY s.updated_at DESC
+		ORDER BY s.pinned_at DESC NULLS LAST,s.updated_at DESC
 		LIMIT $3`, owner, query, limit)
 	if err != nil {
 		return nil, err
@@ -79,7 +80,7 @@ func (s *Store) SearchChatSessions(ctx context.Context, owner, query string, lim
 	out := []ChatSession{}
 	for rows.Next() {
 		var x ChatSession
-		if err := rows.Scan(&x.ID, &x.OwnerSubject, &x.Title, &x.ModelAlias, &x.CreatedAt, &x.UpdatedAt); err != nil {
+		if err := rows.Scan(&x.ID, &x.OwnerSubject, &x.Title, &x.ModelAlias, &x.PinnedAt, &x.CreatedAt, &x.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, x)
@@ -88,11 +89,17 @@ func (s *Store) SearchChatSessions(ctx context.Context, owner, query string, lim
 }
 
 func (s *Store) ChatSession(ctx context.Context, owner, id string) (ChatSession, error) {
-	return scanChatSession(s.DB.QueryRow(ctx, `SELECT id,owner_subject,title,model_alias,created_at,updated_at FROM chat_sessions WHERE id=$1 AND owner_subject=$2`, id, owner))
+	return scanChatSession(s.DB.QueryRow(ctx, `SELECT id,owner_subject,title,model_alias,pinned_at,created_at,updated_at FROM chat_sessions WHERE id=$1 AND owner_subject=$2`, id, owner))
 }
 
-func (s *Store) UpdateChatSession(ctx context.Context, owner, id, title, modelAlias string) (ChatSession, error) {
-	return scanChatSession(s.DB.QueryRow(ctx, `UPDATE chat_sessions SET title=CASE WHEN $3='' THEN title ELSE $3 END,model_alias=CASE WHEN $4='' THEN model_alias ELSE $4 END,updated_at=now() WHERE id=$1 AND owner_subject=$2 RETURNING id,owner_subject,title,model_alias,created_at,updated_at`, id, owner, title, modelAlias))
+func (s *Store) UpdateChatSession(ctx context.Context, owner, id, title, modelAlias string, pinned *bool) (ChatSession, error) {
+	return scanChatSession(s.DB.QueryRow(ctx, `UPDATE chat_sessions SET
+		title=CASE WHEN $3='' THEN title ELSE $3 END,
+		model_alias=CASE WHEN $4='' THEN model_alias ELSE $4 END,
+		pinned_at=CASE WHEN $5::boolean IS NULL THEN pinned_at WHEN $5 THEN COALESCE(pinned_at,now()) ELSE NULL END,
+		updated_at=CASE WHEN $3<>'' OR $4<>'' THEN now() ELSE updated_at END
+		WHERE id=$1 AND owner_subject=$2
+		RETURNING id,owner_subject,title,model_alias,pinned_at,created_at,updated_at`, id, owner, title, modelAlias, pinned))
 }
 
 func (s *Store) DeleteChatSession(ctx context.Context, owner, id string) error {

@@ -40,6 +40,16 @@ func (s *Store) Attachment(ctx context.Context, owner, id string) (Attachment, e
 	return scanAttachment(s.DB.QueryRow(ctx, `SELECT id,owner_subject,name,relative_path,source,media_type,size_bytes,sha256,storage_path,extract_status,extracted_text,created_at,deleted_at
 		FROM attachments WHERE id=$1 AND owner_subject=$2 AND deleted_at IS NULL`, id, owner))
 }
+func (s *Store) UpdateAttachmentExtraction(ctx context.Context, owner, id, status, text string) error {
+	tag, err := s.DB.Exec(ctx, `UPDATE attachments SET extract_status=$3,extracted_text=$4 WHERE id=$1 AND owner_subject=$2 AND deleted_at IS NULL`, id, owner, status, text)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
 
 func (s *Store) Attachments(ctx context.Context, owner string, ids []string) ([]Attachment, error) {
 	if len(ids) == 0 {

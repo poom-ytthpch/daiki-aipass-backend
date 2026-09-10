@@ -21,13 +21,17 @@ func wantsHermesSkillProfile(body []byte, selected []smartSkill) bool {
 	text := latestUserText(body)
 	if containsHermesIntent(text,
 		"skill", "upskill", "learn this", "learn how", "remember as a skill", "improve skill", "update skill",
+		"graft", "code graph", "repo map", "blast radius",
 		"เรียนรู้เป็น skill", "เพิ่ม skill", "อัปสกิล", "up skill", "สร้าง skill", "ปรับ skill", "พัฒนาทักษะ",
 	) {
 		return true
 	}
-	// Domain classification alone is intentionally NOT enough to load Hermes'
-	// heavy skills catalog. Normal coding/data/document/planning requests stay on
-	// the lean user profile; only explicit skill-learning/use intent opts in.
+	// Attached document turns opt into the curated skills profile. Daiki injects
+	// only a bounded relevant excerpt, so this enables document-analysis guidance
+	// without paying for the skills catalog on ordinary chat turns.
+	if strings.Contains(strings.ToLower(text), "--- daiki attachment context ---") {
+		return true
+	}
 	_ = selected
 	return false
 }

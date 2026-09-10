@@ -88,12 +88,32 @@ func (a *app) getChatSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 503, map[string]string{"error": "chat runs unavailable"})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"session": x, "messages": ms, "runs": runs})
+	attachmentIDs := make([]string, 0)
+	seenAttachments := map[string]bool{}
+	for _, message := range ms {
+		for _, attachmentID := range message.AttachmentIDs {
+			if attachmentID != "" && !seenAttachments[attachmentID] {
+				seenAttachments[attachmentID] = true
+				attachmentIDs = append(attachmentIDs, attachmentID)
+			}
+		}
+	}
+	attachmentRows, attachmentErr := a.store.Attachments(r.Context(), current(r).Sub, attachmentIDs)
+	if attachmentErr != nil {
+		writeJSON(w, 503, map[string]string{"error": "chat attachments unavailable"})
+		return
+	}
+	attachments := make([]map[string]any, 0, len(attachmentRows))
+	for _, row := range attachmentRows {
+		attachments = append(attachments, attachmentPublic(row))
+	}
+	writeJSON(w, 200, map[string]any{"session": x, "messages": ms, "runs": runs, "attachments": attachments})
 }
 func (a *app) updateChatSession(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Title      string `json:"title"`
 		ModelAlias string `json:"modelAlias"`
+		Pinned     *bool  `json:"pinned"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid chat payload"})
@@ -107,7 +127,7 @@ func (a *app) updateChatSession(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(in.Title) != "" {
 		title = cleanChatTitle(in.Title)
 	}
-	x, err := a.store.UpdateChatSession(r.Context(), current(r).Sub, chi.URLParam(r, "id"), title, model)
+	x, err := a.store.UpdateChatSession(r.Context(), current(r).Sub, chi.URLParam(r, "id"), title, model, in.Pinned)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			writeJSON(w, 404, map[string]string{"error": "chat not found"})

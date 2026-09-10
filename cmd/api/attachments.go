@@ -24,8 +24,6 @@ import (
 const (
 	maxAttachmentBytes       = int64(25 << 20)
 	maxMultipartRequestBytes = int64(30 << 20)
-	maxExtractedTextBytes    = 1 << 20
-	maxInjectedTextBytes     = 384 << 10
 	maxInjectedImageBytes    = 4 << 20
 )
 
@@ -139,20 +137,7 @@ func (a *app) uploadAttachment(w http.ResponseWriter, r *http.Request) {
 	if mediaType == "" {
 		mediaType = "application/octet-stream"
 	}
-	extractStatus := "stored"
-	extractedText := ""
-	if textAttachment(name, mediaType) {
-		content, readErr := os.ReadFile(storagePath)
-		if readErr == nil {
-			if len(content) > maxExtractedTextBytes {
-				content = content[:maxExtractedTextBytes]
-				extractStatus = "text-truncated"
-			} else {
-				extractStatus = "text-ready"
-			}
-			extractedText = string(content)
-		}
-	}
+	extractStatus, extractedText := extractAttachmentContent(storagePath, name, mediaType)
 	rec, err := a.store.CreateAttachment(r.Context(), store.Attachment{
 		ID: id, OwnerSubject: u.Subject, Name: name, RelativePath: relativePath, Source: source,
 		MediaType: mediaType, SizeBytes: n, SHA256: hex.EncodeToString(h.Sum(nil)), StoragePath: storagePath,
@@ -278,7 +263,8 @@ func (a *app) expandChatAttachments(r *http.Request, body []byte) ([]byte, []exp
 	if last == nil {
 		return nil, nil, errors.New("invalid last message")
 	}
-	textBudget := maxInjectedTextBytes
+	query := latestUserText(body)
+	textBudget := maxAttachmentContextBytes
 	contentParts := []any{}
 	switch content := last["content"].(type) {
 	case string:
@@ -297,15 +283,24 @@ func (a *app) expandChatAttachments(r *http.Request, body []byte) ([]byte, []exp
 		if rec.Source == "folder" {
 			kind = "folder-file"
 		}
+		if rec.ExtractedText == "" && rec.ExtractStatus == "stored" && !strings.HasPrefix(strings.ToLower(rec.MediaType), "image/") {
+			status, text := extractAttachmentContent(rec.StoragePath, rec.Name, rec.MediaType)
+			if status != "stored" {
+				rec.ExtractStatus, rec.ExtractedText = status, text
+				_ = a.store.UpdateAttachmentExtraction(r.Context(), u.Subject, rec.ID, status, text)
+			}
+		}
 		summary = append(summary, expandedAttachment{ID: rec.ID, Name: rec.Name, RelativePath: rec.RelativePath, MediaType: rec.MediaType, SizeBytes: rec.SizeBytes, Kind: kind})
 		if rec.ExtractedText != "" && textBudget > 0 {
-			text := rec.ExtractedText
-			if len(text) > textBudget {
-				text = text[:textBudget]
+			limit := min(textBudget, maxAttachmentExcerptBytes)
+			excerpt, clipped := attachmentExcerpt(rec.ExtractedText, query, limit)
+			textBudget -= len(excerpt)
+			context := fmt.Sprintf("\n\n--- Daiki attachment context ---\nFile: %s\nMedia type: %s\nExtraction: %s\n", rec.RelativePath, rec.MediaType, rec.ExtractStatus)
+			if clipped || strings.Contains(rec.ExtractStatus, "truncated") {
+				context += "Note: This is a bounded relevant excerpt, not the entire file. Do not claim unseen rows/pages were reviewed.\n"
 			}
-			textBudget -= len(text)
-			label := rec.RelativePath
-			contentParts = append(contentParts, map[string]any{"type": "text", "text": "\n\n--- Attached file: " + label + " ---\n" + text})
+			context += "Content excerpt:\n" + excerpt
+			contentParts = append(contentParts, map[string]any{"type": "text", "text": context})
 			continue
 		}
 		if strings.HasPrefix(strings.ToLower(rec.MediaType), "image/") {
@@ -320,7 +315,7 @@ func (a *app) expandChatAttachments(r *http.Request, body []byte) ([]byte, []exp
 			contentParts = append(contentParts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
 			continue
 		}
-		contentParts = append(contentParts, map[string]any{"type": "text", "text": "\n[Attached binary file: " + rec.RelativePath + " (stored, content parser not available yet)]"})
+		contentParts = append(contentParts, map[string]any{"type": "text", "text": "\n[Attached file: " + rec.RelativePath + " · extraction=" + rec.ExtractStatus + " · no text content available]"})
 	}
 	last["content"] = contentParts
 	messages[len(messages)-1] = last

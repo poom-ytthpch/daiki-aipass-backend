@@ -319,7 +319,9 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS chat_sessions_owner_updated_idx ON chat_sessions (owner_subject, updated_at DESC);
+CREATE INDEX IF NOT EXISTS chat_sessions_owner_pinned_updated_idx ON chat_sessions (owner_subject, pinned_at DESC, updated_at DESC);
 CREATE TABLE IF NOT EXISTS chat_messages (
     id BIGSERIAL PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,

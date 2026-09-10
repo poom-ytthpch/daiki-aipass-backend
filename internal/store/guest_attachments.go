@@ -41,6 +41,16 @@ func (s *Store) CreateGuestAttachment(ctx context.Context, a GuestAttachment) (G
 func (s *Store) GuestAttachment(ctx context.Context, guestSubject, deviceID, id string) (GuestAttachment, error) {
 	return scanGuestAttachment(s.DB.QueryRow(ctx, `SELECT `+guestAttachmentColumns+` FROM guest_attachments WHERE id=$1 AND guest_subject=$2 AND device_id=$3 AND deleted_at IS NULL`, id, guestSubject, deviceID))
 }
+func (s *Store) UpdateGuestAttachmentExtraction(ctx context.Context, guestSubject, deviceID, id, status, text string) error {
+	tag, err := s.DB.Exec(ctx, `UPDATE guest_attachments SET extract_status=$4,extracted_text=$5 WHERE id=$1 AND guest_subject=$2 AND device_id=$3 AND deleted_at IS NULL`, id, guestSubject, deviceID, status, text)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
 
 func (s *Store) GuestAttachments(ctx context.Context, guestSubject, deviceID string, ids []string) ([]GuestAttachment, error) {
 	if len(ids) == 0 {
