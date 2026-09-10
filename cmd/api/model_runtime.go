@@ -38,6 +38,7 @@ type modelRecoveryMeta struct {
 	RuntimeProfile        string `json:"runtimeProfile,omitempty"`
 	AppliedOverheadTokens int    `json:"appliedOverheadTokens,omitempty"`
 	AdmissionWaitMS       int64  `json:"admissionWaitMs,omitempty"`
+	AdmissionSpillover    bool   `json:"admissionSpillover,omitempty"`
 	AdmissionTokens       int    `json:"admissionTokens,omitempty"`
 }
 
@@ -536,41 +537,60 @@ func modelAdmissionCost(body []byte, m store.ProviderModel, profile string) int 
 	return max(1, cost)
 }
 
-func (a *app) waitForModelAdmission(ctx context.Context, model string, body []byte, m store.ProviderModel, profile string) (time.Duration, int, error) {
+func (a *app) tryModelAdmission(ctx context.Context, model string, body []byte, m store.ProviderModel, profile string) (bool, time.Duration, int, error) {
 	if a.redis == nil {
-		return 0, 0, nil
+		return true, 0, 0, nil
 	}
 	limit := runtimeTokenLimit(m)
 	cost := modelAdmissionCost(body, m, profile)
 	if limit <= 0 || cost <= 0 {
-		return 0, 0, nil
+		return true, 0, 0, nil
 	}
 	// Keep 15% headroom for provider-side token accounting differences, title/
 	// auxiliary calls and traffic that may not pass through this backend process.
 	capacity := max(1, int(float64(limit)*0.85))
 	refillPerMS := float64(limit) / 60000.0
 	if refillPerMS <= 0 {
-		return 0, cost, nil
+		return true, 0, cost, nil
 	}
 	key := "model:tpm:" + strings.TrimPrefix(modelCircuitKey(model), "model:circuit:")
 	script := `local now=tonumber(ARGV[1]); local capacity=tonumber(ARGV[2]); local refill=tonumber(ARGV[3]); local cost=tonumber(ARGV[4]); local tokens=tonumber(redis.call('HGET',KEYS[1],'tokens')); local last=tonumber(redis.call('HGET',KEYS[1],'last')); if not tokens or not last then tokens=capacity; last=now end; tokens=math.min(capacity,tokens); if now>last then tokens=math.min(capacity,tokens+((now-last)*refill)); last=now end; if tokens>=cost then tokens=tokens-cost; redis.call('HSET',KEYS[1],'tokens',tokens,'last',last); redis.call('PEXPIRE',KEYS[1],120000); return 0 end; local need=cost-tokens; local wait=math.ceil(need/refill); redis.call('HSET',KEYS[1],'tokens',tokens,'last',last); redis.call('PEXPIRE',KEYS[1],120000); return wait`
+	nowMS := time.Now().UnixMilli()
+	waitMS, err := a.redis.Eval(ctx, script, []string{key}, nowMS, capacity, refillPerMS, cost).Int64()
+	if err != nil {
+		// Admission is an availability optimization. Redis queue/quota failures are
+		// handled elsewhere; fail open rather than taking inference down here.
+		return true, 0, cost, nil
+	}
+	if waitMS <= 0 {
+		return true, 0, cost, nil
+	}
+	return false, time.Duration(waitMS) * time.Millisecond, cost, nil
+}
+
+func shouldSpillModelAdmission(primaryWait, fallbackWait time.Duration) bool {
+	const spillThreshold = 2 * time.Second
+	const meaningfulGain = 500 * time.Millisecond
+	if primaryWait < spillThreshold {
+		return false
+	}
+	return fallbackWait <= 0 || fallbackWait+meaningfulGain < primaryWait
+}
+
+func (a *app) waitForModelAdmission(ctx context.Context, model string, body []byte, m store.ProviderModel, profile string) (time.Duration, int, error) {
 	started := time.Now()
 	for {
-		nowMS := time.Now().UnixMilli()
-		waitMS, err := a.redis.Eval(ctx, script, []string{key}, nowMS, capacity, refillPerMS, cost).Int64()
+		admitted, waitHint, cost, err := a.tryModelAdmission(ctx, model, body, m, profile)
 		if err != nil {
-			// Admission is an availability optimization. Redis queue/quota failures are
-			// handled elsewhere; do not take inference down solely because this optional
-			// pacing layer cannot read its bucket.
-			return time.Since(started), cost, nil
+			return time.Since(started), cost, err
 		}
-		if waitMS <= 0 {
+		if admitted {
 			return time.Since(started), cost, nil
 		}
 		select {
 		case <-ctx.Done():
 			return time.Since(started), cost, ctx.Err()
-		case <-time.After(time.Duration(min(int(waitMS), 15000)) * time.Millisecond):
+		case <-time.After(min(waitHint, 15*time.Second)):
 		}
 	}
 }
@@ -806,11 +826,30 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 
 	for attempt := 0; ; attempt++ {
 		meta.Attempts++
-		waited, admissionTokens, admissionErr := a.waitForModelAdmission(ctx, currentModel, body, m, profile)
-		meta.AdmissionWaitMS += waited.Milliseconds()
-		meta.AdmissionTokens = admissionTokens
+		admitted, primaryWait, admissionTokens, admissionErr := a.tryModelAdmission(ctx, currentModel, body, m, profile)
 		if admissionErr != nil {
 			return nil, body, currentModel, meta, admissionErr
+		}
+		if !admitted && allowModelFallback && modelCanFallback(m, currentModel, strategy) && primaryWait >= 2*time.Second {
+			fallbackModel := m.FallbackModelName
+			fallbackRuntime := a.runtimeModel(ctx, fallbackModel)
+			fallbackAdmitted, fallbackWait, fallbackTokens, _ := a.tryModelAdmission(ctx, fallbackModel, body, fallbackRuntime, profile)
+			if fallbackAdmitted || shouldSpillModelAdmission(primaryWait, fallbackWait) {
+				body, currentModel, m, overhead, strategy = applyFallbackModel(ctx, a, body, currentModel, profile, m, &meta)
+				meta.AdmissionSpillover = true
+				admitted = fallbackAdmitted
+				admissionTokens = fallbackTokens
+			}
+		}
+		if !admitted {
+			waited, tokens, waitErr := a.waitForModelAdmission(ctx, currentModel, body, m, profile)
+			meta.AdmissionWaitMS += waited.Milliseconds()
+			meta.AdmissionTokens = tokens
+			if waitErr != nil {
+				return nil, body, currentModel, meta, waitErr
+			}
+		} else {
+			meta.AdmissionTokens = admissionTokens
 		}
 		req, err := makeReq(body)
 		if err != nil {

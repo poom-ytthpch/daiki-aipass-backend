@@ -464,6 +464,9 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	w.Header().Set("x-daiki-retry-attempts", strconv.Itoa(max(0, recovery.Attempts-1)))
 	w.Header().Set("x-daiki-admission-wait-ms", strconv.FormatInt(recovery.AdmissionWaitMS, 10))
 	w.Header().Set("x-daiki-admission-tokens", strconv.Itoa(recovery.AdmissionTokens))
+	if recovery.AdmissionSpillover {
+		w.Header().Set("x-daiki-admission-spillover", "true")
+	}
 	if recovery.ContextTrimmed {
 		w.Header().Set("x-daiki-context-trimmed", "true")
 	}

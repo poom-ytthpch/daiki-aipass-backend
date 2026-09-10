@@ -256,3 +256,18 @@ func TestRuntimeTokenLimitUsesTighterInputOrTotalLimit(t *testing.T) {
 		t.Fatalf("got %d", got)
 	}
 }
+
+func TestShouldSpillModelAdmissionPrefersMeaningfulCapacityGain(t *testing.T) {
+	if shouldSpillModelAdmission(1500*time.Millisecond, 0) {
+		t.Fatal("short primary wait should stay on primary")
+	}
+	if !shouldSpillModelAdmission(3*time.Second, 0) {
+		t.Fatal("ready fallback should absorb a long primary wait")
+	}
+	if !shouldSpillModelAdmission(5*time.Second, 2*time.Second) {
+		t.Fatal("materially faster fallback should be selected")
+	}
+	if shouldSpillModelAdmission(3*time.Second, 2800*time.Millisecond) {
+		t.Fatal("minor wait difference should not churn models")
+	}
+}
