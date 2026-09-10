@@ -528,6 +528,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	body, commandSelection, err = applyAutomaticAttachmentSkills(body, attachments, commandSelection, false)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "unable to apply attachment skills"})
+		return
+	}
 	skills := selectSmartSkills(body)
 	// Hermes owns agent skills/tooling. Keep the legacy small-model instruction only
 	// for direct-LiteLLM compatibility mode; injecting it into Hermes both wastes
@@ -686,6 +691,9 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	}
 	if len(commandSelection.Skills) > 0 {
 		w.Header().Set("x-daiki-command-skills", strings.Join(commandSelection.Skills, ","))
+	}
+	if len(commandSelection.AutoSkills) > 0 {
+		w.Header().Set("x-daiki-auto-skills", strings.Join(commandSelection.AutoSkills, ","))
 	}
 	w.Header().Set("x-daiki-skills", strings.Join(skillIDs, ","))
 	if len(toolNames) > 0 {

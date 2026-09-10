@@ -113,3 +113,81 @@ func TestApplyChatCommandsLimitsSkillFanout(t *testing.T) {
 		t.Fatal("expected more than four selected skills to be rejected")
 	}
 }
+
+func TestAutomaticAttachmentSkillsMatchMediaTypes(t *testing.T) {
+	attachments := []expandedAttachment{
+		{Name: "photo.jpeg", MediaType: "image/jpeg", Kind: "image"},
+		{Name: "manual.pdf", MediaType: "application/pdf", Kind: "file"},
+		{Name: "stock.xlsx", MediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", Kind: "file"},
+		{Name: "events.csv", MediaType: "text/csv", Kind: "file"},
+	}
+	got := autoAttachmentSkills(attachments)
+	want := []string{"image", "pdf", "sheet", "csv"}
+	if len(got) != len(want) {
+		t.Fatalf("auto skills=%v want=%v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("auto skills=%v want=%v", got, want)
+		}
+	}
+}
+
+func TestApplyAutomaticAttachmentSkillsInjectsAndTracksSelection(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"system","content":"base"},{"role":"user","content":"what car is this?"}]}`)
+	prepared, selection, err := applyAutomaticAttachmentSkills(body, []expandedAttachment{{Name: "car.jpg", MediaType: "image/jpeg", Kind: "image"}}, chatCommandSelection{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selection.Skills) != 1 || selection.Skills[0] != "image" || len(selection.AutoSkills) != 1 || selection.AutoSkills[0] != "image" {
+		t.Fatalf("unexpected automatic selection: %#v", selection)
+	}
+	if !strings.Contains(string(prepared), "DAIKI AUTOMATIC ATTACHMENT SKILLS") || !strings.Contains(string(prepared), "SKILL IMAGE") {
+		t.Fatalf("automatic image instruction missing: %s", prepared)
+	}
+}
+
+func TestApplyAutomaticAttachmentSkillsDoesNotDuplicateExplicitSkill(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"review"}]}`)
+	selection := chatCommandSelection{Skills: []string{"pdf"}}
+	prepared, got, err := applyAutomaticAttachmentSkills(body, []expandedAttachment{{Name: "manual.pdf", MediaType: "application/pdf", Kind: "file"}}, selection, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Skills) != 1 || len(got.AutoSkills) != 0 {
+		t.Fatalf("explicit skill should not be duplicated: %#v", got)
+	}
+	if string(prepared) != string(body) {
+		t.Fatalf("body should remain unchanged when explicit skill already covers the attachment")
+	}
+}
+
+func TestAutomaticAttachmentSkillStillAppliesWhenExplicitSkillBudgetIsFull(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"review"}]}`)
+	selection := chatCommandSelection{Skills: []string{"code", "data", "summarize", "translate"}}
+	prepared, got, err := applyAutomaticAttachmentSkills(body, []expandedAttachment{{Name: "manual.pdf", MediaType: "application/pdf", Kind: "file"}}, selection, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Skills) != 4 {
+		t.Fatalf("explicit skill budget must remain capped: %#v", got)
+	}
+	if len(got.AutoSkills) != 1 || got.AutoSkills[0] != "pdf" {
+		t.Fatalf("attachment skill must still be applied out-of-band: %#v", got)
+	}
+	if !strings.Contains(string(prepared), "SKILL PDF") {
+		t.Fatalf("PDF attachment instruction missing: %s", prepared)
+	}
+	if !commandSelectionNeedsSkillsProfile(got) {
+		t.Fatal("automatic PDF skill must select the Hermes skills profile")
+	}
+}
+
+func TestAttachmentSkillsRequireHermesSkillsProfile(t *testing.T) {
+	if !commandSelectionNeedsSkillsProfile(chatCommandSelection{Skills: []string{"document"}}) {
+		t.Fatal("document attachment skill should require the Hermes skills profile")
+	}
+	if commandSelectionNeedsSkillsProfile(chatCommandSelection{Skills: []string{"translate"}}) {
+		t.Fatal("plain translate should not enable the Hermes skills profile")
+	}
+}

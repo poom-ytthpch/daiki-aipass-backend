@@ -155,6 +155,13 @@ func TestGuestGraftUsesRestrictedSkillsProfile(t *testing.T) {
 		t.Fatalf("guest graft must use isolated skills profile: %q %q", url, name)
 	}
 }
+func TestGuestVisionUsesNativeVisionProfile(t *testing.T) {
+	a := &app{cfg: config{HermesBase: "http://hermes:8642", HermesKey: "hermes", HermesEnabled: true}}
+	url, _, name := a.guestHermesUpstream("/v1/chat/completions", "vision")
+	if url != "http://hermes:8642/p/vision/v1/chat/completions" || name != "hermes-vision" {
+		t.Fatalf("guest image turns must use the native vision profile: %q %q", url, name)
+	}
+}
 func TestHermesFallbackDecision(t *testing.T) {
 	if !shouldFallbackFromHermes("hermes", true, 503, nil) {
 		t.Fatal("Hermes 5xx should fallback")
@@ -201,5 +208,57 @@ func TestGuestModelAliasUsesVisionForImageWorkload(t *testing.T) {
 	fast := inference.Route{ResolvedAlias: "fast", Workload: inference.WorkloadFast}
 	if got := guestModelAlias(fast); got != "fast" {
 		t.Fatalf("fast route alias = %q, want fast", got)
+	}
+}
+
+func TestGuestUnlimitedRateBypassesRedis(t *testing.T) {
+	a := &app{}
+	p := store.DefaultGuestAccessPolicy()
+	p.RequestsPerHour = 0
+	p.MinIntervalSeconds = 0
+	if retry, err := a.enforceGuestRate(context.Background(), "guest:test", p); err != nil || retry != 0 {
+		t.Fatalf("unlimited guest rate should not require redis: retry=%s err=%v", retry, err)
+	}
+}
+
+func TestGuestUnlimitedTokenQuotaHasNoRemainingCeiling(t *testing.T) {
+	a := &app{}
+	p := store.DefaultGuestAccessPolicy()
+	p.QuotaMode = "unlimited"
+	decision, policy, err := a.guestQuota(context.Background(), "guest:test", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Mode != "unlimited" || decision.Remaining != nil || policy.TokenLimit != nil {
+		t.Fatalf("unexpected unlimited guest quota: decision=%#v policy=%#v", decision, policy)
+	}
+}
+
+func TestRestrictGuestChatUsesConfiguredAttachmentCount(t *testing.T) {
+	p := store.DefaultGuestAccessPolicy()
+	p.MaxAttachmentsPerMessage = 2
+	_, err := restrictGuestChat([]byte(`{"messages":[{"role":"user","content":"review"}],"attachmentIds":["a","b","c"]}`), p)
+	if err == nil || !strings.Contains(err.Error(), "at most 2") {
+		t.Fatalf("expected configured guest attachment count error, got %v", err)
+	}
+	p.MaxAttachmentsPerMessage = 0
+	if _, err := restrictGuestChat([]byte(`{"messages":[{"role":"user","content":"review"}],"attachmentIds":["a","b","c"]}`), p); err != nil {
+		t.Fatalf("zero should remove admin count limit within platform maximum: %v", err)
+	}
+}
+
+func TestGuestUploadLimitSeparatesFileAndImage(t *testing.T) {
+	p := store.DefaultGuestAccessPolicy()
+	p.MaxUploadBytes = 8 << 20
+	p.MaxImageUploadBytes = 2 << 20
+	if got := guestUploadLimit(p, false); got != 8<<20 {
+		t.Fatalf("file limit=%d", got)
+	}
+	if got := guestUploadLimit(p, true); got != 2<<20 {
+		t.Fatalf("image limit=%d", got)
+	}
+	p.MaxImageUploadBytes = 0
+	if got := guestUploadLimit(p, true); got != maxInjectedImageBytes {
+		t.Fatalf("unlimited image policy should retain platform safety cap: %d", got)
 	}
 }

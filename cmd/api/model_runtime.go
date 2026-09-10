@@ -398,13 +398,6 @@ func (r *replayReadCloser) Close() error {
 	return nil
 }
 
-func responseLooksLikeRateLimitFailure(raw []byte) bool {
-	text := strings.ToLower(string(raw))
-	return strings.Contains(text, "http 429") &&
-		(strings.Contains(text, "ratelimit") || strings.Contains(text, "rate limit")) &&
-		(strings.Contains(text, "limit") || strings.Contains(text, "requested"))
-}
-
 func sseEventHasVisibleContent(raw []byte) bool {
 	var event map[string]any
 	if json.Unmarshal(raw, &event) != nil {

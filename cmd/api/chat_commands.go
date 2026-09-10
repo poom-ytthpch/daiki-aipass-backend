@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 )
 
@@ -17,8 +18,9 @@ type chatCommandOption struct {
 }
 
 type chatCommandSelection struct {
-	Mode   string   `json:"mode,omitempty"`
-	Skills []string `json:"skills,omitempty"`
+	Mode       string   `json:"mode,omitempty"`
+	Skills     []string `json:"skills,omitempty"`
+	AutoSkills []string `json:"autoSkills,omitempty"`
 }
 
 var chatCommandModes = []chatCommandOption{
@@ -30,16 +32,16 @@ var chatCommandModes = []chatCommandOption{
 }
 
 var chatCommandSkills = []chatCommandOption{
-	{ID: "pdf", Name: "PDF", Description: "Review and reason over attached PDF content with document-specific checks.", GuestAllowed: true, Instruction: "SKILL PDF: Treat attached PDF extraction as the primary evidence. Preserve headings, names, numbers and table-like structure where available. If the extraction cannot represent an image, scan, chart or layout detail, say so instead of inventing it."},
-	{ID: "sheet", Name: "Sheet", Description: "Analyze XLSX/XLSM/ODS workbooks, sheets, tables and formulas represented in attachments.", GuestAllowed: true, Instruction: "SKILL SHEET: Analyze spreadsheet content by sheet and columns. Check headers, units, totals, duplicates, missing values and row relationships. Do not invent formulas or cells that are not present in the extracted workbook context."},
-	{ID: "csv", Name: "CSV", Description: "Analyze CSV/TSV rows, columns, filters, joins, totals and anomalies.", GuestAllowed: true, Instruction: "SKILL CSV: Treat the attached delimited data as structured rows and columns. Verify headers and data types, preserve exact identifiers, check counts/totals when relevant, and call out malformed or missing values."},
-	{ID: "document", Name: "Document", Description: "Work with DOCX, PPTX and other extracted documents while preserving structure and facts.", GuestAllowed: true, Instruction: "SKILL DOCUMENT: Ground the answer in attached document content. Preserve important wording, names, dates, numbers, sections and decisions; distinguish document evidence from inference."},
+	{ID: "pdf", Name: "PDF", Description: "Review and reason over attached PDF content with document-specific checks.", GuestAllowed: true, Instruction: "SKILL PDF: When Hermes skill_view is available, load the installed daiki-document-analysis skill before analyzing the attachment. Treat attached PDF extraction as the primary evidence. Preserve headings, names, numbers and table-like structure where available. If the extraction cannot represent an image, scan, chart or layout detail, say so instead of inventing it."},
+	{ID: "sheet", Name: "Sheet", Description: "Analyze XLSX/XLSM/ODS workbooks, sheets, tables and formulas represented in attachments.", GuestAllowed: true, Instruction: "SKILL SHEET: When Hermes skill_view is available, load the installed daiki-document-analysis skill before analyzing the attachment. Analyze spreadsheet content by sheet and columns. Check headers, units, totals, duplicates, missing values and row relationships. Do not invent formulas or cells that are not present in the extracted workbook context."},
+	{ID: "csv", Name: "CSV", Description: "Analyze CSV/TSV rows, columns, filters, joins, totals and anomalies.", GuestAllowed: true, Instruction: "SKILL CSV: When Hermes skill_view is available, load the installed daiki-document-analysis skill before analyzing the attachment. Treat the attached delimited data as structured rows and columns. Verify headers and data types, preserve exact identifiers, check counts/totals when relevant, and call out malformed or missing values."},
+	{ID: "document", Name: "Document", Description: "Work with DOCX, PPTX and other extracted documents while preserving structure and facts.", GuestAllowed: true, Instruction: "SKILL DOCUMENT: When Hermes skill_view is available, load the installed daiki-document-analysis skill before analyzing the attachment. Ground the answer in attached document content. Preserve important wording, names, dates, numbers, sections and decisions; distinguish document evidence from inference."},
 	{ID: "data", Name: "Data", Description: "Perform careful data analysis across tables, JSON and numeric attachments.", GuestAllowed: true, Instruction: "SKILL DATA: Define the metric or comparison, check units and denominators, validate arithmetic, identify missing/inconsistent data, and separate observed values from inferred conclusions."},
 	{ID: "code", Name: "Code", Description: "Debug, explain and produce implementation-ready code with failure-mode checks.", GuestAllowed: true, Instruction: "SKILL CODE: Inspect constraints first, identify the smallest correct implementation, keep code runnable, mention meaningful failure modes, and never invent APIs or repository contents."},
 	{ID: "graft", Name: "Graft", Description: "Use Graft code-intelligence workflow for repository maps, symbol lookup, call traces and blast-radius analysis.", GuestAllowed: true, Instruction: "SKILL GRAFT: When the Hermes skills capability is available, call skill_view for the installed graft-code-intelligence skill before repository analysis, then follow its freshness -> map -> targeted retrieval -> blast-radius -> verification discipline. Never claim Graft commands or repository inspection ran unless an actual Graft-capable tool is available in this runtime."},
 	{ID: "summarize", Name: "Summarize", Description: "Extract facts, decisions, risks and next actions from long content.", GuestAllowed: true, Instruction: "SKILL SUMMARIZE: Preserve names, numbers, decisions and caveats. Separate facts from inference and prioritize decisions, risks and next actions over filler."},
 	{ID: "translate", Name: "Translate", Description: "Translate while preserving intent, terminology, numbers and formatting.", GuestAllowed: true, Instruction: "SKILL TRANSLATE: Preserve meaning, tone, terminology, numbers and formatting. Do not add facts or commentary unless the user asks for it."},
-	{ID: "image", Name: "Image", Description: "Inspect attached images using the vision route when available.", GuestAllowed: true, Instruction: "SKILL IMAGE: Analyze only what is actually visible or supplied from the image. Distinguish observation from inference and never claim to read text or details that are not legible."},
+	{ID: "image", Name: "Image", Description: "Inspect attached images using the vision route when available.", GuestAllowed: true, Instruction: "SKILL IMAGE: Use native image pixels when available. When Hermes skill_view is available, load the installed daiki-image-analysis skill first. Analyze only what is actually visible or supplied from the image. Distinguish observation from inference and never claim to read text or details that are not legible."},
 }
 
 func commandOptionsPublic(options []chatCommandOption, guest bool) []map[string]any {
@@ -157,4 +159,116 @@ func applyChatCommands(body []byte, guest bool) ([]byte, chatCommandSelection, e
 	}
 	out, err := json.Marshal(payload)
 	return out, selection, err
+}
+
+func attachmentCommandSkill(a expandedAttachment) string {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(a.MediaType, ";")[0]))
+	ext := strings.ToLower(filepath.Ext(a.Name))
+	if a.Kind == "image" || strings.HasPrefix(mediaType, "image/") {
+		return "image"
+	}
+	switch ext {
+	case ".pdf":
+		return "pdf"
+	case ".xlsx", ".xls", ".xlsm", ".ods":
+		return "sheet"
+	case ".csv", ".tsv":
+		return "csv"
+	case ".json", ".jsonl", ".ndjson":
+		return "data"
+	case ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".sql", ".sh", ".bash", ".zsh", ".graphql", ".gql":
+		return "code"
+	}
+	if mediaType == "application/pdf" {
+		return "pdf"
+	}
+	if strings.Contains(mediaType, "spreadsheet") || strings.Contains(mediaType, "excel") || strings.Contains(mediaType, "opendocument.spreadsheet") {
+		return "sheet"
+	}
+	if mediaType == "text/csv" || mediaType == "text/tab-separated-values" {
+		return "csv"
+	}
+	if strings.Contains(mediaType, "json") {
+		return "data"
+	}
+	return "document"
+}
+
+func autoAttachmentSkills(attachments []expandedAttachment) []string {
+	out := make([]string, 0, 4)
+	seen := map[string]bool{}
+	for _, attachment := range attachments {
+		id := attachmentCommandSkill(attachment)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		if len(out) == 4 {
+			break
+		}
+	}
+	return out
+}
+
+// applyAutomaticAttachmentSkills makes attachment handling capability-driven rather
+// than dependent on the user knowing about @image/@pdf/@sheet/etc. Explicit command
+// skills still win when the four-skill UI budget is already full; routing continues
+// to inspect the actual attachment payload independently.
+func applyAutomaticAttachmentSkills(body []byte, attachments []expandedAttachment, selection chatCommandSelection, guest bool) ([]byte, chatCommandSelection, error) {
+	if len(attachments) == 0 {
+		return body, selection, nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, selection, fmt.Errorf("invalid chat payload")
+	}
+	seen := map[string]bool{}
+	for _, id := range selection.Skills {
+		seen[id] = true
+	}
+	instructions := []string{}
+	for _, id := range autoAttachmentSkills(attachments) {
+		if seen[id] {
+			continue
+		}
+		option, found := findCommandOption(chatCommandSkills, id, guest)
+		if !found {
+			continue
+		}
+		seen[id] = true
+		selection.AutoSkills = append(selection.AutoSkills, id)
+		if len(selection.Skills) < 4 {
+			selection.Skills = append(selection.Skills, id)
+		}
+		instructions = append(instructions, option.Instruction)
+	}
+	if len(instructions) == 0 {
+		return body, selection, nil
+	}
+	autoInstruction := "DAIKI AUTOMATIC ATTACHMENT SKILLS (selected from the attached media type; apply them to this turn):\n" + strings.Join(instructions, "\n")
+	messages, _ := payload["messages"].([]any)
+	if len(messages) > 0 {
+		if first, ok := messages[0].(map[string]any); ok && strings.EqualFold(strings.TrimSpace(fmt.Sprint(first["role"])), "system") {
+			first["content"] = strings.TrimSpace(fmt.Sprint(first["content"])) + "\n\n" + autoInstruction
+			messages[0] = first
+		} else {
+			messages = append([]any{map[string]any{"role": "system", "content": autoInstruction}}, messages...)
+		}
+	} else {
+		messages = []any{map[string]any{"role": "system", "content": autoInstruction}}
+	}
+	payload["messages"] = messages
+	out, err := json.Marshal(payload)
+	return out, selection, err
+}
+
+func commandSelectionNeedsSkillsProfile(selection chatCommandSelection) bool {
+	for _, id := range append(append([]string{}, selection.Skills...), selection.AutoSkills...) {
+		switch id {
+		case "graft", "pdf", "sheet", "csv", "document", "image":
+			return true
+		}
+	}
+	return false
 }

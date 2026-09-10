@@ -43,6 +43,18 @@ func TestExplicitGraftCommandLoadsSkillsProfile(t *testing.T) {
 		t.Fatalf("explicit @graft must route to skills profile, got %q", got)
 	}
 }
+func TestAttachmentCommandsLoadSkillsProfile(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"review the attachment"}]}`)
+	for _, commands := range []chatCommandSelection{
+		{Skills: []string{"pdf"}},
+		{AutoSkills: []string{"sheet"}},
+		{AutoSkills: []string{"document"}},
+	} {
+		if got := chooseHermesProfile(body, researchMetadata{}, route(inference.WorkloadFast), selectSmartSkills(body), commands); got != "skills" {
+			t.Fatalf("attachment command %#v must route to skills profile, got %q", commands, got)
+		}
+	}
+}
 func TestHermesDomainTaskDoesNotLoadHeavySkillsCatalog(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"debug this Go code"}]}`)
 	if wantsHermesSkillProfile(body, selectSmartSkills(body)) {

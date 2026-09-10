@@ -114,7 +114,7 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 	if !a.cfg.HermesEnabled || a.cfg.HermesBase == "" {
 		a.releaseReservation(ctx, requestID, decision, reserved)
 		_ = a.store.FinishUsage(ctx, requestID, "failed", store.Usage{})
-		return nil, upstreamName, errors.New("Hermes unavailable")
+		return nil, upstreamName, errors.New("hermes unavailable")
 	}
 	makeReq := func(payload []byte) (*http.Request, error) {
 		req, buildErr := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, strings.NewReader(string(payload)))
@@ -145,7 +145,7 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 	if resp == nil || resp.Body == nil {
 		a.releaseReservation(ctx, requestID, decision, reserved)
 		_ = a.store.FinishUsage(context.Background(), requestID, "failed", store.Usage{})
-		return nil, upstreamName, errors.New("Hermes returned no response")
+		return nil, upstreamName, errors.New("hermes returned no response")
 	}
 	defer resp.Body.Close()
 	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 12<<20))
@@ -166,10 +166,10 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 		return nil, upstreamName, readErr
 	}
 	if resp.StatusCode >= 400 {
-		return responseBody, upstreamName, fmt.Errorf("Hermes returned status %d", resp.StatusCode)
+		return responseBody, upstreamName, fmt.Errorf("hermes returned status %d", resp.StatusCode)
 	}
 	if providerFailureStatus(responseBody) != 0 {
-		return responseBody, upstreamName, errors.New("Hermes generation provider failed")
+		return responseBody, upstreamName, errors.New("hermes generation provider failed")
 	}
 	return responseBody, upstreamName, nil
 }
