@@ -685,7 +685,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		req.Header.Set("x-daiki-request-id", requestID)
 		req.Header.Set("x-daiki-principal", currentPrincipal(r).AuthKind)
 		if upstreamName == "hermes" {
-			req.Header.Set("X-Hermes-Session-Id", requestID)
+			req.Header.Set("X-Hermes-Session-Id", newHermesSessionID())
 			baseKey := hermesSessionKey(r)
 			if baseKey != "" {
 				baseKey += ":p:" + hermesProfile
@@ -1206,6 +1206,17 @@ func apiKeyHash(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
 }
+func newHermesSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("api_%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b)
+	return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+}
+
 func newAPIKeySecret() (id, raw, prefix, hash string, err error) {
 	buf := make([]byte, 32)
 	if _, err = rand.Read(buf); err != nil {

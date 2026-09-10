@@ -457,3 +457,13 @@ func TestTokenEstimateRespectsLowerCompletionCap(t *testing.T) {
 		t.Fatalf("unexpected capped total %#v", e)
 	}
 }
+
+func TestNewHermesSessionIDIsUUIDLikeAndPathSafe(t *testing.T) {
+	id := newHermesSessionID()
+	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		t.Fatalf("unexpected Hermes session id format: %q", id)
+	}
+	if strings.ContainsAny(id, "/\\\r\n\x00") {
+		t.Fatalf("Hermes session id is path-unsafe: %q", id)
+	}
+}

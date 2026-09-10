@@ -390,7 +390,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		req.Header.Set("x-daiki-request-id", requestID)
 		req.Header.Set("x-daiki-principal", "guest")
 		if strings.HasPrefix(upstreamName, "hermes") {
-			req.Header.Set("X-Hermes-Session-Id", requestID)
+			req.Header.Set("X-Hermes-Session-Id", newHermesSessionID())
 			baseKey := "daiki-guest:" + strings.TrimPrefix(identity.Subject, "guest:") + ":" + identity.DeviceID
 			req.Header.Set("X-Hermes-Session-Key", hermesModelScopedSessionKey(baseKey, payload))
 		}
