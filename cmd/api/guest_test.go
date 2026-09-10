@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/inference"
 	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
 	"github.com/redis/go-redis/v9"
 )
@@ -155,5 +156,16 @@ func TestGuestSubjectUsesCanonicalNetworkIPAndIgnoresUserAgent(t *testing.T) {
 	}
 	if strings.Contains(guestSubject(r1), "203.0.113.42") {
 		t.Fatal("raw network IP must not be persisted in guest subject")
+	}
+}
+
+func TestGuestModelAliasUsesVisionForImageWorkload(t *testing.T) {
+	vision := inference.Route{ResolvedAlias: "vision", Workload: inference.WorkloadVision}
+	if got := guestModelAlias(vision); got != "vision" {
+		t.Fatalf("vision route alias = %q, want vision", got)
+	}
+	fast := inference.Route{ResolvedAlias: "fast", Workload: inference.WorkloadFast}
+	if got := guestModelAlias(fast); got != "fast" {
+		t.Fatalf("fast route alias = %q, want fast", got)
 	}
 }

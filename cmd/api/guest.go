@@ -186,7 +186,7 @@ func (a *app) enforceGuestRate(ctx context.Context, subject string, p store.Gues
 
 func (a *app) guestQuota(ctx context.Context, subject string, p store.GuestAccessPolicy) (quotaDecision, store.Policy, error) {
 	limit := p.TokenLimit
-	policy := store.Policy{ScopeType: "system", ScopeID: "guest", QuotaMode: "limited", TokenLimit: &limit, IntervalKind: p.IntervalKind, IntervalSeconds: p.IntervalSeconds, AllowedModels: json.RawMessage(`["fast"]`)}
+	policy := store.Policy{ScopeType: "system", ScopeID: "guest", QuotaMode: "limited", TokenLimit: &limit, IntervalKind: p.IntervalKind, IntervalSeconds: p.IntervalSeconds, AllowedModels: json.RawMessage(`["fast","vision"]`)}
 	start, reset := quotaWindow(policy, time.Now().UTC())
 	if lastReset, resetErr := a.store.GuestLastReset(ctx, subject); resetErr == nil && lastReset != nil && lastReset.After(start) {
 		start = *lastReset
@@ -284,6 +284,13 @@ func (a *app) guestChatStream(w http.ResponseWriter, r *http.Request) {
 	a.proxyGuestInference(w, r, true)
 }
 
+func guestModelAlias(route inference.Route) string {
+	if route.ResolvedAlias == "vision" || route.Workload == inference.WorkloadVision {
+		return "vision"
+	}
+	return "fast"
+}
+
 func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream bool) {
 	if a.store == nil || a.queue == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest chat unavailable"})
@@ -301,16 +308,8 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	identity := guestIdentityForRequest(r)
 	subject := identity.Subject
 	a.recordGuestIdentity(r.Context(), identity)
-	if retry, rateErr := a.enforceGuestRate(r.Context(), subject, p); rateErr != nil {
-		if retry > 0 {
-			seconds := max(1, int(retry.Seconds()))
-			w.Header().Set("Retry-After", strconv.Itoa(seconds))
-			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "guest_rate_limited", "retryAfterSeconds": seconds})
-		} else {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest_rate_limiter_unavailable"})
-		}
-		return
-	}
+	// Do not consume the guest cooldown until the payload, attachments and model route
+	// have all been validated. Invalid uploads/routes should never punish the next valid turn.
 	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
@@ -331,13 +330,26 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if alias, aliasErr := a.store.ModelAlias(r.Context(), "fast"); aliasErr == nil && alias.LiteLLMModelName != "" {
+	guestAlias := guestModelAlias(route)
+	// Guest text is Fast-only, while image understanding uses the dedicated Vision
+	// route. Both are still policy-controlled Guest capabilities and go through Hermes.
+	if alias, aliasErr := a.store.ModelAlias(r.Context(), guestAlias); aliasErr == nil && alias.LiteLLMModelName != "" {
 		var payload map[string]any
 		if json.Unmarshal(upstreamBody, &payload) == nil {
 			payload["model"] = alias.LiteLLMModelName
 			upstreamBody, _ = json.Marshal(payload)
 			route.PhysicalModel = alias.LiteLLMModelName
 		}
+	}
+	if retry, rateErr := a.enforceGuestRate(r.Context(), subject, p); rateErr != nil {
+		if retry > 0 {
+			seconds := max(1, int(retry.Seconds()))
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "guest_rate_limited", "retryAfterSeconds": seconds})
+		} else {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest_rate_limiter_unavailable"})
+		}
+		return
 	}
 	decision, _, err := a.guestQuota(r.Context(), subject, p)
 	if err != nil {
@@ -357,17 +369,17 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, status, map[string]any{"error": code, "quota": decision})
 		return
 	}
-	if err := a.store.StartUsageForPrincipal(r.Context(), requestID, subject, "", "fast", string(inference.WorkloadFast), reserved); err != nil {
+	if err := a.store.StartUsageForPrincipal(r.Context(), requestID, subject, "", guestAlias, string(route.Workload), reserved); err != nil {
 		a.releaseReservation(r.Context(), requestID, decision, reserved)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest usage ledger unavailable"})
 		return
 	}
 	_ = a.store.MergeUsageMetadata(r.Context(), requestID, map[string]any{
-		"authKind": "guest", "resolvedAlias": "fast", "physicalModel": route.PhysicalModel,
+		"authKind": "guest", "resolvedAlias": guestAlias, "physicalModel": route.PhysicalModel,
 		"guestNetworkId": identity.Subject, "guestDeviceId": identity.DeviceID, "guestDeviceName": identity.DeviceName,
 		"attachments": attachments,
 	})
-	ticket, err := a.queue.Acquire(r.Context(), requestID, subject, inference.WorkloadFast, route.Priority)
+	ticket, err := a.queue.Acquire(r.Context(), requestID, subject, route.Workload, route.Priority)
 	if err != nil {
 		a.releaseReservation(context.Background(), requestID, decision, reserved)
 		_ = a.store.FinishUsage(context.Background(), requestID, "failed", store.Usage{})
@@ -441,7 +453,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	}
 	defer resp.Body.Close()
 	w.Header().Set("x-daiki-access-mode", "guest-fast")
-	w.Header().Set("x-daiki-model-alias", "fast")
+	w.Header().Set("x-daiki-model-alias", guestAlias)
 	w.Header().Set("x-daiki-inference-upstream", upstreamName)
 	w.Header().Set("x-daiki-model-physical", route.PhysicalModel)
 	w.Header().Set("x-daiki-retry-attempts", strconv.Itoa(max(0, recovery.Attempts-1)))
