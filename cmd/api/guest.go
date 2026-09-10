@@ -261,9 +261,7 @@ func (a *app) inferenceUpstreamForRequest(r *http.Request, path string) (string,
 }
 func (a *app) guestHermesUpstream(path, profile string) (string, string, string) {
 	if a.cfg.HermesEnabled && a.cfg.HermesBase != "" {
-		switch profile {
-		case "guest-skills", "vision":
-		default:
+		if profile != "guest-skills" {
 			profile = "guest"
 		}
 		return strings.TrimRight(a.cfg.HermesBase, "/") + "/p/" + profile + path, a.cfg.HermesKey, "hermes-" + profile
@@ -390,11 +388,6 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	body, commandSelection, err = applyAutomaticAttachmentSkills(body, attachments, commandSelection, true)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unable to apply attachment skills"})
-		return
-	}
 	decision, _, err := a.guestQuota(r.Context(), subject, p)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest quota unavailable"})
@@ -483,9 +476,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		upstreamBody = ensureStreamUsage(upstreamBody)
 	}
 	guestProfile := "guest"
-	if route.Workload == inference.WorkloadVision {
-		guestProfile = "vision"
-	} else if commandSelectionNeedsSkillsProfile(commandSelection) {
+	if commandSelectionHasSkill(commandSelection, "graft") {
 		guestProfile = "guest-skills"
 	}
 	upstreamURL, upstreamKey, upstreamName := a.guestHermesUpstream("/v1/chat/completions", guestProfile)
@@ -506,7 +497,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		}
 		return req, nil
 	}
-	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, guestProfile, makeGuestRequest)
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, "guest", makeGuestRequest)
 	upstreamBody = recoveredBody
 	if recoveredModel != "" {
 		route.PhysicalModel = recoveredModel
@@ -551,9 +542,6 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	}
 	if len(commandSelection.Skills) > 0 {
 		w.Header().Set("x-daiki-command-skills", strings.Join(commandSelection.Skills, ","))
-	}
-	if len(commandSelection.AutoSkills) > 0 {
-		w.Header().Set("x-daiki-auto-skills", strings.Join(commandSelection.AutoSkills, ","))
 	}
 	if researchMeta.Used {
 		w.Header().Set("x-daiki-research-used", "true")
