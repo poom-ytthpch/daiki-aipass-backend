@@ -27,8 +27,10 @@ type chatRunIdentity struct {
 }
 
 type chatRunStartInput struct {
-	ResearchMode string `json:"researchMode"`
-	ThinkingMode string `json:"thinkingMode"`
+	ResearchMode  string   `json:"researchMode"`
+	ThinkingMode  string   `json:"thinkingMode"`
+	CommandMode   string   `json:"commandMode"`
+	CommandSkills []string `json:"commandSkills"`
 }
 
 func captureChatRunIdentity(r *http.Request) chatRunIdentity {
@@ -54,13 +56,22 @@ func (a *app) startChatRun(w http.ResponseWriter, r *http.Request) {
 		mode = "auto"
 	}
 	thinking := normalizeThinkingMode(in.ThinkingMode)
+	commandPayload, _ := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "user", "content": "command validation"}}, "commandMode": in.CommandMode, "commandSkills": in.CommandSkills})
+	_, commandSelection, commandErr := applyChatCommands(commandPayload, false)
+	if commandErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": commandErr.Error()})
+		return
+	}
+	if commandSelection.Mode == "deep-search" {
+		mode = "web"
+	}
 	token, err := randomURLToken(12)
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "unable to create chat run"})
 		return
 	}
-	initial, _ := json.Marshal(map[string]any{"phase": "queued", "research": map[string]any{"mode": mode}, "thinking": map[string]any{"mode": thinking}})
-	run, err := a.store.CreateChatRun(r.Context(), store.ChatRun{ID: "run_" + token, SessionID: sessionID, OwnerSubject: current(r).Sub, ResearchMode: mode, ThinkingMode: thinking, Activity: initial})
+	initial, _ := json.Marshal(map[string]any{"phase": "queued", "research": map[string]any{"mode": mode}, "thinking": map[string]any{"mode": thinking}, "commands": commandSelection})
+	run, err := a.store.CreateChatRun(r.Context(), store.ChatRun{ID: "run_" + token, SessionID: sessionID, OwnerSubject: current(r).Sub, ResearchMode: mode, ThinkingMode: thinking, CommandMode: commandSelection.Mode, CommandSkills: commandSelection.Skills, Activity: initial})
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			writeJSON(w, 404, map[string]string{"error": "chat not found"})
@@ -194,8 +205,8 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 		_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"attachmentContextInherited": true})
 	}
 	profile := thinkingProfileFor(run.ThinkingMode)
-	_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"research": map[string]any{"mode": run.ResearchMode, "query": clipText(lastUserText, 500)}, "thinking": map[string]any{"mode": run.ThinkingMode, "reasoningBudget": profile.ReasoningBudget}})
-	payload := map[string]any{"model": session.ModelAlias, "researchMode": run.ResearchMode, "thinkingMode": run.ThinkingMode, "messages": payloadMessages, "attachmentIds": attachmentIDs, "stream": false}
+	_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"research": map[string]any{"mode": run.ResearchMode, "query": clipText(lastUserText, 500)}, "thinking": map[string]any{"mode": run.ThinkingMode, "reasoningBudget": profile.ReasoningBudget}, "commands": map[string]any{"mode": run.CommandMode, "skills": run.CommandSkills}})
+	payload := map[string]any{"model": session.ModelAlias, "researchMode": run.ResearchMode, "thinkingMode": run.ThinkingMode, "commandMode": run.CommandMode, "commandSkills": run.CommandSkills, "messages": payloadMessages, "attachmentIds": attachmentIDs, "stream": false}
 	invoke := func(body []byte) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat", bytes.NewReader(body)).WithContext(ctx)
 		req.Header.Set("x-daiki-chat-run-id", run.ID)
@@ -318,7 +329,7 @@ func safeRunResearchActivity(meta researchMetadata) map[string]any {
 	}
 	if len(meta.Sources) > 0 {
 		sources := make([]map[string]any, 0, min(len(meta.Sources), 8))
-		for _, source := range meta.Sources {
+		for _, source := range meta.Sources[:min(len(meta.Sources), 8)] {
 			sources = append(sources, map[string]any{
 				"index": source.Index, "title": source.Title, "url": source.URL, "engine": source.Engine,
 				"snippet": clipText(strings.TrimSpace(source.Snippet), 280),

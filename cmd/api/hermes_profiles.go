@@ -53,7 +53,16 @@ func applyHermesSessionScope(req *http.Request, baseKey string, payload []byte) 
 	}
 }
 
-func chooseHermesProfile(body []byte, research researchMetadata, route inference.Route, selected []smartSkill) string {
+func commandSelectionHasSkill(selection chatCommandSelection, want string) bool {
+	for _, skill := range selection.Skills {
+		if strings.EqualFold(strings.TrimSpace(skill), want) {
+			return true
+		}
+	}
+	return false
+}
+
+func chooseHermesProfile(body []byte, research researchMetadata, route inference.Route, selected []smartSkill, commands chatCommandSelection) string {
 	// Vision must win over research. The research profile is intentionally text-only;
 	// routing an image turn there makes Hermes pre-analyze data URLs through its sandbox
 	// fallback instead of passing pixels natively to the vision-capable model. Web
@@ -67,6 +76,9 @@ func chooseHermesProfile(body []byte, research researchMetadata, route inference
 	}
 	if wantsHermesAgentProfile(body) {
 		return "agent"
+	}
+	if commandSelectionHasSkill(commands, "graft") {
+		return "skills"
 	}
 	if wantsHermesSkillProfile(body, selected) {
 		return "skills"

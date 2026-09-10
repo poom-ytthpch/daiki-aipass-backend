@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -124,7 +125,7 @@ func (a *app) recordGuestIdentity(ctx context.Context, id guestIdentity) {
 	}
 }
 
-const guestContinuitySystemPrompt = `You are Daiki in Guest mode. Use the conversation messages supplied in this request as authoritative context. Resolve short follow-ups, pronouns, and references from the immediately preceding user/assistant turns instead of asking what topic the user means when the topic is already present. Do not claim memory beyond the supplied messages. Guest mode has no general tools or skills; answer only from supplied text and attachments.`
+const guestContinuitySystemPrompt = `You are Daiki in Guest mode. Use the conversation messages supplied in this request as authoritative context. Resolve short follow-ups, pronouns, and references from the immediately preceding user/assistant turns instead of asking what topic the user means when the topic is already present. Do not claim memory beyond the supplied messages. Guest mode has no unrestricted agent tools. Only Daiki-owned, server-whitelisted command modes/skills and supplied attachment/web evidence may be used for this request.`
 
 func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 	var payload map[string]any
@@ -158,10 +159,17 @@ func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 	clean := map[string]any{
 		"model":                 "fast",
 		"messages":              messages,
+		"researchMode":          "off",
 		"max_completion_tokens": p.MaxCompletionTokens,
 	}
 	if stream, ok := payload["stream"].(bool); ok {
 		clean["stream"] = stream
+	}
+	if commandMode, ok := payload["commandMode"].(string); ok && strings.TrimSpace(commandMode) != "" {
+		clean["commandMode"] = commandMode
+	}
+	if commandSkills, ok := payload["commandSkills"].([]any); ok {
+		clean["commandSkills"] = commandSkills
 	}
 	if ids, ok := payload["attachmentIds"].([]any); ok {
 		if len(ids) > 10 {
@@ -237,9 +245,12 @@ func (a *app) inferenceUpstreamForRequest(r *http.Request, path string) (string,
 	// Compatibility helper: authenticated chat defaults to the slim user profile.
 	return a.authenticatedHermesUpstream(path, "user")
 }
-func (a *app) guestHermesUpstream(path string) (string, string, string) {
+func (a *app) guestHermesUpstream(path, profile string) (string, string, string) {
 	if a.cfg.HermesEnabled && a.cfg.HermesBase != "" {
-		return strings.TrimRight(a.cfg.HermesBase, "/") + "/p/guest" + path, a.cfg.HermesKey, "hermes-guest"
+		if profile != "guest-skills" {
+			profile = "guest"
+		}
+		return strings.TrimRight(a.cfg.HermesBase, "/") + "/p/" + profile + path, a.cfg.HermesKey, "hermes-" + profile
 	}
 	return a.liteLLMUpstream(path)
 }
@@ -290,6 +301,32 @@ func (a *app) guestChatStream(w http.ResponseWriter, r *http.Request) {
 	a.proxyGuestInference(w, r, true)
 }
 
+func guestResearchSourcesHeader(meta researchMetadata) string {
+	if len(meta.Sources) == 0 {
+		return ""
+	}
+	limit := len(meta.Sources)
+	if limit > 4 {
+		limit = 4
+	}
+	for limit > 0 {
+		rows := make([]map[string]any, 0, limit)
+		for _, source := range meta.Sources[:limit] {
+			rows = append(rows, map[string]any{"index": source.Index, "title": clipText(source.Title, 180), "url": source.URL, "engine": source.Engine})
+		}
+		raw, err := json.Marshal(rows)
+		if err != nil {
+			return ""
+		}
+		encoded := base64.StdEncoding.EncodeToString(raw)
+		if len(encoded) <= 6000 {
+			return encoded
+		}
+		limit--
+	}
+	return ""
+}
+
 func guestModelAlias(route inference.Route) string {
 	if route.ResolvedAlias == "vision" || route.Workload == inference.WorkloadVision {
 		return "vision"
@@ -314,8 +351,9 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	identity := guestIdentityForRequest(r)
 	subject := identity.Subject
 	a.recordGuestIdentity(r.Context(), identity)
-	// Do not consume the guest cooldown until the payload, attachments and model route
-	// have all been validated. Invalid uploads/routes should never punish the next valid turn.
+	// Parse and validate the user-controlled payload and attachments before consuming
+	// Guest admission. Research is deliberately performed only after quota/rate checks
+	// so /deep-search cannot become an unmetered public-web resource bypass.
 	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
@@ -326,14 +364,43 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	body, responseLanguage, err := applyResponseLanguage(body)
+	body, commandSelection, err := applyChatCommands(body, true)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unable to apply response language"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	body, attachments, err := a.expandGuestChatAttachments(r.Context(), identity, body, p)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	decision, _, err := a.guestQuota(r.Context(), subject, p)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest quota unavailable"})
+		return
+	}
+	if decision.Remaining != nil && *decision.Remaining <= 0 {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "guest_quota_exhausted", "quota": decision})
+		return
+	}
+	if retry, rateErr := a.enforceGuestRate(r.Context(), subject, p); rateErr != nil {
+		if retry > 0 {
+			seconds := max(1, int(retry.Seconds()))
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "guest_rate_limited", "retryAfterSeconds": seconds})
+		} else {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest_rate_limiter_unavailable"})
+		}
+		return
+	}
+	body, researchMeta, researchErr := a.enrichChatWithResearch(r.Context(), body)
+	if researchErr != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": researchErr.Error(), "research": researchMeta})
+		return
+	}
+	body, responseLanguage, err := applyResponseLanguage(body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unable to apply response language"})
 		return
 	}
 	route, upstreamBody, err := a.router.RouteChat(body)
@@ -351,21 +418,6 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 			upstreamBody, _ = json.Marshal(payload)
 			route.PhysicalModel = alias.LiteLLMModelName
 		}
-	}
-	if retry, rateErr := a.enforceGuestRate(r.Context(), subject, p); rateErr != nil {
-		if retry > 0 {
-			seconds := max(1, int(retry.Seconds()))
-			w.Header().Set("Retry-After", strconv.Itoa(seconds))
-			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "guest_rate_limited", "retryAfterSeconds": seconds})
-		} else {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest_rate_limiter_unavailable"})
-		}
-		return
-	}
-	decision, _, err := a.guestQuota(r.Context(), subject, p)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest quota unavailable"})
-		return
 	}
 	reserved := reservationTokens(body)
 	requestID := middleware.GetReqID(r.Context())
@@ -388,7 +440,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	guestMeta := map[string]any{
 		"authKind": "guest", "resolvedAlias": guestAlias, "physicalModel": route.PhysicalModel,
 		"guestNetworkId": identity.Subject, "guestDeviceId": identity.DeviceID, "guestDeviceName": identity.DeviceName,
-		"attachments": attachments,
+		"attachments": attachments, "commands": commandSelection, "research": safeRunResearchActivity(researchMeta),
 	}
 	if responseLanguage.Code != "" {
 		guestMeta["responseLanguage"] = responseLanguage
@@ -409,7 +461,11 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	if stream {
 		upstreamBody = ensureStreamUsage(upstreamBody)
 	}
-	upstreamURL, upstreamKey, upstreamName := a.guestHermesUpstream("/v1/chat/completions")
+	guestProfile := "guest"
+	if commandSelectionHasSkill(commandSelection, "graft") {
+		guestProfile = "guest-skills"
+	}
+	upstreamURL, upstreamKey, upstreamName := a.guestHermesUpstream("/v1/chat/completions", guestProfile)
 	makeGuestRequest := func(payload []byte) (*http.Request, error) {
 		req, buildErr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, strings.NewReader(string(payload)))
 		if buildErr != nil {
@@ -467,11 +523,29 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	}
 	defer resp.Body.Close()
 	w.Header().Set("x-daiki-access-mode", "guest-fast")
+	if commandSelection.Mode != "" {
+		w.Header().Set("x-daiki-command-mode", commandSelection.Mode)
+	}
+	if len(commandSelection.Skills) > 0 {
+		w.Header().Set("x-daiki-command-skills", strings.Join(commandSelection.Skills, ","))
+	}
+	if researchMeta.Used {
+		w.Header().Set("x-daiki-research-used", "true")
+		w.Header().Set("x-daiki-research-sources", strconv.Itoa(len(researchMeta.Sources)))
+		if encodedSources := guestResearchSourcesHeader(researchMeta); encodedSources != "" {
+			w.Header().Set("x-daiki-research-sources-json", encodedSources)
+		}
+	} else {
+		w.Header().Set("x-daiki-research-used", "false")
+		w.Header().Set("x-daiki-research-sources", "0")
+	}
+	w.Header().Set("x-daiki-research-mode", researchMeta.Mode)
 	w.Header().Set("x-daiki-model-alias", guestAlias)
 	if responseLanguage.Code != "" {
 		w.Header().Set("x-daiki-response-language", responseLanguage.Code)
 	}
 	w.Header().Set("x-daiki-inference-upstream", upstreamName)
+	w.Header().Set("x-daiki-hermes-profile", guestProfile)
 	w.Header().Set("x-daiki-model-physical", route.PhysicalModel)
 	w.Header().Set("x-daiki-retry-attempts", strconv.Itoa(max(0, recovery.Attempts-1)))
 	w.Header().Set("x-daiki-admission-wait-ms", strconv.FormatInt(recovery.AdmissionWaitMS, 10))

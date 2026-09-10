@@ -32,7 +32,10 @@ func TestRestrictGuestChatForcesFastAndStripsCapabilities(t *testing.T) {
 	if payload["max_completion_tokens"] != float64(321) {
 		t.Fatalf("unexpected output cap: %#v", payload)
 	}
-	for _, key := range []string{"max_tokens", "researchMode", "thinkingMode", "research", "web_search", "tools", "tool_choice", "attachments"} {
+	if payload["researchMode"] != "off" {
+		t.Fatalf("guest research must default off unless a whitelisted command enables it: %#v", payload)
+	}
+	for _, key := range []string{"max_tokens", "thinkingMode", "research", "web_search", "tools", "tool_choice", "attachments"} {
 		if _, exists := payload[key]; exists {
 			t.Fatalf("guest payload must strip %s: %#v", key, payload)
 		}
@@ -140,9 +143,16 @@ func TestAllAuthenticatedInferenceUsesHermes(t *testing.T) {
 }
 func TestGuestUsesRestrictedHermesProfile(t *testing.T) {
 	a := &app{cfg: config{LiteLLMBase: "http://litellm:4000", LiteLLMKey: "lite", HermesBase: "http://hermes:8642", HermesKey: "hermes", HermesEnabled: true}}
-	url, key, name := a.guestHermesUpstream("/v1/chat/completions")
+	url, key, name := a.guestHermesUpstream("/v1/chat/completions", "guest")
 	if url != "http://hermes:8642/p/guest/v1/chat/completions" || key != "hermes" || name != "hermes-guest" {
 		t.Fatalf("guest must use restricted Hermes profile: %q %q %q", url, key, name)
+	}
+}
+func TestGuestGraftUsesRestrictedSkillsProfile(t *testing.T) {
+	a := &app{cfg: config{HermesBase: "http://hermes:8642", HermesKey: "hermes", HermesEnabled: true}}
+	url, _, name := a.guestHermesUpstream("/v1/chat/completions", "guest-skills")
+	if url != "http://hermes:8642/p/guest-skills/v1/chat/completions" || name != "hermes-guest-skills" {
+		t.Fatalf("guest graft must use isolated skills profile: %q %q", url, name)
 	}
 }
 func TestHermesFallbackDecision(t *testing.T) {

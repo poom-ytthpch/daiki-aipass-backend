@@ -10,32 +10,37 @@ import (
 )
 
 type ChatRun struct {
-	ID           string          `json:"id"`
-	SessionID    string          `json:"sessionId"`
-	OwnerSubject string          `json:"-"`
-	Status       string          `json:"status"`
-	ResearchMode string          `json:"researchMode"`
-	ThinkingMode string          `json:"thinkingMode"`
-	RequestID    string          `json:"requestId,omitempty"`
-	Content      string          `json:"content"`
-	Error        string          `json:"error,omitempty"`
-	Activity     json.RawMessage `json:"activity"`
-	CreatedAt    time.Time       `json:"createdAt"`
-	StartedAt    *time.Time      `json:"startedAt,omitempty"`
-	CompletedAt  *time.Time      `json:"completedAt,omitempty"`
-	UpdatedAt    time.Time       `json:"updatedAt"`
+	ID            string          `json:"id"`
+	SessionID     string          `json:"sessionId"`
+	OwnerSubject  string          `json:"-"`
+	Status        string          `json:"status"`
+	ResearchMode  string          `json:"researchMode"`
+	ThinkingMode  string          `json:"thinkingMode"`
+	CommandMode   string          `json:"commandMode,omitempty"`
+	CommandSkills []string        `json:"commandSkills,omitempty"`
+	RequestID     string          `json:"requestId,omitempty"`
+	Content       string          `json:"content"`
+	Error         string          `json:"error,omitempty"`
+	Activity      json.RawMessage `json:"activity"`
+	CreatedAt     time.Time       `json:"createdAt"`
+	StartedAt     *time.Time      `json:"startedAt,omitempty"`
+	CompletedAt   *time.Time      `json:"completedAt,omitempty"`
+	UpdatedAt     time.Time       `json:"updatedAt"`
 }
 
 func scanChatRun(row pgx.Row) (ChatRun, error) {
 	var x ChatRun
-	err := row.Scan(&x.ID, &x.SessionID, &x.OwnerSubject, &x.Status, &x.ResearchMode, &x.ThinkingMode, &x.RequestID, &x.Content, &x.Error, &x.Activity, &x.CreatedAt, &x.StartedAt, &x.CompletedAt, &x.UpdatedAt)
+	err := row.Scan(&x.ID, &x.SessionID, &x.OwnerSubject, &x.Status, &x.ResearchMode, &x.ThinkingMode, &x.CommandMode, &x.CommandSkills, &x.RequestID, &x.Content, &x.Error, &x.Activity, &x.CreatedAt, &x.StartedAt, &x.CompletedAt, &x.UpdatedAt)
 	return x, err
 }
 
-const chatRunCols = `id,session_id,owner_subject,status,research_mode,thinking_mode,request_id,content,error,activity,created_at,started_at,completed_at,updated_at`
+const chatRunCols = `id,session_id,owner_subject,status,research_mode,thinking_mode,command_mode,command_skills,request_id,content,error,activity,created_at,started_at,completed_at,updated_at`
 
 func (s *Store) CreateChatRun(ctx context.Context, x ChatRun) (ChatRun, error) {
-	return scanChatRun(s.DB.QueryRow(ctx, `INSERT INTO chat_runs(id,session_id,owner_subject,status,research_mode,thinking_mode,activity) SELECT $1,s.id,s.owner_subject,'queued',$3,$4,$5 FROM chat_sessions s WHERE s.id=$2 AND s.owner_subject=$6 RETURNING `+chatRunCols, x.ID, x.SessionID, x.ResearchMode, x.ThinkingMode, x.Activity, x.OwnerSubject))
+	if x.CommandSkills == nil {
+		x.CommandSkills = []string{}
+	}
+	return scanChatRun(s.DB.QueryRow(ctx, `INSERT INTO chat_runs(id,session_id,owner_subject,status,research_mode,thinking_mode,command_mode,command_skills,activity) SELECT $1,s.id,s.owner_subject,'queued',$3,$4,$5,$6,$7 FROM chat_sessions s WHERE s.id=$2 AND s.owner_subject=$8 RETURNING `+chatRunCols, x.ID, x.SessionID, x.ResearchMode, x.ThinkingMode, x.CommandMode, x.CommandSkills, x.Activity, x.OwnerSubject))
 }
 func (s *Store) ChatRun(ctx context.Context, owner, id string) (ChatRun, error) {
 	return scanChatRun(s.DB.QueryRow(ctx, `SELECT `+chatRunCols+` FROM chat_runs WHERE id=$1 AND owner_subject=$2`, id, owner))
@@ -54,7 +59,7 @@ func (s *Store) SetChatRunStatus(ctx context.Context, owner, id, status string) 
 }
 
 func (s *Store) ResetChatRun(ctx context.Context, owner, id string) (ChatRun, error) {
-	return scanChatRun(s.DB.QueryRow(ctx, `UPDATE chat_runs SET status='queued',request_id='',content='',error='',completed_at=NULL,activity=jsonb_build_object('phase','queued','research',jsonb_build_object('mode',research_mode),'thinking',jsonb_build_object('mode',thinking_mode)),updated_at=now() WHERE id=$1 AND owner_subject=$2 RETURNING `+chatRunCols, id, owner))
+	return scanChatRun(s.DB.QueryRow(ctx, `UPDATE chat_runs SET status='queued',request_id='',content='',error='',completed_at=NULL,activity=jsonb_build_object('phase','queued','research',jsonb_build_object('mode',research_mode),'thinking',jsonb_build_object('mode',thinking_mode),'commands',jsonb_build_object('mode',command_mode,'skills',command_skills)),updated_at=now() WHERE id=$1 AND owner_subject=$2 RETURNING `+chatRunCols, id, owner))
 }
 func (s *Store) ChatRuns(ctx context.Context, owner, sessionID string) ([]ChatRun, error) {
 	rows, err := s.DB.Query(ctx, `SELECT `+chatRunCols+` FROM chat_runs WHERE session_id=$1 AND owner_subject=$2 ORDER BY created_at ASC LIMIT 200`, sessionID, owner)

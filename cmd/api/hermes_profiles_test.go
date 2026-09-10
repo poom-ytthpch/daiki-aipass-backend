@@ -28,7 +28,7 @@ func TestChooseHermesProfile(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			body := []byte(tc.body)
-			got := chooseHermesProfile(body, tc.research, route(tc.workload), selectSmartSkills(body))
+			got := chooseHermesProfile(body, tc.research, route(tc.workload), selectSmartSkills(body), chatCommandSelection{})
 			if got != tc.want {
 				t.Fatalf("got %q want %q", got, tc.want)
 			}
@@ -36,6 +36,13 @@ func TestChooseHermesProfile(t *testing.T) {
 	}
 }
 
+func TestExplicitGraftCommandLoadsSkillsProfile(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"inspect this repository"}]}`)
+	commands := chatCommandSelection{Skills: []string{"graft"}}
+	if got := chooseHermesProfile(body, researchMetadata{}, route(inference.WorkloadFast), selectSmartSkills(body), commands); got != "skills" {
+		t.Fatalf("explicit @graft must route to skills profile, got %q", got)
+	}
+}
 func TestHermesDomainTaskDoesNotLoadHeavySkillsCatalog(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"debug this Go code"}]}`)
 	if wantsHermesSkillProfile(body, selectSmartSkills(body)) {

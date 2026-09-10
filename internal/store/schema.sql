@@ -340,6 +340,8 @@ CREATE TABLE IF NOT EXISTS chat_runs (
     status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','paused','completed','failed','cancelled')),
     research_mode TEXT NOT NULL DEFAULT 'auto',
     thinking_mode TEXT NOT NULL DEFAULT 'medium',
+    command_mode TEXT NOT NULL DEFAULT '',
+    command_skills TEXT[] NOT NULL DEFAULT '{}',
     request_id TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
@@ -349,6 +351,8 @@ CREATE TABLE IF NOT EXISTS chat_runs (
     completed_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE chat_runs ADD COLUMN IF NOT EXISTS command_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE chat_runs ADD COLUMN IF NOT EXISTS command_skills TEXT[] NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS chat_runs_session_created_idx ON chat_runs(session_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS chat_runs_owner_status_idx ON chat_runs(owner_subject,status,updated_at DESC);
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS run_id TEXT;

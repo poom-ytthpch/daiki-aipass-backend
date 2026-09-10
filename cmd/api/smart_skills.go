@@ -175,5 +175,5 @@ func (a *app) smartCapabilities(w http.ResponseWriter, r *http.Request) {
 		{"id": "attachment_search", "name": "Attachment Search", "description": "Search uploaded text/code/data by name, path or content."},
 		{"id": "attachment_read", "name": "Attachment Read", "description": "Read extracted content from a selected uploaded file."},
 	}
-	writeJSON(w, 200, map[string]any{"mode": "small-model-v1", "maxToolRounds": 2, "skills": skills, "tools": tools})
+	writeJSON(w, 200, map[string]any{"mode": "small-model-v1", "maxToolRounds": 2, "skills": skills, "tools": tools, "commands": chatCommandCatalog(false)})
 }

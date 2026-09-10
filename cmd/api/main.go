@@ -190,6 +190,7 @@ func main() {
 		r.Post("/auth/password-reset", a.passwordReset)
 		r.Post("/auth/password-reset/confirm", a.passwordResetConfirm)
 		r.Get("/guest/policy", a.guestPolicyPublic)
+		r.Get("/guest/capabilities", a.guestCapabilities)
 		r.Post("/guest/chat", a.guestChat)
 		r.Post("/guest/chat/stream", a.guestChatStream)
 		r.Get("/guest/attachments", a.guestListAttachments)
@@ -473,6 +474,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, 400, map[string]string{"error": "invalid body"})
 		return
 	}
+	body, commandSelection, err := applyChatCommands(body, false)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	body, researchMeta, researchErr := a.enrichChatWithResearch(r.Context(), body)
 	if researchErr == nil {
 		body, responseLanguage, err = applyResponseLanguage(body)
@@ -610,6 +616,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	requestMeta["physicalModel"] = route.PhysicalModel
 	requestMeta["workload"] = string(route.Workload)
 	requestMeta["research"] = researchMeta
+	requestMeta["commands"] = commandSelection
 	if responseLanguage.Code != "" {
 		requestMeta["responseLanguage"] = responseLanguage
 	}
@@ -674,6 +681,12 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		w.Header().Set("x-daiki-research-mode", researchMeta.Mode)
 	}
 	w.Header().Set("x-daiki-model-alias", route.Alias)
+	if commandSelection.Mode != "" {
+		w.Header().Set("x-daiki-command-mode", commandSelection.Mode)
+	}
+	if len(commandSelection.Skills) > 0 {
+		w.Header().Set("x-daiki-command-skills", strings.Join(commandSelection.Skills, ","))
+	}
 	w.Header().Set("x-daiki-skills", strings.Join(skillIDs, ","))
 	if len(toolNames) > 0 {
 		w.Header().Set("x-daiki-tools", strings.Join(toolNames, ","))
@@ -688,7 +701,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	w.Header().Set("x-daiki-token-estimate-output", fmt.Sprint(tokenEstimate.VisibleBudget))
 	w.Header().Set("x-daiki-token-estimate-total", fmt.Sprint(tokenEstimate.TotalBudget))
 	w.Header().Set("x-daiki-queue-wait-ms", fmt.Sprint(ticket.AcquiredAt.Sub(ticket.EnqueuedAt).Milliseconds()))
-	hermesProfile := chooseHermesProfile(upstreamBody, researchMeta, route, skills)
+	hermesProfile := chooseHermesProfile(upstreamBody, researchMeta, route, skills, commandSelection)
 	upstreamURL, upstreamKey, upstreamName := a.authenticatedHermesUpstream(path, hermesProfile)
 	w.Header().Set("x-daiki-hermes-profile", hermesProfile)
 	makeUpstreamRequest := func(payload []byte) (*http.Request, error) {
