@@ -326,6 +326,11 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	body, responseLanguage, err := applyResponseLanguage(body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unable to apply response language"})
+		return
+	}
 	body, attachments, err := a.expandGuestChatAttachments(r.Context(), identity, body, p)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -380,11 +385,15 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest usage ledger unavailable"})
 		return
 	}
-	_ = a.store.MergeUsageMetadata(r.Context(), requestID, map[string]any{
+	guestMeta := map[string]any{
 		"authKind": "guest", "resolvedAlias": guestAlias, "physicalModel": route.PhysicalModel,
 		"guestNetworkId": identity.Subject, "guestDeviceId": identity.DeviceID, "guestDeviceName": identity.DeviceName,
 		"attachments": attachments,
-	})
+	}
+	if responseLanguage.Code != "" {
+		guestMeta["responseLanguage"] = responseLanguage
+	}
+	_ = a.store.MergeUsageMetadata(r.Context(), requestID, guestMeta)
 	ticket, err := a.queue.Acquire(r.Context(), requestID, subject, route.Workload, route.Priority)
 	if err != nil {
 		a.releaseReservation(context.Background(), requestID, decision, reserved)
@@ -459,6 +468,9 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	defer resp.Body.Close()
 	w.Header().Set("x-daiki-access-mode", "guest-fast")
 	w.Header().Set("x-daiki-model-alias", guestAlias)
+	if responseLanguage.Code != "" {
+		w.Header().Set("x-daiki-response-language", responseLanguage.Code)
+	}
 	w.Header().Set("x-daiki-inference-upstream", upstreamName)
 	w.Header().Set("x-daiki-model-physical", route.PhysicalModel)
 	w.Header().Set("x-daiki-retry-attempts", strconv.Itoa(max(0, recovery.Attempts-1)))

@@ -468,11 +468,21 @@ func first(v ...string) string {
 
 func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, stream bool) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	responseLanguage := responseLanguagePreference{}
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid body"})
 		return
 	}
 	body, researchMeta, researchErr := a.enrichChatWithResearch(r.Context(), body)
+	if researchErr == nil {
+		body, responseLanguage, err = applyResponseLanguage(body)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "unable to apply response language"})
+			return
+		}
+	} else {
+		responseLanguage = responseLanguagePreference{}
+	}
 	chatRunID := strings.TrimSpace(r.Header.Get("x-daiki-chat-run-id"))
 	if chatRunID != "" && a.store != nil {
 		_ = a.store.UpdateChatRunActivity(context.Background(), chatRunID, map[string]any{
@@ -600,6 +610,9 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	requestMeta["physicalModel"] = route.PhysicalModel
 	requestMeta["workload"] = string(route.Workload)
 	requestMeta["research"] = researchMeta
+	if responseLanguage.Code != "" {
+		requestMeta["responseLanguage"] = responseLanguage
+	}
 	requestMeta["thinking"] = map[string]any{"mode": thinkingProfile.Mode, "reasoningBudget": thinkingProfile.ReasoningBudget, "maxCompletionTokens": thinkingProfile.MaxCompletionTokens, "estimate": tokenEstimate}
 	_ = a.store.MergeUsageMetadata(r.Context(), requestID, requestMeta)
 	principalID := "user:" + c.Sub
@@ -666,6 +679,9 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		w.Header().Set("x-daiki-tools", strings.Join(toolNames, ","))
 	}
 	w.Header().Set("x-daiki-workload", string(route.Workload))
+	if responseLanguage.Code != "" {
+		w.Header().Set("x-daiki-response-language", responseLanguage.Code)
+	}
 	w.Header().Set("x-daiki-thinking-mode", thinkingProfile.Mode)
 	w.Header().Set("x-daiki-token-estimate-input", fmt.Sprint(tokenEstimate.InputTokens))
 	w.Header().Set("x-daiki-token-estimate-thinking", fmt.Sprint(tokenEstimate.ThinkingBudget))

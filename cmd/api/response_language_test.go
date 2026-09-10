@@ -1,0 +1,65 @@
+package main
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+func languageBody(t *testing.T, messages ...map[string]any) []byte {
+	t.Helper()
+	items := make([]any, 0, len(messages))
+	for _, m := range messages {
+		items = append(items, m)
+	}
+	b, err := json.Marshal(map[string]any{"model": "fast", "messages": items})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestResponseLanguageKeepsThaiAcrossAutomaticAttachmentPrompt(t *testing.T) {
+	body := languageBody(t,
+		map[string]any{"role": "user", "content": "ตอนนี้ใช้ model อะไร"},
+		map[string]any{"role": "assistant", "content": "ตอนนี้ใช้ Qwen ครับ"},
+		map[string]any{"role": "user", "content": "ขอรายละเอียดหน่อย"},
+		map[string]any{"role": "assistant", "content": "ได้ครับ"},
+		map[string]any{"role": "user", "content": "Please review the attached content."},
+	)
+	pref := resolveResponseLanguage(body)
+	if pref.Code != "th-TH" {
+		t.Fatalf("code=%q source=%q", pref.Code, pref.Source)
+	}
+	out, applied, err := applyResponseLanguage(body)
+	if err != nil || applied.Code != "th-TH" {
+		t.Fatalf("applied=%+v err=%v", applied, err)
+	}
+	if !strings.Contains(string(out), "DAIKI RESPONSE LANGUAGE") || !strings.Contains(string(out), "Thai") {
+		t.Fatalf("missing Thai language instruction: %s", out)
+	}
+}
+
+func TestResponseLanguageExplicitSwitchWins(t *testing.T) {
+	body := languageBody(t,
+		map[string]any{"role": "user", "content": "คุยภาษาไทยก่อน"},
+		map[string]any{"role": "assistant", "content": "ได้ครับ"},
+		map[string]any{"role": "user", "content": "ตอบเป็นภาษาอังกฤษตั้งแต่ข้อความนี้"},
+	)
+	pref := resolveResponseLanguage(body)
+	if pref.Code != "en" || pref.Source != "explicit" {
+		t.Fatalf("pref=%+v", pref)
+	}
+}
+
+func TestResponseLanguageUsesLatestSubstantiveUserLanguage(t *testing.T) {
+	body := languageBody(t,
+		map[string]any{"role": "user", "content": "สวัสดีครับ"},
+		map[string]any{"role": "assistant", "content": "สวัสดีครับ"},
+		map[string]any{"role": "user", "content": "Explain this API contract in English"},
+	)
+	pref := resolveResponseLanguage(body)
+	if pref.Code != "en" {
+		t.Fatalf("pref=%+v", pref)
+	}
+}
