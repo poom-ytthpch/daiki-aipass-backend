@@ -106,3 +106,19 @@ func TestLargeCSVExcerptIsTokenBounded(t *testing.T) {
 		t.Fatalf("clipped=%v len=%d target=%v", clipped, len(excerpt), strings.Contains(excerpt, "TARGET-731,999,cancelled"))
 	}
 }
+
+func TestLargeCSVExcerptPrioritizesSpecificKeyOverGenericSKU(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("sku,price,status,note\n")
+	for i := 0; i < 24000; i++ {
+		if i == 19000 {
+			b.WriteString("CSV-TARGET-7319,99,CANCELLED-7319,deep-target\n")
+			continue
+		}
+		fmt.Fprintf(&b, "SKU-%05d,%d,OK,row-%d\n", i, i%97, i)
+	}
+	excerpt, clipped := attachmentExcerpt(b.String(), "For SKU CSV-TARGET-7319, return only the exact status value.", maxAttachmentExcerptBytes)
+	if !clipped || !strings.Contains(excerpt, "CSV-TARGET-7319,99,CANCELLED-7319,deep-target") {
+		t.Fatalf("specific deep key was not retained, clipped=%v len=%d", clipped, len(excerpt))
+	}
+}

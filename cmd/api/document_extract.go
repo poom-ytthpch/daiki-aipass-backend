@@ -284,19 +284,36 @@ func attachmentExcerpt(text, query string, limit int) (string, bool) {
 		add(i)
 	}
 	if len(terms) > 0 {
-		for i, line := range lines {
-			lower := strings.ToLower(line)
-			matched := false
-			for _, term := range terms {
-				if strings.Contains(lower, term) {
-					matched = true
-					break
+		// Search the most specific query terms first. A generic column word such as
+		// "sku" or "status" can match every row in a large table; scanning rows
+		// first would fill the excerpt before a unique key near the end is reached.
+		sort.SliceStable(terms, func(i, j int) bool {
+			score := func(term string) int {
+				n := len([]rune(term))
+				if strings.ContainsAny(term, "-_") {
+					n += 24
 				}
+				for _, r := range term {
+					if unicode.IsDigit(r) {
+						n += 32
+						break
+					}
+				}
+				return n
 			}
-			if matched {
+			return score(terms[i]) > score(terms[j])
+		})
+		for _, term := range terms {
+			for i, line := range lines {
+				if !strings.Contains(strings.ToLower(line), term) {
+					continue
+				}
 				add(i - 1)
 				add(i)
 				add(i + 1)
+				if len(selected) >= 80 {
+					break
+				}
 			}
 			if len(selected) >= 80 {
 				break
