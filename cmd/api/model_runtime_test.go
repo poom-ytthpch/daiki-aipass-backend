@@ -144,8 +144,9 @@ func TestResearchProfileUsesResearchOverhead(t *testing.T) {
 	m := store.ProviderModel{ITPMLimit: 7000, AgentOverheadTokens: 5300, ResearchOverheadTokens: 800, ContextStrategy: "adaptive", FallbackModelName: "fallback"}
 	userOverhead := runtimeAgentOverhead(m, "user")
 	researchOverhead := runtimeAgentOverhead(m, "research")
-	if userOverhead != 5300 || researchOverhead != 800 {
-		t.Fatalf("unexpected overheads user=%d research=%d", userOverhead, researchOverhead)
+	directOverhead := runtimeAgentOverhead(m, "research-direct")
+	if userOverhead != 5300 || researchOverhead != 800 || directOverhead != 800 {
+		t.Fatalf("unexpected overheads user=%d research=%d research-direct=%d", userOverhead, researchOverhead, directOverhead)
 	}
 	if !shouldPreflightFallback(m, body, userOverhead) {
 		t.Fatal("user profile should fallback with the larger agent overhead")
