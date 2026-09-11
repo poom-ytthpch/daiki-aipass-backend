@@ -482,7 +482,9 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	body, researchMeta, researchErr := a.enrichChatWithResearch(r.Context(), body)
+	chatRunID := strings.TrimSpace(r.Header.Get("x-daiki-chat-run-id"))
+	researchCtx := withResearchRunID(r.Context(), chatRunID)
+	body, researchMeta, researchErr := a.enrichChatWithResearch(researchCtx, body)
 	if researchErr == nil {
 		body, responseLanguage, err = applyResponseLanguage(body)
 		if err != nil {
@@ -492,7 +494,6 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	} else {
 		responseLanguage = responseLanguagePreference{}
 	}
-	chatRunID := strings.TrimSpace(r.Header.Get("x-daiki-chat-run-id"))
 	if chatRunID != "" && a.store != nil {
 		_ = a.store.UpdateChatRunActivity(context.Background(), chatRunID, map[string]any{
 			"phase":    "thinking",

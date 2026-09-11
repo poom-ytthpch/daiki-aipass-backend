@@ -178,6 +178,18 @@ func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 		"researchMode":          "off",
 		"max_completion_tokens": p.MaxCompletionTokens,
 	}
+	region := normalizeResearchRegion(payload["researchRegion"])
+	if region != "" {
+		clean["researchRegion"] = region
+	}
+	if locale := normalizeResearchLocale(payload["researchLocale"]); locale != "" {
+		clean["researchLocale"] = locale
+	}
+	clean["researchScope"] = normalizeResearchScope(payload["researchScope"], region)
+	clean["researchDepth"] = normalizeResearchDepth(payload["researchDepth"])
+	if focus := clipText(strings.TrimSpace(fmt.Sprint(payload["researchFocus"])), 240); focus != "" {
+		clean["researchFocus"] = focus
+	}
 	if stream, ok := payload["stream"].(bool); ok {
 		clean["stream"] = stream
 	}
@@ -358,13 +370,13 @@ func guestResearchSourcesHeader(meta researchMetadata) string {
 		return ""
 	}
 	limit := len(meta.Sources)
-	if limit > 4 {
-		limit = 4
+	if limit > 8 {
+		limit = 8
 	}
 	for limit > 0 {
 		rows := make([]map[string]any, 0, limit)
 		for _, source := range meta.Sources[:limit] {
-			rows = append(rows, map[string]any{"index": source.Index, "title": clipText(source.Title, 180), "url": source.URL, "engine": source.Engine})
+			rows = append(rows, map[string]any{"index": source.Index, "title": clipText(source.Title, 180), "url": source.URL, "engine": source.Engine, "region": source.Region, "authority": source.Authority, "sourceType": source.SourceType, "platform": source.Platform})
 		}
 		raw, err := json.Marshal(rows)
 		if err != nil {

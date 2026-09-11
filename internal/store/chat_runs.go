@@ -59,7 +59,7 @@ func (s *Store) SetChatRunStatus(ctx context.Context, owner, id, status string) 
 }
 
 func (s *Store) ResetChatRun(ctx context.Context, owner, id string) (ChatRun, error) {
-	return scanChatRun(s.DB.QueryRow(ctx, `UPDATE chat_runs SET status='queued',request_id='',content='',error='',completed_at=NULL,activity=jsonb_build_object('phase','queued','research',jsonb_build_object('mode',research_mode),'thinking',jsonb_build_object('mode',thinking_mode),'commands',jsonb_build_object('mode',command_mode,'skills',command_skills)),updated_at=now() WHERE id=$1 AND owner_subject=$2 RETURNING `+chatRunCols, id, owner))
+	return scanChatRun(s.DB.QueryRow(ctx, `UPDATE chat_runs SET status='queued',request_id='',content='',error='',completed_at=NULL,activity=jsonb_build_object('phase','queued','research',COALESCE(activity->'research','{}'::jsonb)||jsonb_build_object('mode',research_mode,'phase','queued'),'thinking',jsonb_build_object('mode',thinking_mode),'commands',jsonb_build_object('mode',command_mode,'skills',command_skills)),updated_at=now() WHERE id=$1 AND owner_subject=$2 RETURNING `+chatRunCols, id, owner))
 }
 func (s *Store) ChatRuns(ctx context.Context, owner, sessionID string) ([]ChatRun, error) {
 	rows, err := s.DB.Query(ctx, `SELECT `+chatRunCols+` FROM chat_runs WHERE session_id=$1 AND owner_subject=$2 ORDER BY created_at ASC LIMIT 200`, sessionID, owner)

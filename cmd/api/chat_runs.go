@@ -27,10 +27,15 @@ type chatRunIdentity struct {
 }
 
 type chatRunStartInput struct {
-	ResearchMode  string   `json:"researchMode"`
-	ThinkingMode  string   `json:"thinkingMode"`
-	CommandMode   string   `json:"commandMode"`
-	CommandSkills []string `json:"commandSkills"`
+	ResearchMode   string   `json:"researchMode"`
+	ResearchRegion string   `json:"researchRegion"`
+	ResearchLocale string   `json:"researchLocale"`
+	ResearchScope  string   `json:"researchScope"`
+	ResearchDepth  string   `json:"researchDepth"`
+	ResearchFocus  string   `json:"researchFocus"`
+	ThinkingMode   string   `json:"thinkingMode"`
+	CommandMode    string   `json:"commandMode"`
+	CommandSkills  []string `json:"commandSkills"`
 }
 
 func captureChatRunIdentity(r *http.Request) chatRunIdentity {
@@ -41,6 +46,24 @@ func captureChatRunIdentity(r *http.Request) chatRunIdentity {
 	u.Roles = append([]string{}, u.Roles...)
 	p.Scopes = append([]string{}, p.Scopes...)
 	return chatRunIdentity{Claims: c, User: u, Principal: p}
+}
+
+func chatRunResearchPreferences(run store.ChatRun) researchPreferences {
+	prefs := researchPreferences{Depth: "standard"}
+	var activity map[string]any
+	if len(run.Activity) == 0 || json.Unmarshal(run.Activity, &activity) != nil {
+		return prefs
+	}
+	research, _ := activity["research"].(map[string]any)
+	if research == nil {
+		return prefs
+	}
+	prefs.Region = normalizeResearchRegion(research["region"])
+	prefs.Locale = normalizeResearchLocale(research["locale"])
+	prefs.Scope = normalizeResearchScope(research["scope"], prefs.Region)
+	prefs.Depth = normalizeResearchDepth(research["depth"])
+	prefs.Focus = clipText(strings.TrimSpace(fmt.Sprint(research["focus"])), 240)
+	return prefs
 }
 
 func (a *app) startChatRun(w http.ResponseWriter, r *http.Request) {
@@ -65,12 +88,20 @@ func (a *app) startChatRun(w http.ResponseWriter, r *http.Request) {
 	if commandSelection.Mode == "deep-search" {
 		mode = "web"
 	}
+	region := normalizeResearchRegion(in.ResearchRegion)
+	locale := normalizeResearchLocale(in.ResearchLocale)
+	depth := normalizeResearchDepth(in.ResearchDepth)
+	if commandSelection.Mode == "deep-search" {
+		depth = "deep"
+	}
+	scope := normalizeResearchScope(in.ResearchScope, region)
+	focus := clipText(strings.TrimSpace(in.ResearchFocus), 240)
 	token, err := randomURLToken(12)
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "unable to create chat run"})
 		return
 	}
-	initial, _ := json.Marshal(map[string]any{"phase": "queued", "research": map[string]any{"mode": mode}, "thinking": map[string]any{"mode": thinking}, "commands": commandSelection})
+	initial, _ := json.Marshal(map[string]any{"phase": "queued", "research": map[string]any{"mode": mode, "region": region, "locale": locale, "scope": scope, "depth": depth, "focus": focus, "phase": "queued"}, "thinking": map[string]any{"mode": thinking}, "commands": commandSelection})
 	run, err := a.store.CreateChatRun(r.Context(), store.ChatRun{ID: "run_" + token, SessionID: sessionID, OwnerSubject: current(r).Sub, ResearchMode: mode, ThinkingMode: thinking, CommandMode: commandSelection.Mode, CommandSkills: commandSelection.Skills, Activity: initial})
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -205,8 +236,15 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 		_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"attachmentContextInherited": true})
 	}
 	profile := thinkingProfileFor(run.ThinkingMode)
-	_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"research": map[string]any{"mode": run.ResearchMode, "query": clipText(lastUserText, 500)}, "thinking": map[string]any{"mode": run.ThinkingMode, "reasoningBudget": profile.ReasoningBudget}, "commands": map[string]any{"mode": run.CommandMode, "skills": run.CommandSkills}})
-	payload := map[string]any{"model": session.ModelAlias, "researchMode": run.ResearchMode, "thinkingMode": run.ThinkingMode, "commandMode": run.CommandMode, "commandSkills": run.CommandSkills, "messages": payloadMessages, "attachmentIds": attachmentIDs, "stream": false}
+	researchPrefs := chatRunResearchPreferences(run)
+	researchActivity := map[string]any{"mode": run.ResearchMode, "query": clipText(lastUserText, 500), "region": researchPrefs.Region, "locale": researchPrefs.Locale, "scope": researchPrefs.Scope, "depth": researchPrefs.Depth, "focus": researchPrefs.Focus, "phase": "planning"}
+	_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"research": researchActivity, "thinking": map[string]any{"mode": run.ThinkingMode, "reasoningBudget": profile.ReasoningBudget}, "commands": map[string]any{"mode": run.CommandMode, "skills": run.CommandSkills}})
+	payload := map[string]any{
+		"model": session.ModelAlias, "researchMode": run.ResearchMode, "researchRegion": researchPrefs.Region, "researchLocale": researchPrefs.Locale,
+		"researchScope": researchPrefs.Scope, "researchDepth": researchPrefs.Depth, "researchFocus": researchPrefs.Focus,
+		"thinkingMode": run.ThinkingMode, "commandMode": run.CommandMode, "commandSkills": run.CommandSkills,
+		"messages": payloadMessages, "attachmentIds": attachmentIDs, "stream": false,
+	}
 	invoke := func(body []byte) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat", bytes.NewReader(body)).WithContext(ctx)
 		req.Header.Set("x-daiki-chat-run-id", run.ID)
@@ -323,15 +361,22 @@ func (a *app) failBackgroundRun(run store.ChatRun, started time.Time, message, r
 }
 
 func safeRunResearchActivity(meta researchMetadata) map[string]any {
-	out := map[string]any{"mode": meta.Mode, "query": meta.Query, "used": meta.Used, "error": meta.Error, "contextInherited": meta.ContextInherited}
+	out := map[string]any{"mode": meta.Mode, "query": meta.Query, "used": meta.Used, "error": meta.Error, "contextInherited": meta.ContextInherited, "region": meta.Region, "locale": meta.Locale, "scope": meta.Scope, "depth": meta.Depth, "focus": meta.Focus, "phase": meta.Phase, "localSourceCount": meta.LocalSourceCount, "globalSourceCount": meta.GlobalSourceCount, "socialSourceCount": meta.SocialSourceCount, "socialPlatforms": meta.SocialPlatforms}
 	if meta.ResolvedQuery != "" && meta.ResolvedQuery != meta.Query {
 		out["resolvedQuery"] = clipText(meta.ResolvedQuery, 900)
+	}
+	if len(meta.Queries) > 0 {
+		queries := make([]string, 0, min(len(meta.Queries), 10))
+		for _, query := range meta.Queries[:min(len(meta.Queries), 10)] {
+			queries = append(queries, clipText(query, 300))
+		}
+		out["queries"] = queries
 	}
 	if len(meta.Sources) > 0 {
 		sources := make([]map[string]any, 0, min(len(meta.Sources), 8))
 		for _, source := range meta.Sources[:min(len(meta.Sources), 8)] {
 			sources = append(sources, map[string]any{
-				"index": source.Index, "title": source.Title, "url": source.URL, "engine": source.Engine,
+				"index": source.Index, "title": source.Title, "url": source.URL, "engine": source.Engine, "region": source.Region, "authority": source.Authority, "sourceType": source.SourceType, "platform": source.Platform,
 				"snippet": clipText(strings.TrimSpace(source.Snippet), 280),
 			})
 		}
@@ -366,7 +411,21 @@ func (a *app) chatRunActivity(ctx context.Context, requestID string, headers htt
 		return activity
 	}
 	if research, ok := meta["research"].(map[string]any); ok {
-		safe := map[string]any{"mode": research["mode"], "query": research["query"], "used": research["used"], "error": research["error"]}
+		safe := map[string]any{
+			"mode": research["mode"], "query": research["query"], "used": research["used"], "error": research["error"],
+			"region": research["region"], "locale": research["locale"], "scope": research["scope"], "depth": research["depth"], "focus": research["focus"],
+			"phase": "completed", "localSourceCount": research["localSourceCount"], "globalSourceCount": research["globalSourceCount"], "socialSourceCount": research["socialSourceCount"], "socialPlatforms": research["socialPlatforms"],
+		}
+		if value := research["resolvedQuery"]; value != nil {
+			safe["resolvedQuery"] = value
+		}
+		if queries, ok := research["queries"].([]any); ok {
+			out := make([]string, 0, min(len(queries), 10))
+			for _, query := range queries[:min(len(queries), 10)] {
+				out = append(out, clipText(strings.TrimSpace(fmt.Sprint(query)), 300))
+			}
+			safe["queries"] = out
+		}
 		if rows, ok := research["sources"].([]any); ok {
 			sources := make([]map[string]any, 0, min(len(rows), 8))
 			for _, row := range rows {
@@ -374,7 +433,7 @@ func (a *app) chatRunActivity(ctx context.Context, requestID string, headers htt
 				if !ok {
 					continue
 				}
-				sources = append(sources, map[string]any{"index": m["index"], "title": m["title"], "url": m["url"], "engine": m["engine"], "snippet": clipText(strings.TrimSpace(fmt.Sprint(m["snippet"])), 280)})
+				sources = append(sources, map[string]any{"index": m["index"], "title": m["title"], "url": m["url"], "engine": m["engine"], "region": m["region"], "authority": m["authority"], "sourceType": m["sourceType"], "platform": m["platform"], "snippet": clipText(strings.TrimSpace(fmt.Sprint(m["snippet"])), 280)})
 			}
 			safe["sources"] = sources
 			safe["sourceCount"] = len(sources)

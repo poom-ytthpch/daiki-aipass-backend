@@ -69,6 +69,9 @@ func TestApplyGuestDeepSearchForcesBackendResearch(t *testing.T) {
 	if payload["researchMode"] != "web" {
 		t.Fatalf("deep-search must force server research: %#v", payload)
 	}
+	if payload["researchDepth"] != "deep" {
+		t.Fatalf("deep-search must request deep research depth: %#v", payload)
+	}
 }
 
 func TestGuestSanitizerPreservesOnlyWhitelistedCommandInputs(t *testing.T) {

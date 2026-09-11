@@ -190,6 +190,85 @@ func TestResearchRankingAndRelevanceForAIPassport(t *testing.T) {
 	}
 }
 
+func TestResearchPreferencesThailandDefaultsLocalFirst(t *testing.T) {
+	prefs := researchPreferencesFromPayload(map[string]any{"researchLocale": "th-TH", "researchDepth": "deep"}, "รถไฟฟ้ารุ่นใหม่")
+	if prefs.Region != "TH" || prefs.Scope != "local-first" || prefs.Depth != "deep" {
+		t.Fatalf("unexpected Thailand preferences: %#v", prefs)
+	}
+	prefs = researchPreferencesFromPayload(map[string]any{"researchRegion": "GLOBAL", "researchScope": "global"}, "รถไฟฟ้ารุ่นใหม่")
+	if prefs.Region != "GLOBAL" || prefs.Scope != "global" {
+		t.Fatalf("explicit global preference must win over Thai query text: %#v", prefs)
+	}
+}
+
+func TestDeepThailandResearchPlanSearchesLocalAndSocialBeforeGlobal(t *testing.T) {
+	prefs := researchPreferences{Region: "TH", Locale: "th-TH", Scope: "local-first", Depth: "deep", Focus: "ราคาและประสบการณ์ผู้ใช้จริง"}
+	plan := researchSearchPlan("BYD Sealion 7", prefs)
+	if len(plan) == 0 {
+		t.Fatal("expected a research plan")
+	}
+	joined := make([]string, 0, len(plan))
+	firstGlobal := -1
+	lastLocal := -1
+	seenStage := map[string]bool{}
+	for i, item := range plan {
+		joined = append(joined, item.Query)
+		seenStage[item.Stage] = true
+		if item.Region == "TH" {
+			lastLocal = i
+		}
+		if item.Region == "GLOBAL" && firstGlobal < 0 {
+			firstGlobal = i
+		}
+	}
+	queries := strings.Join(joined, "\n")
+	for _, want := range []string{"site:go.th", "site:facebook.com", "site:instagram.com", "site:tiktok.com"} {
+		if !strings.Contains(queries, want) {
+			t.Fatalf("deep Thailand plan missing %q: %#v", want, plan)
+		}
+	}
+	if !seenStage["social-local"] {
+		t.Fatalf("deep Thailand plan must include a local social stage: %#v", plan)
+	}
+	if firstGlobal < 0 || lastLocal < 0 || firstGlobal <= lastLocal {
+		t.Fatalf("Thailand stages must be planned before global expansion: firstGlobal=%d lastLocal=%d plan=%#v", firstGlobal, lastLocal, plan)
+	}
+}
+
+func TestSocialPlatformClassification(t *testing.T) {
+	cases := map[string]string{
+		"https://www.facebook.com/example/posts/1": "Facebook",
+		"https://instagram.com/p/example":          "Instagram",
+		"https://www.tiktok.com/@example/video/1":  "TikTok",
+		"https://x.com/example/status/1":           "X",
+		"https://youtube.com/watch?v=1":            "YouTube",
+		"https://www.reddit.com/r/cars/comments/1": "Reddit",
+		"https://pantip.com/topic/123":             "Pantip",
+		"https://www.threads.net/@example/post/1":  "Threads",
+	}
+	for raw, want := range cases {
+		if got := researchSocialPlatform(raw); got != want {
+			t.Fatalf("researchSocialPlatform(%q)=%q want %q", raw, got, want)
+		}
+		if got := researchSourceType(raw); got != "social" {
+			t.Fatalf("researchSourceType(%q)=%q want social", raw, got)
+		}
+	}
+	if got := researchSocialPlatform("https://example.com/article"); got != "" {
+		t.Fatalf("ordinary web source classified as social: %q", got)
+	}
+}
+
+func TestThailandRankingBoostsRelevantLocalSource(t *testing.T) {
+	prefs := researchPreferences{Region: "TH", Scope: "local-first", Depth: "deep"}
+	query := "BYD Sealion 7 price"
+	local := researchResultRankForPreferences(query, "BYD Sealion 7 ราคาไทย", "https://example.co.th/sealion-7", "ราคา Thailand ประเทศไทย", 1, prefs)
+	global := researchResultRankForPreferences(query, "BYD Sealion 7 price", "https://example.com/sealion-7", "global price overview", 1, prefs)
+	if local <= global {
+		t.Fatalf("Thailand-relevant result should outrank global result: local=%v global=%v", local, global)
+	}
+}
+
 func TestFetchPublicPageDirectURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("content-type", "text/html; charset=utf-8")

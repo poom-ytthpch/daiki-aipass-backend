@@ -25,7 +25,7 @@ type chatCommandSelection struct {
 
 var chatCommandModes = []chatCommandOption{
 	{ID: "plan", Name: "Plan", Description: "Turn the request into an ordered, practical plan with checks and dependencies.", GuestAllowed: true, Instruction: "MODE PLAN: Produce a practical ordered plan. Include dependencies, risks, verification/success checks, and the smallest useful next action. Avoid generic filler."},
-	{ID: "deep-search", Name: "Deep Search", Description: "Search the public web first, then synthesize fresh evidence and sources.", GuestAllowed: true, ResearchMode: "web", Instruction: "MODE DEEP SEARCH: Synthesize the fresh web evidence carefully. Prefer primary/official evidence, compare conflicts, state uncertainty, and answer the user's actual decision or question rather than dumping results."},
+	{ID: "deep-search", Name: "Deep Search", Description: "Plan several searches, prioritize relevant local evidence, expand globally, verify sources, then produce a cited research report.", GuestAllowed: true, ResearchMode: "web", Instruction: "MODE DEEP SEARCH: Perform a deliberate multi-query research pass before answering. Prefer primary/official evidence, prioritize the user's configured local region before expanding globally, compare conflicts, verify important claims across independent sources, state uncertainty, and synthesize a polished research report. For substantial requests use compact sections such as Executive Summary, Research Approach, Findings, local-market implications, comparisons/risks, and Recommendation when relevant. Cite evidence inline and do not dump raw search results."},
 	{ID: "analyze", Name: "Analyze", Description: "Inspect evidence, assumptions, trade-offs and edge cases before answering.", GuestAllowed: true, Instruction: "MODE ANALYZE: Analyze the supplied information systematically. Separate evidence from assumptions, check important edge cases, compare meaningful alternatives, and finish with a clear conclusion."},
 	{ID: "brainstorm", Name: "Brainstorm", Description: "Generate several distinct useful ideas, then narrow to the strongest options.", GuestAllowed: true, Instruction: "MODE BRAINSTORM: Generate distinct, non-duplicate ideas. Group related ideas, identify the strongest options, and explain the key trade-off for each without padding the answer."},
 	{ID: "concise", Name: "Concise", Description: "Prefer the shortest complete answer that still solves the request.", GuestAllowed: true, Instruction: "MODE CONCISE: Give the shortest complete answer that solves the request. Keep only necessary context, caveats, and steps."},
@@ -119,6 +119,9 @@ func applyChatCommands(body []byte, guest bool) ([]byte, chatCommandSelection, e
 			instructions = append(instructions, option.Instruction)
 			if option.ResearchMode != "" {
 				payload["researchMode"] = option.ResearchMode
+			}
+			if option.ID == "deep-search" {
+				payload["researchDepth"] = "deep"
 			}
 		}
 	}
