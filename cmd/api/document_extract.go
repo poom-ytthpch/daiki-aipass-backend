@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -52,7 +53,31 @@ func readTextAttachment(path string) (string, bool, error) {
 	return string(bytes.ToValidUTF8(b, []byte("�"))), truncated, nil
 }
 
+func extractDaikiPDFText(path string) (string, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	idx := bytes.LastIndex(b, []byte(daikiPDFTextMarker))
+	if idx < 0 {
+		return "", false
+	}
+	encoded := strings.TrimSpace(string(b[idx+len(daikiPDFTextMarker):]))
+	if encoded == "" {
+		return "", false
+	}
+	decoded, err := base64.RawStdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", false
+	}
+	text, _ := clipUTF8Bytes(string(decoded), maxExtractedDocumentBytes)
+	return text, true
+}
+
 func extractPDFText(path string) (text string, truncated bool, err error) {
+	if embedded, ok := extractDaikiPDFText(path); ok {
+		return embedded, len(embedded) >= maxExtractedDocumentBytes, nil
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("pdf parser failed: %v", r)

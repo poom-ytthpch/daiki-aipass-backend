@@ -19,6 +19,7 @@ var builtinSkills = []smartSkill{
 	{ID: "translate", Name: "Translate", Description: "Translate while preserving intent, terminology and formatting.", Prompt: "For translation: preserve meaning, tone, technical terms, numbers and formatting. Do not add commentary unless requested."},
 	{ID: "data-analysis", Name: "Data Analysis", Description: "Reason over tables, CSV, JSON and numeric data with checks.", Prompt: "For data analysis: state the metric being computed, check units and denominators, use calculator for arithmetic when available, and call out missing or inconsistent data."},
 	{ID: "document-qa", Name: "Document QA", Description: "Answer from uploaded files and distinguish evidence from assumptions.", Prompt: "For document questions: ground answers in attached content, quote only short identifying fragments, mention the file/path used, and say when the files do not contain the answer."},
+	{ID: "file-artifacts", Name: "File Artifacts", Description: "Create or transform downloadable TXT, Markdown, JSON, CSV and PDF artifacts with format validation.", Prompt: "For file creation: infer the requested artifact type, preserve the user's language and exact identifiers, emit format-valid content only, and rely on Daiki's artifact renderer for CSV/PDF validation and packaging. For reading files, use the extracted attachment evidence rather than guessing."},
 	{ID: "planning", Name: "Planning", Description: "Create practical ordered plans with dependencies and verification steps.", Prompt: "For planning: give ordered steps, dependencies, risks, success checks and a smallest next action. Avoid generic advice."},
 	{ID: "problem-solving", Name: "Problem Solving", Description: "Break ambiguous problems into verifiable steps for a small model.", Prompt: "For problem solving: restate the objective briefly, reason in small verifiable steps internally, check assumptions, and give a direct answer with uncertainty where needed."},
 }
@@ -108,6 +109,11 @@ func selectSmartSkills(body []byte) []smartSkill {
 	}
 	if containsAny("summar", "tl;dr", "สรุป", "ย่อ", "จับประเด็น") {
 		add("summarize")
+	}
+	artifactCreateIntent := containsAny("generate", "create", "make file", "export", "save as", "สร้าง", "ทำไฟล์", "ส่งออก", "บันทึกเป็น")
+	artifactType := containsAny("file", "csv", "pdf", "json", "markdown", "ไฟล์", "ซีเอสวี", "พีดีเอฟ", "รายงาน")
+	if artifactCreateIntent && artifactType {
+		add("file-artifacts")
 	}
 	if containsAny("translate", "translation", "แปล", "ภาษาอังกฤษ", "ภาษาไทย") {
 		add("translate")

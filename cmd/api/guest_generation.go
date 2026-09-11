@@ -307,15 +307,7 @@ func (a *app) storeGeneratedGuestAttachment(ctx context.Context, identity guestI
 		return store.GuestAttachment{}, err
 	}
 	h := sha256.Sum256(data)
-	extractStatus, extractedText := "stored", ""
-	if strings.HasPrefix(mediaType, "text/") || textAttachment(name, mediaType) {
-		extractStatus = "text-ready"
-		extractedText = string(data)
-		if len(extractedText) > maxExtractedTextBytes {
-			extractedText = extractedText[:maxExtractedTextBytes]
-			extractStatus = "text-truncated"
-		}
-	}
+	extractStatus, extractedText := extractAttachmentContent(storagePath, name, mediaType)
 	rec, err := a.store.CreateGuestAttachment(ctx, store.GuestAttachment{
 		ID: id, GuestSubject: identity.Subject, DeviceID: identity.DeviceID, Name: name,
 		RelativePath: name, Source: source, MediaType: mediaType, SizeBytes: int64(len(data)),
@@ -339,35 +331,32 @@ func (a *app) guestGenerateFile(w http.ResponseWriter, r *http.Request) {
 		Prompt    string `json:"prompt"`
 		Name      string `json:"name"`
 		MediaType string `json:"mediaType"`
+		Format    string `json:"format"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body) != nil || strings.TrimSpace(body.Prompt) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "prompt is required"})
+		return
+	}
+	spec, err := generatedFileSpecFor(body.Format, body.Name, body.MediaType, body.Prompt)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	if err := a.enforceGuestDailyCapability(r.Context(), "filegen", identity.Subject, p.FileGenerationsPerDay); err != nil {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "guest_file_generation_limit"})
 		return
 	}
-	name := generatedName(body.Name, "generated.txt")
-	mediaType := strings.TrimSpace(body.MediaType)
-	if mediaType == "" {
-		mediaType = mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
-	}
-	if mediaType == "" {
-		mediaType = "text/plain; charset=utf-8"
-	}
-	prompt := "Create the requested file contents. Return ONLY the final file contents with no Markdown fences, no explanation, and no filename header. User request:\n" + strings.TrimSpace(body.Prompt)
-	responseBody, upstream, err := a.runGuestCoreGeneration(r.Context(), identity, p, "file-generation", "guest", prompt)
+	responseBody, upstream, err := a.runGuestCoreGeneration(r.Context(), identity, p, "file-generation:"+spec.Format, "guest-skills", generatedFilePrompt(spec, body.Prompt))
 	if err != nil {
 		a.refundGuestDailyCapability(r.Context(), "filegen", identity.Subject, p.FileGenerationsPerDay)
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "guest_file_generation_failed", "upstream": upstream})
 		return
 	}
 	content := chatCompletionText(responseBody)
-	data := []byte(content)
-	if len(data) == 0 {
+	data, err := normalizeGeneratedFile(spec, content)
+	if err != nil {
 		a.refundGuestDailyCapability(r.Context(), "filegen", identity.Subject, p.FileGenerationsPerDay)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "guest_file_generation_empty"})
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "guest_file_generation_invalid", "detail": err.Error(), "format": spec.Format})
 		return
 	}
 	if p.MaxGeneratedFileBytes > 0 && int64(len(data)) > p.MaxGeneratedFileBytes {
@@ -375,15 +364,14 @@ func (a *app) guestGenerateFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "generated_file_exceeds_limit"})
 		return
 	}
-	rec, err := a.storeGeneratedGuestAttachment(r.Context(), identity, p, name, "generated-file", mediaType, data)
+	rec, err := a.storeGeneratedGuestAttachment(r.Context(), identity, p, spec.Name, "generated-file", spec.MediaType, data)
 	if err != nil {
 		a.refundGuestDailyCapability(r.Context(), "filegen", identity.Subject, p.FileGenerationsPerDay)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "generated_file_storage_failed"})
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"attachment": guestAttachmentPublic(rec), "upstream": upstream})
+	writeJSON(w, http.StatusCreated, map[string]any{"attachment": guestAttachmentPublic(rec), "upstream": upstream, "format": spec.Format})
 }
-
 func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 	p, _, err := a.store.GuestAccessPolicy(r.Context())
 	if err != nil || !p.Enabled || !p.AllowImageGeneration {
