@@ -23,6 +23,94 @@ import (
 
 var generatedImageDataRE = regexp.MustCompile(`data:(image/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)`)
 
+const defaultOpenRouterImageModel = "google/gemini-3.1-flash-lite-image"
+
+type openRouterImageResponse struct {
+	Data []struct {
+		B64JSON   string `json:"b64_json"`
+		MediaType string `json:"media_type"`
+	} `json:"data"`
+}
+
+func decodeOpenRouterImageResponse(body []byte) ([]byte, string, error) {
+	var payload openRouterImageResponse
+	if err := json.Unmarshal(body, &payload); err != nil || len(payload.Data) == 0 {
+		return nil, "", errors.New("image provider returned no image")
+	}
+	encoded := strings.TrimSpace(payload.Data[0].B64JSON)
+	if encoded == "" {
+		return nil, "", errors.New("image provider returned empty image")
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(data) == 0 {
+		return nil, "", errors.New("image provider returned invalid base64")
+	}
+	mediaType := strings.TrimSpace(payload.Data[0].MediaType)
+	if !strings.HasPrefix(mediaType, "image/") {
+		mediaType = "image/png"
+	}
+	return data, mediaType, nil
+}
+
+func (a *app) generateGuestImageViaOpenRouter(ctx context.Context, prompt string) ([]byte, string, string, error) {
+	providers, err := a.store.ModelProviders(ctx)
+	if err != nil {
+		return nil, "", "", err
+	}
+	for _, provider := range providers {
+		if !provider.Enabled || !provider.HasAPIKey || !strings.Contains(strings.ToLower(provider.BaseURL), "openrouter.ai") {
+			continue
+		}
+		key, err := a.providerAPIKey(provider)
+		if err != nil || strings.TrimSpace(key) == "" {
+			continue
+		}
+		endpoint := strings.TrimRight(provider.BaseURL, "/") + "/images"
+		client, err := safeProviderHTTPClient(ctx, endpoint)
+		if err != nil {
+			return nil, "", "openrouter-images", err
+		}
+		model := strings.TrimSpace(os.Getenv("OPENROUTER_IMAGE_MODEL"))
+		if model == "" {
+			model = defaultOpenRouterImageModel
+		}
+		payload, _ := json.Marshal(map[string]any{"model": model, "prompt": strings.TrimSpace(prompt), "n": 1})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
+		if err != nil {
+			return nil, "", "openrouter-images", err
+		}
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("authorization", "Bearer "+key)
+		req.Header.Set("http-referer", a.cfg.AppBaseURL)
+		req.Header.Set("x-title", "Daiki AI Passport")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, "", "openrouter-images", err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, "", "openrouter-images", readErr
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, "", "openrouter-images", fmt.Errorf("image provider returned status %d", resp.StatusCode)
+		}
+		data, mediaType, err := decodeOpenRouterImageResponse(body)
+		return data, mediaType, "openrouter-images:" + model, err
+	}
+	return nil, "", "", errors.New("no OpenRouter image provider configured")
+}
+
+func (a *app) refundGuestDailyCapability(ctx context.Context, capability, subject string, limit int) {
+	if limit == 0 || a.redis == nil {
+		return
+	}
+	key := fmt.Sprintf("guest-%s:%s:%s", capability, subject, time.Now().UTC().Format("20060102"))
+	if v, err := a.redis.Decr(ctx, key).Result(); err == nil && v < 0 {
+		_ = a.redis.Set(ctx, key, 0, 26*time.Hour).Err()
+	}
+}
+
 func (a *app) enforceGuestDailyCapability(ctx context.Context, capability, subject string, limit int) error {
 	if limit == 0 {
 		return nil
@@ -257,21 +345,25 @@ func (a *app) guestGenerateFile(w http.ResponseWriter, r *http.Request) {
 	prompt := "Create the requested file contents. Return ONLY the final file contents with no Markdown fences, no explanation, and no filename header. User request:\n" + strings.TrimSpace(body.Prompt)
 	responseBody, upstream, err := a.runGuestCoreGeneration(r.Context(), identity, p, "file-generation", "guest", prompt)
 	if err != nil {
+		a.refundGuestDailyCapability(r.Context(), "filegen", identity.Subject, p.FileGenerationsPerDay)
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "guest_file_generation_failed", "upstream": upstream})
 		return
 	}
 	content := chatCompletionText(responseBody)
 	data := []byte(content)
 	if len(data) == 0 {
+		a.refundGuestDailyCapability(r.Context(), "filegen", identity.Subject, p.FileGenerationsPerDay)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "guest_file_generation_empty"})
 		return
 	}
 	if p.MaxGeneratedFileBytes > 0 && int64(len(data)) > p.MaxGeneratedFileBytes {
+		a.refundGuestDailyCapability(r.Context(), "filegen", identity.Subject, p.FileGenerationsPerDay)
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "generated_file_exceeds_limit"})
 		return
 	}
 	rec, err := a.storeGeneratedGuestAttachment(r.Context(), identity, p, name, "generated-file", mediaType, data)
 	if err != nil {
+		a.refundGuestDailyCapability(r.Context(), "filegen", identity.Subject, p.FileGenerationsPerDay)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "generated_file_storage_failed"})
 		return
 	}
@@ -298,37 +390,46 @@ func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "guest_image_generation_limit"})
 		return
 	}
-	prompt := "Generate an image for this request using the image_generate capability and return the generated image. Request: " + strings.TrimSpace(body.Prompt)
-	responseBody, upstream, err := a.runGuestCoreGeneration(r.Context(), identity, p, "image-generation", "guest-media", prompt)
+	prompt := strings.TrimSpace(body.Prompt)
+	data, mediaType, upstream, err := a.generateGuestImageViaOpenRouter(r.Context(), prompt)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "image_generation_unavailable", "upstream": upstream})
-		return
+		// Preserve Hermes as a secondary path for installations that configure an
+		// image_gen provider such as FAL/OpenAI. match-infra currently has an
+		// OpenRouter provider, so normal traffic uses the dedicated Images API.
+		hermesPrompt := "Generate an image for this request using the image_generate capability and return the generated image. Request: " + prompt
+		responseBody, hermesUpstream, hermesErr := a.runGuestCoreGeneration(r.Context(), identity, p, "image-generation", "guest-media", hermesPrompt)
+		if hermesErr == nil {
+			content := chatCompletionText(responseBody)
+			match := generatedImageDataRE.FindStringSubmatch(content)
+			if len(match) == 3 {
+				decoded, decodeErr := base64.StdEncoding.DecodeString(match[2])
+				if decodeErr == nil && len(decoded) > 0 {
+					data, mediaType, upstream, err = decoded, match[1], hermesUpstream, nil
+				}
+			}
+		}
 	}
-	content := chatCompletionText(responseBody)
-	match := generatedImageDataRE.FindStringSubmatch(content)
-	if len(match) != 3 {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "image_generation_unavailable", "upstream": upstream})
-		return
-	}
-	data, err := base64.StdEncoding.DecodeString(match[2])
 	if err != nil || len(data) == 0 {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "generated_image_invalid"})
+		a.refundGuestDailyCapability(r.Context(), "imagegen", identity.Subject, p.ImageGenerationsPerDay)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "image_generation_unavailable", "upstream": upstream})
 		return
 	}
 	if (p.MaxGeneratedImageBytes > 0 && int64(len(data)) > p.MaxGeneratedImageBytes) || int64(len(data)) > maxInjectedImageBytes {
+		a.refundGuestDailyCapability(r.Context(), "imagegen", identity.Subject, p.ImageGenerationsPerDay)
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "generated_image_exceeds_limit"})
 		return
 	}
 	ext := ".png"
-	if exts, _ := mime.ExtensionsByType(match[1]); len(exts) > 0 {
+	if exts, _ := mime.ExtensionsByType(mediaType); len(exts) > 0 {
 		ext = exts[0]
 	}
 	name := generatedName(body.Name, "generated"+ext)
 	if filepath.Ext(name) == "" {
 		name += ext
 	}
-	rec, err := a.storeGeneratedGuestAttachment(r.Context(), identity, p, name, "generated-image", match[1], data)
+	rec, err := a.storeGeneratedGuestAttachment(r.Context(), identity, p, name, "generated-image", mediaType, data)
 	if err != nil {
+		a.refundGuestDailyCapability(r.Context(), "imagegen", identity.Subject, p.ImageGenerationsPerDay)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "generated_image_storage_failed"})
 		return
 	}
