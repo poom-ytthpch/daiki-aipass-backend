@@ -615,6 +615,59 @@ func (a *app) searxSearch(ctx context.Context, base, query string) ([]searxResul
 	return a.searxSearchWithLanguage(ctx, base, query, "all")
 }
 
+type storedGoogleResearchSource struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet"`
+	Engine  string `json:"engine"`
+	Stage   string `json:"stage"`
+}
+
+func researchRowsFromStoredGoogleEvidence(query string, payloads []json.RawMessage) []searxResult {
+	seen := map[string]bool{}
+	out := make([]searxResult, 0, 12)
+	for _, raw := range payloads {
+		var sources []storedGoogleResearchSource
+		if json.Unmarshal(raw, &sources) != nil {
+			continue
+		}
+		for _, source := range sources {
+			engine := strings.ToLower(strings.TrimSpace(source.Engine))
+			if engine != "google" && engine != "google cse" && engine != "google-cache" {
+				continue
+			}
+			if !isHTTPURL(source.URL) || seen[source.URL] || !researchCandidateRelevant(query, source.Title, source.URL, source.Snippet) {
+				continue
+			}
+			seen[source.URL] = true
+			stage := strings.TrimSpace(source.Stage)
+			if stage == "" {
+				stage = "durable-google-cache"
+			}
+			out = append(out, searxResult{
+				Title: source.Title, URL: source.URL, Content: source.Snippet, Engine: "google-cache",
+				Score: float64(researchRelevanceScore(query, source.Title, source.URL, source.Snippet)), Stage: stage, SearchQuery: query,
+			})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Score > out[j].Score })
+	if len(out) > 12 {
+		out = out[:12]
+	}
+	return out
+}
+
+func (a *app) durableGoogleResearchEvidence(ctx context.Context, query string) []searxResult {
+	if a.store == nil {
+		return nil
+	}
+	payloads, err := a.store.RecentResearchSourceMetadata(ctx, time.Now().Add(-7*24*time.Hour), 250)
+	if err != nil {
+		return nil
+	}
+	return researchRowsFromStoredGoogleEvidence(query, payloads)
+}
+
 func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language string) ([]searxResult, error) {
 	if strings.TrimSpace(language) == "" {
 		language = "all"
@@ -711,8 +764,19 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 	if rows, err := search("google cse"); err == nil && len(rows) > 0 {
 		return rows, nil
 	} else {
-		if rows := lastGood(); len(rows) > 0 {
-			return rows, nil
+		providerFailed := firstErr != nil || err != nil
+		if providerFailed {
+			if rows := lastGood(); len(rows) > 0 {
+				return rows, nil
+			}
+			if rows := a.durableGoogleResearchEvidence(ctx, query); len(rows) > 0 {
+				if a.redis != nil {
+					if raw, marshalErr := json.Marshal(rows); marshalErr == nil {
+						_ = a.redis.Set(ctx, lastGoodKey, raw, 6*time.Hour).Err()
+					}
+				}
+				return rows, nil
+			}
 		}
 		if firstErr != nil && err != nil {
 			return nil, fmt.Errorf("Google Search unavailable: %v; Google CSE unavailable: %w", firstErr, err)
@@ -722,8 +786,8 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 		}
 		// An empty response is still a successful Google lookup. Preserve the
 		// historical caller contract so webResearch can report "no search results"
-		// distinctly from CAPTCHA/provider failures. LKG is used only for actual
-		// Google transport/provider errors above.
+		// distinctly from CAPTCHA/provider failures. Cached evidence is used only
+		// when a Google transport/provider failure happened above.
 		return nil, nil
 	}
 }

@@ -391,6 +391,25 @@ func TestSearxSearchDoesNotFallBackOutsideGoogle(t *testing.T) {
 	}
 }
 
+func TestStoredGoogleEvidenceOnlyReusesGoogleProvenance(t *testing.T) {
+	query := "BYD Sealion 7 ราคาล่าสุด Thailand 2026"
+	payloads := []json.RawMessage{
+		json.RawMessage(`[
+			{"title":"BYD SEALION 7 | Rêver Automotive","url":"https://www.reverautomotive.com/en/model/sealion7/overview","snippet":"BYD SEALION 7 Thailand ราคา","engine":"google cse","stage":"local-primary"},
+			{"title":"BYD SEALION 7 direct","url":"https://www.reverautomotive.com/model/sealion7/overview","snippet":"BYD SEALION 7","engine":"direct","stage":"direct"},
+			{"title":"BYD SEALION 7 old brave","url":"https://www.reverautomotive.com/news/example","snippet":"BYD SEALION 7","engine":"brave","stage":"local-primary"},
+			{"title":"BYD SEALION 8 SUV 7 ที่นั่ง","url":"https://example.com/sealion8","snippet":"BYD SEALION 8 7 ที่นั่ง","engine":"google","stage":"local-primary"}
+		]`),
+	}
+	rows := researchRowsFromStoredGoogleEvidence(query, payloads)
+	if len(rows) != 1 {
+		t.Fatalf("stored Google evidence rows=%#v want exactly one Google-backed relevant source", rows)
+	}
+	if rows[0].URL != "https://www.reverautomotive.com/en/model/sealion7/overview" || rows[0].Engine != "google-cache" {
+		t.Fatalf("unexpected durable Google evidence: %#v", rows[0])
+	}
+}
+
 func TestExplicitWebResearchFailureFailsClosed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("content-type", "application/json")
