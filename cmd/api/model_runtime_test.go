@@ -392,6 +392,57 @@ func TestApplyReasoningForGPTOSSClampsOffToLow(t *testing.T) {
 	}
 }
 
+func TestModelRequestRecoversHTTP400ToolChoiceConflict(t *testing.T) {
+	calls := 0
+	var retryBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		raw, _ := io.ReadAll(r.Body)
+		if calls == 1 {
+			w.Header().Set("content-type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"litellm.BadRequestError: OpenAIException - Tool choice is none, but model called a tool.","code":"400"}}`))
+			return
+		}
+		_ = json.Unmarshal(raw, &retryBody)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"grounded answer"},"finish_reason":"stop"}],"usage":{"total_tokens":12}}`))
+	}))
+	defer srv.Close()
+
+	payload := []byte(`{"model":"qwen","messages":[{"role":"user","content":"use supplied evidence only"}],"tools":[{"type":"function","function":{"name":"search","parameters":{"type":"object"}}}],"tool_choice":"none","parallel_tool_calls":false}`)
+	a := &app{inferenceHTTP: srv.Client()}
+	makeReq := func(body []byte) (*http.Request, error) {
+		return http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader(string(body)))
+	}
+	resp, _, _, meta, err := a.doModelRequestWithRecovery(context.Background(), payload, "qwen", "research-direct", makeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || calls != 2 {
+		t.Fatalf("status=%d calls=%d meta=%#v", resp.StatusCode, calls, meta)
+	}
+	if !meta.ProviderCompatibilityRetry || meta.FailureKind != "provider_tool_choice" {
+		t.Fatalf("expected bounded tool-choice compatibility retry, meta=%#v", meta)
+	}
+	if _, ok := retryBody["tools"]; ok {
+		t.Fatalf("retry must remove tools: %#v", retryBody)
+	}
+	if _, ok := retryBody["tool_choice"]; ok {
+		t.Fatalf("retry must remove tool_choice: %#v", retryBody)
+	}
+	messages, _ := retryBody["messages"].([]any)
+	if len(messages) < 2 {
+		t.Fatalf("retry missing compatibility system message: %#v", retryBody)
+	}
+	first, _ := messages[0].(map[string]any)
+	content, _ := first["content"].(string)
+	if !strings.Contains(content, "Return the answer as normal text only") {
+		t.Fatalf("retry missing text-only instruction: %#v", first)
+	}
+}
+
 func TestProviderFailureStatusDetectsHermesToolChoiceConflict(t *testing.T) {
 	raw := []byte(`{"choices":[{"message":{"role":"assistant","content":"API call failed after 1 retries: litellm.APIConnectionError: OpenAIException - Tool choice is none, but model called a tool"},"finish_reason":"error"}],"hermes":{"completed":false,"failed":true,"error_code":"agent_error"}}`)
 	if got := providerFailureStatus(raw); got != http.StatusBadGateway {

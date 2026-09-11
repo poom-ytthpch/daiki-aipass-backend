@@ -1039,6 +1039,23 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 				resp.Status = fmt.Sprintf("%d %s", softStatus, http.StatusText(softStatus))
 			}
 		}
+		if statusForRecovery == http.StatusBadRequest {
+			errBody, _ = io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+			_ = resp.Body.Close()
+			if unexpectedBlockedToolCall(errBody) && !compatibilityRetried {
+				// LiteLLM/Groq may reject a completion when the model emits a hidden
+				// tool call despite tool_choice=none. HTTP 400 is normally terminal,
+				// so detect only this exact compatibility signature and retry once
+				// with all tool fields removed plus an explicit text-only instruction.
+				body = applyTextOnlyProviderCompatibility(body)
+				compatibilityRetried = true
+				meta.ProviderCompatibilityRetry = true
+				meta.FailureKind = "provider_tool_choice"
+				continue
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(errBody))
+			resp.Header.Set("content-type", "application/json")
+		}
 		if !recoverableProviderStatus(statusForRecovery) {
 			if statusForRecovery < 400 {
 				a.clearModelCircuit(ctx, currentModel)

@@ -87,6 +87,13 @@ func researchUnsupportedClaims(text string, meta researchMetadata) []string {
 			add(match[1])
 		}
 	}
+	lowerText := strings.ToLower(text)
+	if strings.Contains(lowerText, "ไม่รวมภาษี") || strings.Contains(lowerText, "ภาษีและค่าธรรมเนียม") || strings.Contains(lowerText, "tax not included") || strings.Contains(lowerText, "excluding tax") || strings.Contains(lowerText, "taxes and fees") {
+		add("ภาษี tax")
+	}
+	if strings.Contains(lowerText, "ไม่รวมค่าธรรมเนียม") || strings.Contains(lowerText, "ค่าธรรมเนียมอื่น") || strings.Contains(lowerText, "fees not included") || strings.Contains(lowerText, "excluding fees") {
+		add("ค่าธรรมเนียม fees")
+	}
 	sort.Strings(violations)
 	if len(violations) > 12 {
 		violations = violations[:12]

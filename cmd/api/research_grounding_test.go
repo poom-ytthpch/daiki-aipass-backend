@@ -40,6 +40,16 @@ func TestResearchGroundingAcceptsSupportedPrices(t *testing.T) {
 	}
 }
 
+func TestResearchGroundingRejectsUnsupportedTaxFeeDisclaimer(t *testing.T) {
+	meta := sealionGroundingMeta()
+	text := "Premium 1,199,900 บาท [1] ราคานี้อาจยังไม่รวมภาษีและค่าธรรมเนียมอื่น ๆ"
+	violations := researchUnsupportedClaims(text, meta)
+	joined := strings.ToLower(strings.Join(violations, " "))
+	if !strings.Contains(joined, "tax") && !strings.Contains(joined, "ภาษี") {
+		t.Fatalf("unsupported tax/fee disclaimer must be rejected: %#v", violations)
+	}
+}
+
 func TestResearchGroundingRejectsUnsupportedManufacturerAttribution(t *testing.T) {
 	meta := sealionGroundingMeta()
 	text := "รถรุ่นนี้ผลิตโดยบริษัท Chery และทำตลาดในชื่อ SEALION 7"
