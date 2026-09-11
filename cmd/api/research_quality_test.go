@@ -61,6 +61,37 @@ func TestSealion7ResearchRelevanceRejectsMismatchedSources(t *testing.T) {
 	}
 }
 
+func TestSealion7RejectsSealion8SevenSeatNoise(t *testing.T) {
+	query := "BYD Sealion 7 ราคาล่าสุด Thailand"
+	title := "BYD SEALION 8 เจาะลึกสเปก ราคาล่าสุด SUV 7 ที่นั่ง"
+	content := "BYD SEALION 8 เปิดตัวในไทย 2026 รถ SUV แบบ 7 ที่นั่ง"
+	if got := researchCandidateRelevant(query, title, "https://example.com/byd-sealion-8", content); got {
+		t.Fatalf("sibling model with an unrelated 7-seat mention must be rejected, score=%d", researchRelevanceScore(query, title, "https://example.com/byd-sealion-8", content))
+	}
+}
+
+func TestPriceEvidenceRequiresAnActualPriceClaim(t *testing.T) {
+	query := "BYD Sealion 7 ราคาล่าสุด Thailand"
+	withoutPrice := researchSource{Title: "BYD SEALION 7 ราคาและสเปก", URL: "https://example.com/sealion7", Excerpt: "BYD SEALION 7 รุ่นใหม่ในประเทศไทย ข้อมูลอัปเดตกันยายน 2026"}
+	withPrice := researchSource{Title: "BYD SEALION 7 ราคา", URL: "https://example.com/sealion7-price", Excerpt: "BYD SEALION 7 Premium ราคา 1,199,900 บาท"}
+	if got := researchEvidenceScoreForQuery(query, withoutPrice); got > 32 {
+		t.Fatalf("price query without an actual price must have weak evidence, got %d", got)
+	}
+	if got := researchEvidenceScoreForQuery(query, withPrice); got < 90 {
+		t.Fatalf("price query with an explicit price should retain strong evidence, got %d", got)
+	}
+}
+
+func TestSitemapEntityURLsRejectSiblingModel(t *testing.T) {
+	query := "BYD Sealion 7 ราคาล่าสุด Thailand"
+	xml := `<urlset><url><loc>https://official.example/model/sealion8/overview</loc></url><url><loc>https://official.example/model/sealion7/tech-spec</loc></url><url><loc>https://official.example/model/sealion7/overview</loc></url></urlset>`
+	urls := researchSitemapEntityURLs(query, xml)
+	joined := strings.Join(urls, "\n")
+	if strings.Contains(joined, "sealion8") || !strings.Contains(joined, "/model/sealion7/overview") {
+		t.Fatalf("unexpected sitemap entity matches: %#v", urls)
+	}
+}
+
 func TestResearchAuthorityDoesNotConfuseGovernmentWithProductPrimary(t *testing.T) {
 	query := "BYD Sealion 7 ราคา ล่าสุด Thailand"
 	localDistributor := researchAuthorityForCandidate(query,

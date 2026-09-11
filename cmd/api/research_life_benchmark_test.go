@@ -42,8 +42,8 @@ func lifeBenchmarkAuthorities(seed lifeBenchmarkSeed) (string, string) {
 
 func lifeBenchmarkUpgraded(seed lifeBenchmarkSeed) []researchSource {
 	primaryAuthority, secondaryAuthority := lifeBenchmarkAuthorities(seed)
-	primaryEvidence := seed.Name + " Thailand current reference updated September 2026 with current price, product specifications, availability and model details."
-	secondaryEvidence := seed.Name + " Thailand independent guide updated September 2026 with current retail availability, comparison details and local pricing context."
+	primaryEvidence := seed.Name + " Thailand current reference updated September 2026 with current retail price THB 1,999, product specifications, availability and model details."
+	secondaryEvidence := seed.Name + " Thailand independent guide updated September 2026 with current retail price THB 2,099, comparison details and local pricing context."
 	if researchInterpretiveIntent(lifeBenchmarkQuery(seed)) {
 		primaryEvidence = seed.Name + " astrology ephemeris and interpretive reference for September 2026; interpretation is presented as a belief/tradition rather than scientific fact."
 		secondaryEvidence = seed.Name + " independent astrology interpretation and reference for September 2026, clearly separated from empirically verified claims."

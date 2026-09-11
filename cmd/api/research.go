@@ -75,10 +75,13 @@ type searxResponse struct {
 }
 
 var (
-	researchScriptRE = regexp.MustCompile(`(?is)<(?:script|style|noscript|svg|iframe)[^>]*>.*?</(?:script|style|noscript|svg|iframe)>`)
-	researchTagRE    = regexp.MustCompile(`(?s)<[^>]+>`)
-	researchSpaceRE  = regexp.MustCompile(`\s+`)
-	researchURLRE    = regexp.MustCompile(`(?i)https?://[^\s<>"']+`)
+	researchScriptRE  = regexp.MustCompile(`(?is)<(?:script|style|noscript|svg|iframe)[^>]*>.*?</(?:script|style|noscript|svg|iframe)>`)
+	researchTagRE     = regexp.MustCompile(`(?s)<[^>]+>`)
+	researchSpaceRE   = regexp.MustCompile(`\s+`)
+	researchURLRE     = regexp.MustCompile(`(?i)https?://[^\s<>"']+`)
+	researchHrefRE    = regexp.MustCompile(`(?i)href\s*=\s*["']([^"'#]+)["']`)
+	researchLocRE     = regexp.MustCompile(`(?is)<loc>\s*(https?://[^<]+?)\s*</loc>`)
+	researchSitemapRE = regexp.MustCompile(`(?im)^\s*sitemap:\s*(https?://\S+)\s*$`)
 )
 
 func normalizeResearchMode(v any) string {
@@ -848,33 +851,43 @@ func isHTTPURL(raw string) bool {
 	return u.Scheme == "http" || u.Scheme == "https"
 }
 
-func fetchPublicPage(ctx context.Context, client *http.Client, raw string) (string, error) {
+func fetchPublicDocument(ctx context.Context, client *http.Client, raw string, maxBytes int64) (string, string, error) {
 	if !isHTTPURL(raw) {
-		return "", errors.New("unsafe source URL")
+		return "", "", errors.New("unsafe source URL")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("user-agent", "Mozilla/5.0 (compatible; DaikiAIResearch/1.0; +https://daiki-aipass.matchchemical.co)")
-	req.Header.Set("accept", "text/html,text/plain,application/json;q=0.8,*/*;q=0.1")
+	req.Header.Set("accept", "text/html,text/plain,application/xml,text/xml,application/json;q=0.8,*/*;q=0.1")
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("source HTTP %d", resp.StatusCode)
+		return "", "", fmt.Errorf("source HTTP %d", resp.StatusCode)
 	}
 	ct := strings.ToLower(resp.Header.Get("content-type"))
-	if ct != "" && !strings.Contains(ct, "text/") && !strings.Contains(ct, "json") {
-		return "", errors.New("unsupported source content type")
+	if ct != "" && !strings.Contains(ct, "text/") && !strings.Contains(ct, "json") && !strings.Contains(ct, "xml") {
+		return "", "", errors.New("unsupported source content type")
 	}
-	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 350<<10))
+	if maxBytes <= 0 {
+		maxBytes = 350 << 10
+	}
+	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	if err != nil {
+		return "", "", err
+	}
+	return string(rawBody), ct, nil
+}
+
+func fetchPublicPage(ctx context.Context, client *http.Client, raw string) (string, error) {
+	text, ct, err := fetchPublicDocument(ctx, client, raw, 350<<10)
 	if err != nil {
 		return "", err
 	}
-	text := string(rawBody)
 	if strings.Contains(ct, "html") || strings.Contains(strings.ToLower(text[:min(len(text), 300)]), "<html") {
 		text = researchScriptRE.ReplaceAllString(text, " ")
 		text = researchTagRE.ReplaceAllString(text, " ")

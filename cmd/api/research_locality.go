@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	htmlstd "html"
 	"net/url"
 	"sort"
 	"strings"
@@ -322,6 +323,335 @@ func sortResearchResults(results []searxResult, query string, prefs researchPref
 	})
 }
 
+type researchOutboundCandidate struct {
+	URL            string
+	Host           string
+	Score          int
+	OfficialSignal bool
+}
+
+func researchIgnoredOutboundHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" || researchSocialPlatform("https://"+host) != "" {
+		return true
+	}
+	for _, blocked := range []string{
+		"google.com", "google.co.th", "gstatic.com", "googleapis.com", "googletagmanager.com",
+		"doubleclick.net", "cloudflare.com", "line.me", "linktr.ee", "apple.com", "microsoft.com",
+	} {
+		if host == blocked || strings.HasSuffix(host, "."+blocked) {
+			return true
+		}
+	}
+	return false
+}
+
+func researchOutboundCandidates(baseURL, rawHTML, query string) []researchOutboundCandidate {
+	base, err := url.Parse(baseURL)
+	if err != nil || base.Hostname() == "" {
+		return nil
+	}
+	baseHost := strings.ToLower(strings.TrimPrefix(base.Hostname(), "www."))
+	type acc struct {
+		candidate researchOutboundCandidate
+		count     int
+	}
+	byHost := map[string]*acc{}
+	for _, match := range researchHrefRE.FindAllStringSubmatchIndex(rawHTML, -1) {
+		if len(match) < 4 || match[2] < 0 || match[3] <= match[2] {
+			continue
+		}
+		href := htmlstd.UnescapeString(strings.TrimSpace(rawHTML[match[2]:match[3]]))
+		ref, err := url.Parse(href)
+		if err != nil {
+			continue
+		}
+		target := base.ResolveReference(ref)
+		target.Fragment = ""
+		if !isHTTPURL(target.String()) {
+			continue
+		}
+		host := strings.ToLower(strings.TrimPrefix(target.Hostname(), "www."))
+		if host == baseHost || researchIgnoredOutboundHost(host) {
+			continue
+		}
+		start := max(0, match[0]-280)
+		end := min(len(rawHTML), match[1]+360)
+		contextText := htmlstd.UnescapeString(researchTagRE.ReplaceAllString(rawHTML[start:end], " "))
+		contextText = researchSpaceRE.ReplaceAllString(contextText, " ")
+		score := 1
+		official := researchOfficialDistributorSignal(contextText, contextText)
+		if official {
+			score += 8
+		}
+		lowerTarget := strings.ToLower(target.String())
+		lowerContext := strings.ToLower(contextText)
+		for _, term := range researchEntityTerms(query) {
+			if len(term) < 3 || researchPureNumericModelTerm(term) {
+				continue
+			}
+			if strings.Contains(lowerTarget, term) {
+				score += 4
+			} else if strings.Contains(lowerContext, term) {
+				score += 2
+			}
+		}
+		if researchCandidateRelevant(query, contextText, target.String(), contextText) {
+			score += 5
+		}
+		entry := byHost[host]
+		if entry == nil {
+			entry = &acc{candidate: researchOutboundCandidate{URL: target.String(), Host: host, Score: score, OfficialSignal: official}}
+			byHost[host] = entry
+		} else {
+			entry.count++
+			entry.candidate.Score += min(3, entry.count)
+			entry.candidate.OfficialSignal = entry.candidate.OfficialSignal || official
+			if score > entry.candidate.Score {
+				entry.candidate.URL = target.String()
+			}
+		}
+	}
+	out := make([]researchOutboundCandidate, 0, len(byHost))
+	for _, entry := range byHost {
+		out = append(out, entry.candidate)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Score > out[j].Score })
+	if len(out) > 6 {
+		out = out[:6]
+	}
+	return out
+}
+
+func researchSitemapDirectives(origin string, robots string) []string {
+	base, err := url.Parse(origin)
+	if err != nil || base.Hostname() == "" {
+		return nil
+	}
+	host := researchHost(origin)
+	out := make([]string, 0, 3)
+	seen := map[string]bool{}
+	add := func(raw string) {
+		u, err := url.Parse(strings.TrimSpace(htmlstd.UnescapeString(raw)))
+		if err != nil || !isHTTPURL(u.String()) || researchHost(u.String()) != host || seen[u.String()] {
+			return
+		}
+		seen[u.String()] = true
+		out = append(out, u.String())
+	}
+	for _, match := range researchSitemapRE.FindAllStringSubmatch(robots, -1) {
+		if len(match) > 1 {
+			add(match[1])
+		}
+		if len(out) >= 2 {
+			break
+		}
+	}
+	defaultURL := *base
+	defaultURL.Path = "/sitemap.xml"
+	defaultURL.RawQuery = ""
+	defaultURL.Fragment = ""
+	add(defaultURL.String())
+	if len(out) > 2 {
+		out = out[:2]
+	}
+	return out
+}
+
+func researchSitemapEntityURLs(query, rawXML string) []string {
+	type candidate struct {
+		url   string
+		score int
+	}
+	seen := map[string]bool{}
+	rows := make([]candidate, 0, 12)
+	for _, match := range researchLocRE.FindAllStringSubmatch(rawXML, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		raw := strings.TrimSpace(htmlstd.UnescapeString(match[1]))
+		if seen[raw] || !isHTTPURL(raw) {
+			continue
+		}
+		seen[raw] = true
+		relevance := researchRelevanceScore(query, raw, raw, raw)
+		if relevance < 58 {
+			continue
+		}
+		score := relevance
+		lower := strings.ToLower(raw)
+		if strings.Contains(lower, "/model/") || strings.Contains(lower, "/models/") || strings.Contains(lower, "/product/") {
+			score += 20
+		}
+		if strings.Contains(lower, "overview") {
+			score += 12
+		}
+		if strings.Contains(lower, "tech-spec") || strings.Contains(lower, "spec") {
+			score += 8
+		}
+		if researchPriceIntent(query) && (strings.Contains(lower, "price") || strings.Contains(lower, "campaign")) {
+			score += 6
+		}
+		rows = append(rows, candidate{url: raw, score: score})
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].score > rows[j].score })
+	out := make([]string, 0, min(4, len(rows)))
+	for _, row := range rows[:min(4, len(rows))] {
+		out = append(out, row.url)
+	}
+	return out
+}
+
+func researchOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	u.Path, u.RawQuery, u.Fragment = "/", "", ""
+	return u.String()
+}
+
+func (a *app) discoverLinkedOfficialSources(ctx context.Context, query string, prefs researchPreferences, rows []searxResult) []researchSource {
+	if len(rows) == 0 || strings.TrimSpace(researchEntityPhrase(query)) == "" {
+		return nil
+	}
+	client := newPublicWebClient(7 * time.Second)
+	seedRows := append([]searxResult(nil), rows...)
+	seedPriority := func(stage string) int {
+		switch stage {
+		case "local-primary-distributor":
+			return 4
+		case "local-primary-current", "local-primary":
+			return 3
+		case "discovered-primary":
+			return 2
+		default:
+			if strings.HasPrefix(stage, "local-") {
+				return 1
+			}
+			return 0
+		}
+	}
+	sort.SliceStable(seedRows, func(i, j int) bool { return seedPriority(seedRows[i].Stage) > seedPriority(seedRows[j].Stage) })
+	candidateByHost := map[string]researchOutboundCandidate{}
+	seedPages := 0
+	for _, row := range seedRows {
+		if seedPages >= 2 {
+			break
+		}
+		if !isHTTPURL(row.URL) || researchSocialPlatform(row.URL) != "" || !researchCandidateRelevant(query, row.Title, row.URL, row.Content) {
+			continue
+		}
+		if !strings.HasPrefix(row.Stage, "local-") && row.Stage != "discovered-primary" {
+			continue
+		}
+		rawHTML, ct, err := fetchPublicDocument(ctx, client, row.URL, 550<<10)
+		if err != nil || (!strings.Contains(ct, "html") && !strings.Contains(strings.ToLower(rawHTML[:min(len(rawHTML), 300)]), "<html")) {
+			continue
+		}
+		seedPages++
+		for _, candidate := range researchOutboundCandidates(row.URL, rawHTML, query) {
+			if existing, ok := candidateByHost[candidate.Host]; !ok || candidate.Score > existing.Score {
+				candidateByHost[candidate.Host] = candidate
+			} else if candidate.OfficialSignal && !existing.OfficialSignal {
+				existing.OfficialSignal = true
+				candidateByHost[candidate.Host] = existing
+			}
+		}
+	}
+	if len(candidateByHost) == 0 {
+		return nil
+	}
+	candidates := make([]researchOutboundCandidate, 0, len(candidateByHost))
+	for _, candidate := range candidateByHost {
+		candidates = append(candidates, candidate)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Score > candidates[j].Score })
+	if len(candidates) > 3 {
+		candidates = candidates[:3]
+	}
+
+	out := make([]researchSource, 0, 2)
+	for _, candidate := range candidates {
+		origin := researchOrigin(candidate.URL)
+		if origin == "" {
+			continue
+		}
+		official := candidate.OfficialSignal
+		if homeText, err := fetchPublicPage(ctx, client, origin); err == nil && researchOfficialDistributorSignal(homeText, homeText) {
+			official = true
+		}
+
+		robotsURL, _ := url.Parse(origin)
+		robotsURL.Path = "/robots.txt"
+		robotsURL.RawQuery, robotsURL.Fragment = "", ""
+		robots, _, _ := fetchPublicDocument(ctx, client, robotsURL.String(), 96<<10)
+		sitemaps := researchSitemapDirectives(origin, robots)
+		targets := make([]string, 0, 4)
+		seenTargets := map[string]bool{}
+		for _, sitemapURL := range sitemaps {
+			xml, _, err := fetchPublicDocument(ctx, client, sitemapURL, 1400<<10)
+			if err != nil {
+				continue
+			}
+			for _, target := range researchSitemapEntityURLs(query, xml) {
+				if researchHost(target) != candidate.Host || seenTargets[target] {
+					continue
+				}
+				seenTargets[target] = true
+				targets = append(targets, target)
+				if len(targets) >= 4 {
+					break
+				}
+			}
+			if len(targets) >= 4 {
+				break
+			}
+		}
+		if len(targets) == 0 && researchCandidateRelevant(query, candidate.URL, candidate.URL, candidate.URL) {
+			targets = append(targets, candidate.URL)
+		}
+		for _, target := range targets {
+			text, err := fetchPublicPage(ctx, client, target)
+			if err != nil || !researchCandidateRelevant(query, target, target, text) {
+				continue
+			}
+			if researchOfficialDistributorSignal(text, text) {
+				official = true
+			}
+			authority := "secondary"
+			stage := "discovered-linked-direct"
+			if official {
+				authority = "primary"
+				stage = "discovered-official-direct"
+			}
+			source := researchSource{
+				Title:      first(researchEntityPhrase(query), candidate.Host) + " — " + candidate.Host,
+				URL:        target,
+				Excerpt:    researchFocusedExcerpt(query, text, 6500),
+				Engine:     "direct-discovery",
+				Region:     researchSourceRegion("", target, text, prefs),
+				Authority:  authority,
+				SourceType: "web",
+				Stage:      stage,
+			}
+			if prefs.Region == "TH" {
+				source.Region = "TH"
+			}
+			scoreResearchSource(query, &source, time.Now())
+			boostResearchSourceForPlan(query, prefs, &source)
+			if source.QualityScore < 58 {
+				continue
+			}
+			out = append(out, source)
+			if len(out) >= 2 {
+				return out
+			}
+		}
+	}
+	return out
+}
+
 func withResearchRunID(ctx context.Context, runID string) context.Context {
 	if strings.TrimSpace(runID) == "" {
 		return ctx
@@ -483,6 +813,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 	}
 	results = unique
 	sortResearchResults(results, query, prefs)
+	discoveredOfficial := a.discoverLinkedOfficialSources(ctx, query, prefs, results)
 
 	limit := a.cfg.WebResearchMaxResults
 	if limit <= 0 || limit > 8 {
@@ -547,6 +878,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 		}
 	}
 	appendRowsN(direct, 0)
+	appendRowsN(discoveredOfficial, 2)
 	if prefs.Region == "TH" && prefs.Scope != "global" {
 		if researchFreshnessIntent(query) {
 			appendRowsN(localCurrent, 1)
@@ -616,7 +948,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 	for i := range sources {
 		// Public social pages are frequently login-walled or bot-blocked. Keep the
 		// indexed search snippet instead of failing the full research run.
-		if sources[i].SourceType == "social" {
+		if sources[i].SourceType == "social" || strings.TrimSpace(sources[i].Excerpt) != "" {
 			continue
 		}
 		fetchIndexes = append(fetchIndexes, i)

@@ -91,6 +91,19 @@ func TestResearchQueryVariantsForAIPass(t *testing.T) {
 		t.Fatalf("missing authoritative fallback query: %#v", variants)
 	}
 }
+
+func TestOutboundOfficialLinkAndSitemapDiscovery(t *testing.T) {
+	html := `<html><body><p>BYD Thailand ผู้จัดจำหน่ายอย่างเป็นทางการ <a href="https://official.example/model/sealion7/overview">SEALION 7 official</a></p></body></html>`
+	candidates := researchOutboundCandidates("https://dealer.example/byd-sealion7", html, "BYD Sealion 7 ราคาล่าสุด Thailand")
+	if len(candidates) == 0 || candidates[0].Host != "official.example" || !candidates[0].OfficialSignal {
+		t.Fatalf("official outbound candidate not discovered: %#v", candidates)
+	}
+	directives := researchSitemapDirectives("https://official.example/", "Sitemap: https://official.example/sitemap.xml\nSitemap: https://other.example/sitemap.xml")
+	if len(directives) != 1 || directives[0] != "https://official.example/sitemap.xml" {
+		t.Fatalf("sitemap directives must stay on the discovered host: %#v", directives)
+	}
+}
+
 func TestWebCapabilityQuestion(t *testing.T) {
 	for _, q := range []string{
 		"ตอนนี้เข้า internet ได้ยัง",

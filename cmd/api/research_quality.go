@@ -11,6 +11,8 @@ import (
 
 var researchEntityTokenRE = regexp.MustCompile(`(?i)v?[0-9]+(?:\.[0-9]+){1,3}|[a-z0-9][a-z0-9._-]{1,}|[0-9]{1,4}`)
 var researchYearRE = regexp.MustCompile(`\b(?:20[0-9]{2}|25[0-9]{2})\b`)
+var researchPriceEvidenceRE = regexp.MustCompile(`(?i)(?:[$€£¥฿]\s*\d[\d,.]*|(?:thb|usd|eur|gbp|jpy)\s*\d[\d,.]*|\d[\d,.]*\s*(?:บาท|baht|thb|usd|eur|gbp|jpy))`)
+var researchLoosePriceRE = regexp.MustCompile(`(?i)(?:ราคา|price|starting\s+price)\s*(?::|=|-|เริ่มต้น|starting\s+at)?\s*[$€£¥฿]?\s*(\d[\d,.]*)`)
 
 var researchEntityStopwords = map[string]bool{
 	"find": true, "search": true, "research": true, "latest": true, "current": true, "today": true,
@@ -167,10 +169,30 @@ func researchRelevanceScore(query, title, rawURL, content string) int {
 	// Do not drift to a sibling product/model. For example, a Sealion 7 query
 	// must reject Sealion 6 even though the brand/family terms are similar.
 	for _, number := range modelNumberTerms {
+		anchor := ""
+		for i, term := range terms {
+			if term != number {
+				continue
+			}
+			for j := i - 1; j >= 0; j-- {
+				if researchTermHasLetter(terms[j]) {
+					anchor = normalizeResearchText(terms[j])
+					break
+				}
+			}
+			break
+		}
 		matched := strings.Contains(hay, " "+number+" ")
-		if !matched {
-			for _, alpha := range longAlphaValues {
-				if strings.Contains(hay, alpha+number) || strings.Contains(hay, alpha+" "+number) {
+		if anchor != "" {
+			matched = false
+			for _, candidate := range []string{
+				anchor + number,
+				anchor + " " + number,
+				anchor + " model " + number,
+				anchor + " series " + number,
+				anchor + " รุ่น " + number,
+			} {
+				if strings.Contains(hay, candidate) {
 					matched = true
 					break
 				}
@@ -195,6 +217,16 @@ func researchCandidateRelevant(query, title, rawURL, content string) bool {
 func researchFreshnessIntent(query string) bool {
 	q := strings.ToLower(query)
 	for _, signal := range []string{"latest", "current", "today", "price", "promo", "promotion", "availability", "release", "2026", "ล่าสุด", "ปัจจุบัน", "วันนี้", "ราคา", "โปรโมชั่น", "โปร", "มีขาย", "เปิดตัว", "กันยายน", "สิงหาคม"} {
+		if strings.Contains(q, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func researchPriceIntent(query string) bool {
+	q := strings.ToLower(query)
+	for _, signal := range []string{"price", "prices", "how much", "ราคา", "กี่บาท", "เท่าไหร่", "เท่าไร"} {
 		if strings.Contains(q, signal) {
 			return true
 		}
@@ -511,6 +543,45 @@ func researchEvidenceScore(source researchSource) int {
 	return 25
 }
 
+func researchHasPriceEvidence(text string) bool {
+	if researchPriceEvidenceRE.MatchString(text) {
+		return true
+	}
+	for _, match := range researchLoosePriceRE.FindAllStringSubmatch(text, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		raw := strings.TrimSpace(match[1])
+		digits := strings.NewReplacer(",", "", ".", "").Replace(raw)
+		value, err := strconv.Atoi(digits)
+		if err != nil {
+			continue
+		}
+		// A bare 4-digit current/B.E. year after the word "price" is usually
+		// metadata such as "price 2026", not an actual monetary amount.
+		if !strings.ContainsAny(raw, ",.") && len(digits) == 4 && value >= 1900 && value <= 2600 {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func researchEvidenceScoreForQuery(query string, source researchSource) int {
+	score := researchEvidenceScore(source)
+	if !researchPriceIntent(query) {
+		return score
+	}
+	text := strings.TrimSpace(source.Title + " " + source.Snippet + " " + source.Excerpt)
+	if researchHasPriceEvidence(text) {
+		return score
+	}
+	if source.SourceType == "social" {
+		return min(score, 22)
+	}
+	return min(score, 32)
+}
+
 func scoreResearchSource(query string, source *researchSource, now time.Time) {
 	if source == nil {
 		return
@@ -522,7 +593,7 @@ func scoreResearchSource(query string, source *researchSource, now time.Time) {
 	}
 	source.AuthorityScore = researchAuthorityScore(source.Authority)
 	source.FreshnessScore = researchFreshnessScore(query, source.Title+" "+text, now)
-	source.EvidenceScore = researchEvidenceScore(*source)
+	source.EvidenceScore = researchEvidenceScoreForQuery(query, *source)
 	source.QualityScore = clampResearchScore((source.RelevanceScore*45 + source.AuthorityScore*25 + source.FreshnessScore*20 + source.EvidenceScore*10) / 100)
 }
 
@@ -704,7 +775,7 @@ func researchRetrievalBenchmarkScore(query string, sources []researchSource, exp
 			relevant++
 		}
 		freshTotal += researchFreshnessScore(query, source.Title+" "+source.Snippet+" "+source.Excerpt, now)
-		evidenceTotal += researchEvidenceScore(source)
+		evidenceTotal += researchEvidenceScoreForQuery(query, source)
 		host := researchHost(source.URL)
 		for _, expected := range expectedHosts {
 			if host == expected || strings.HasSuffix(host, "."+expected) {
