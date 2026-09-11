@@ -27,7 +27,7 @@ func (a *app) guestPolicyPublic(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "guest policy unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"enabled": p.Enabled, "model": "fast", "quotaMode": p.QuotaMode, "tokenLimit": p.TokenLimit, "intervalKind": p.IntervalKind,
 		"requestsPerHour": p.RequestsPerHour, "minIntervalSeconds": p.MinIntervalSeconds, "maxCompletionTokens": p.MaxCompletionTokens,
 		"allowUploads": p.AllowUploads, "allowImageGeneration": p.AllowImageGeneration, "allowFileGeneration": p.AllowFileGeneration,
@@ -35,7 +35,15 @@ func (a *app) guestPolicyPublic(w http.ResponseWriter, r *http.Request) {
 		"maxStoredBytes": p.MaxStoredBytes, "maxAttachmentsPerMessage": p.MaxAttachmentsPerMessage, "attachmentRetentionHours": p.AttachmentRetentionHours,
 		"imageGenerationsPerDay": p.ImageGenerationsPerDay, "fileGenerationsPerDay": p.FileGenerationsPerDay,
 		"maxGeneratedFileBytes": p.MaxGeneratedFileBytes, "maxGeneratedImageBytes": p.MaxGeneratedImageBytes,
-	})
+	}
+	identity := guestIdentityForRequest(r)
+	if decision, _, quotaErr := a.guestQuota(r.Context(), identity.Subject, p); quotaErr == nil {
+		payload["quota"] = decision
+	}
+	if retryAfter, rateErr := a.guestRateRetryAfter(r.Context(), identity.Subject, p); rateErr == nil {
+		payload["rateRetryAfterSeconds"] = max(0, int(retryAfter.Seconds()))
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (a *app) adminGuestPolicy(w http.ResponseWriter, r *http.Request) {
@@ -184,6 +192,26 @@ func restrictGuestChat(body []byte, p store.GuestAccessPolicy) ([]byte, error) {
 	return json.Marshal(clean)
 }
 
+func (a *app) guestRateRetryAfter(ctx context.Context, subject string, p store.GuestAccessPolicy) (time.Duration, error) {
+	if p.RequestsPerHour == 0 && p.MinIntervalSeconds == 0 {
+		return 0, nil
+	}
+	if a.redis == nil {
+		return 0, fmt.Errorf("guest rate limiter unavailable")
+	}
+	now := time.Now().UTC()
+	hourKey := "guest-chat:hour:" + subject
+	lastKey := "guest-chat:last:" + subject
+	script := `local now=tonumber(ARGV[1]); local minGap=tonumber(ARGV[2]); local hourly=tonumber(ARGV[3]); local wait=0; local last=tonumber(redis.call('GET',KEYS[2]) or '0'); if minGap>0 and last>0 and now-last<minGap then wait=minGap-(now-last) end; local count=tonumber(redis.call('GET',KEYS[1]) or '0'); if hourly>0 and count>=hourly then local ttl=redis.call('TTL',KEYS[1]); if ttl<1 then ttl=3600 end; if ttl>wait then wait=ttl end end; return wait`
+	result, err := a.redis.Eval(ctx, script, []string{hourKey, lastKey}, now.Unix(), p.MinIntervalSeconds, p.RequestsPerHour).Int64()
+	if err != nil {
+		return 0, err
+	}
+	if result <= 0 {
+		return 0, nil
+	}
+	return time.Duration(result) * time.Second, nil
+}
 func (a *app) enforceGuestRate(ctx context.Context, subject string, p store.GuestAccessPolicy) (time.Duration, error) {
 	// Zero explicitly means unlimited for each limiter. Avoid requiring Redis when
 	// both dimensions are unlimited so an admin policy change takes effect on the
@@ -401,7 +429,12 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		return
 	}
 	if decision.Remaining != nil && *decision.Remaining <= 0 {
-		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "guest_quota_exhausted", "quota": decision})
+		payload := map[string]any{"error": "guest_quota_exhausted", "quota": decision}
+		if seconds := quotaRetryAfterSeconds(decision); seconds > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			payload["retryAfterSeconds"] = seconds
+		}
+		writeJSON(w, http.StatusTooManyRequests, payload)
 		return
 	}
 	if retry, rateErr := a.enforceGuestRate(r.Context(), subject, p); rateErr != nil {
@@ -447,10 +480,16 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	}
 	if err := a.reserveQuota(r.Context(), requestID, decision, reserved); err != nil {
 		status, code := http.StatusServiceUnavailable, "guest_quota_service_unavailable"
+		payload := map[string]any{"error": code, "quota": decision}
 		if strings.Contains(err.Error(), "exhausted") {
 			status, code = http.StatusTooManyRequests, "guest_quota_exhausted"
+			payload["error"] = code
+			if seconds := quotaRetryAfterSeconds(decision); seconds > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(seconds))
+				payload["retryAfterSeconds"] = seconds
+			}
 		}
-		writeJSON(w, status, map[string]any{"error": code, "quota": decision})
+		writeJSON(w, status, payload)
 		return
 	}
 	if err := a.store.StartUsageForPrincipal(r.Context(), requestID, subject, "", guestAlias, string(route.Workload), reserved); err != nil {

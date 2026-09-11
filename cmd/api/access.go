@@ -161,6 +161,20 @@ func quotaWindowSpec(kind string, count int, seconds *int64, now time.Time) (tim
 func quotaWindow(p store.Policy, now time.Time) (time.Time, *time.Time) {
 	return quotaWindowSpec(p.IntervalKind, p.IntervalCount, p.IntervalSeconds, now)
 }
+func quotaRetryAfterSeconds(d quotaDecision) int {
+	if d.ResetAt == nil {
+		return 0
+	}
+	until := time.Until(*d.ResetAt)
+	if until <= 0 {
+		return 1
+	}
+	seconds := int(until / time.Second)
+	if until%time.Second != 0 {
+		seconds++
+	}
+	return max(1, seconds)
+}
 
 func policyQuotaSpecs(p store.Policy) ([]quotaSpec, error) {
 	if p.QuotaMode == "unlimited" || p.TokenLimit == nil {

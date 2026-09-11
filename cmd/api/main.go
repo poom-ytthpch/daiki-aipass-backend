@@ -584,9 +584,15 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if err := a.reserveQuota(r.Context(), requestID, decision, reserved); err != nil {
 		status := http.StatusServiceUnavailable
 		code := "quota_service_unavailable"
+		payload := map[string]any{"error": code, "quota": decision}
 		if strings.Contains(err.Error(), "exhausted") {
 			status = http.StatusTooManyRequests
 			code = "quota_exhausted"
+			payload["error"] = code
+			if seconds := quotaRetryAfterSeconds(decision); seconds > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(seconds))
+				payload["retryAfterSeconds"] = seconds
+			}
 			if a.redis != nil {
 				ttl := time.Hour
 				if decision.ResetAt != nil {
@@ -597,7 +603,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 				_ = a.redis.Set(r.Context(), "quota:blocked:"+decision.CounterKey, "1", ttl).Err()
 			}
 		}
-		writeJSON(w, status, map[string]any{"error": code, "quota": decision})
+		writeJSON(w, status, payload)
 		return
 	}
 	if a.redis != nil {

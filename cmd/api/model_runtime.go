@@ -34,6 +34,9 @@ type modelRecoveryMeta struct {
 	PreflightFallback        bool   `json:"preflightFallback,omitempty"`
 	PredictedInputTokens     int    `json:"predictedInputTokens,omitempty"`
 	FallbackTo               string `json:"fallbackTo,omitempty"`
+	OutputCapped             bool   `json:"outputCapped,omitempty"`
+	OriginalOutputTokens     int    `json:"originalOutputTokens,omitempty"`
+	FinalOutputTokens        int    `json:"finalOutputTokens,omitempty"`
 	FinalModel               string `json:"finalModel"`
 	RuntimeProfile           string `json:"runtimeProfile,omitempty"`
 	AppliedOverheadTokens    int    `json:"appliedOverheadTokens,omitempty"`
@@ -292,6 +295,34 @@ func trimChatContext(body []byte, target int) ([]byte, int, int, error) {
 		final = estimateChatInputTokens(out)
 	}
 	return out, original, final, nil
+}
+
+func runtimeOutputCap(m store.ProviderModel) int {
+	cap := m.MaxOutputTokens
+	if m.OTPMLimit > 0 {
+		// Never submit a single completion budget that already exceeds the
+		// provider output-tokens-per-minute ceiling. Keep a little headroom for
+		// provider-side accounting and concurrent short completions.
+		safeOTPM := max(1, int(float64(m.OTPMLimit)*0.90))
+		if cap <= 0 || safeOTPM < cap {
+			cap = safeOTPM
+		}
+	}
+	return cap
+}
+
+func requestCompletionLimit(body []byte) int {
+	var p struct {
+		MaxTokens           int `json:"max_tokens"`
+		MaxCompletionTokens int `json:"max_completion_tokens"`
+	}
+	if json.Unmarshal(body, &p) != nil {
+		return 0
+	}
+	if p.MaxCompletionTokens > 0 {
+		return p.MaxCompletionTokens
+	}
+	return max(0, p.MaxTokens)
 }
 
 func applyModelOutputCap(body []byte, maxOutput int) []byte {
@@ -828,7 +859,7 @@ func applyFallbackModel(ctx context.Context, a *app, body []byte, currentModel, 
 	overhead := runtimeAgentOverhead(m, profile)
 	meta.AppliedOverheadTokens = overhead
 	meta.FinalModel = currentModel
-	body = applyModelOutputCap(body, m.MaxOutputTokens)
+	body = applyModelOutputCap(body, runtimeOutputCap(m))
 	strategy := m.ContextStrategy
 	if strategy == "" {
 		strategy = "adaptive"
@@ -879,7 +910,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		}
 	}
 
-	body = applyModelOutputCap(body, m.MaxOutputTokens)
+	body = applyModelOutputCap(body, runtimeOutputCap(m))
 	if strategy == "adaptive" || strategy == "trim" {
 		if target := runtimeMessageTarget(m, 0, 1, overhead); target > 0 {
 			trimmed, orig, final, err := trimChatContext(body, target)
@@ -994,7 +1025,26 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 			return resp, body, currentModel, meta, nil
 		}
 		recovered := false
-		if statusForRecovery == http.StatusTooManyRequests && (strategy == "adaptive" || strategy == "trim") && (obs.Kind == "itpm" || obs.Kind == "tpm" || obs.Requested > obs.Limit && obs.Limit > 0) {
+		if statusForRecovery == http.StatusTooManyRequests && obs.Kind == "otpm" && obs.Limit > 0 {
+			before := requestCompletionLimit(body)
+			if before <= 0 {
+				before = obs.Requested
+			}
+			target := max(1, int(float64(obs.Limit)*0.90))
+			if configured := m.MaxOutputTokens; configured > 0 && configured < target {
+				target = configured
+			}
+			if before <= 0 || before > target {
+				if meta.OriginalOutputTokens == 0 {
+					meta.OriginalOutputTokens = before
+				}
+				body = applyModelOutputCap(body, target)
+				meta.FinalOutputTokens = requestCompletionLimit(body)
+				meta.OutputCapped = meta.FinalOutputTokens > 0 && (before <= 0 || meta.FinalOutputTokens < before)
+				recovered = meta.OutputCapped
+			}
+		}
+		if statusForRecovery == http.StatusTooManyRequests && !recovered && (strategy == "adaptive" || strategy == "trim") && (obs.Kind == "itpm" || obs.Kind == "tpm") {
 			target := runtimeMessageTarget(m, obs.Limit, 1-float64(attempt)*0.18, overhead)
 			if target == 0 && obs.Limit > 0 && overhead < int(float64(obs.Limit)*0.90) {
 				target = max(256, int(float64(obs.Limit)*0.72)-overhead)
@@ -1041,6 +1091,8 @@ func friendlyRateLimitError(body []byte, meta modelRecoveryMeta) []byte {
 	message := "Model provider is temporarily rate limited. Daiki retried automatically; please continue in a moment."
 	if obs.Kind == "itpm" && obs.Limit > 0 {
 		message = fmt.Sprintf("This model's input limit is %d tokens/minute. Daiki compacted the conversation and retried automatically, but the provider is still rate limited. Your chat is preserved; send the next message normally.", obs.Limit)
+	} else if obs.Kind == "otpm" && obs.Limit > 0 {
+		message = fmt.Sprintf("This model's output limit is %d tokens/minute. Daiki reduced the response budget and retried automatically, but the provider is still rate limited. Your chat is preserved; retry in a moment.", obs.Limit)
 	}
 	out, _ := json.Marshal(map[string]any{"error": map[string]any{"code": "provider_rate_limited", "message": message}, "retryable": true, "recovery": meta})
 	return out

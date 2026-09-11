@@ -41,3 +41,18 @@ func TestPolicyQuotaSpecsIncludeParallelLimits(t *testing.T) {
 		t.Fatalf("unexpected parallel spec %#v", specs[1])
 	}
 }
+
+func TestQuotaRetryAfterSeconds(t *testing.T) {
+	if got := quotaRetryAfterSeconds(quotaDecision{}); got != 0 {
+		t.Fatalf("lifetime/no-reset quota must not advertise Retry-After, got %d", got)
+	}
+	reset := time.Now().Add(90 * time.Second)
+	got := quotaRetryAfterSeconds(quotaDecision{ResetAt: &reset})
+	if got < 89 || got > 90 {
+		t.Fatalf("unexpected Retry-After seconds: got %d", got)
+	}
+	past := time.Now().Add(-time.Second)
+	if got := quotaRetryAfterSeconds(quotaDecision{ResetAt: &past}); got != 1 {
+		t.Fatalf("past reset should retry immediately with a bounded 1s header, got %d", got)
+	}
+}

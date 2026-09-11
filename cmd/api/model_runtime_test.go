@@ -21,6 +21,14 @@ func TestParseRateLimitObservationITPM(t *testing.T) {
 	}
 }
 
+func TestParseRateLimitObservationOTPM(t *testing.T) {
+	body := []byte(`HTTP 429: litellm.RateLimitError: Request too large for model qwen/qwen3.8-27b on output tokens per minute (OTPM): Limit 1000, Requested 1994`)
+	got := parseRateLimitObservation(429, body)
+	if got.Kind != "otpm" || got.Limit != 1000 || got.Requested != 1994 {
+		t.Fatalf("unexpected observation: %#v", got)
+	}
+}
+
 func TestTrimChatContextKeepsNewestTurn(t *testing.T) {
 	messages := []map[string]any{{"role": "user", "content": "old " + strings.Repeat("a", 12000)}, {"role": "assistant", "content": strings.Repeat("b", 12000)}, {"role": "user", "content": "LATEST QUESTION"}}
 	body, _ := json.Marshal(map[string]any{"model": "m", "messages": messages})
@@ -67,6 +75,51 @@ func TestModelRequestRecoversITPMBeforeReturning(t *testing.T) {
 	}
 	if !meta.ContextTrimmed || secondTokens >= 7000 {
 		t.Fatalf("retry did not compact below limit tokens=%d meta=%#v", secondTokens, meta)
+	}
+}
+
+func TestModelRequestRecoversOTPMByReducingOutputBudget(t *testing.T) {
+	calls := 0
+	secondOutputCap := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		b, _ := io.ReadAll(r.Body)
+		var payload struct {
+			MaxCompletionTokens int `json:"max_completion_tokens"`
+		}
+		_ = json.Unmarshal(b, &payload)
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`HTTP 429: litellm.RateLimitError: Request too large for model qwen/qwen3.8-27b on output tokens per minute (OTPM): Limit 1000, Requested 1994`))
+			return
+		}
+		secondOutputCap = payload.MaxCompletionTokens
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":10}}`))
+	}))
+	defer srv.Close()
+	payload, _ := json.Marshal(map[string]any{
+		"model":                 "qwen",
+		"max_completion_tokens": 1994,
+		"messages":              []map[string]any{{"role": "user", "content": "what car is this?"}},
+	})
+	a := &app{inferenceHTTP: srv.Client()}
+	makeReq := func(body []byte) (*http.Request, error) {
+		return http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, strings.NewReader(string(body)))
+	}
+	resp, _, _, meta, err := a.doModelRequestWithRecovery(context.Background(), payload, "qwen", "vision", makeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || calls != 2 {
+		t.Fatalf("status=%d calls=%d meta=%#v", resp.StatusCode, calls, meta)
+	}
+	if secondOutputCap <= 0 || secondOutputCap > 900 {
+		t.Fatalf("expected retry output cap <= 900, got %d", secondOutputCap)
+	}
+	if !meta.OutputCapped || meta.OriginalOutputTokens != 1994 || meta.FinalOutputTokens != secondOutputCap {
+		t.Fatalf("output recovery metadata mismatch: %#v", meta)
 	}
 }
 
