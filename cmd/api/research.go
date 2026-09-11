@@ -616,10 +616,28 @@ func (a *app) searxSearch(ctx context.Context, base, query string) ([]searxResul
 }
 
 func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language string) ([]searxResult, error) {
-	search := func(engine string) ([]searxResult, error) {
-		if strings.TrimSpace(language) == "" {
-			language = "all"
+	if strings.TrimSpace(language) == "" {
+		language = "all"
+	}
+	lastGoodKey := fmt.Sprintf("research:google:lkg:%x", sha256.Sum256([]byte(language+"\n"+query)))
+	lastGood := func() []searxResult {
+		if a.redis == nil {
+			return nil
 		}
+		cached, err := a.redis.Get(ctx, lastGoodKey).Bytes()
+		if err != nil || len(cached) == 0 {
+			return nil
+		}
+		var rows []searxResult
+		if json.Unmarshal(cached, &rows) != nil {
+			return nil
+		}
+		for i := range rows {
+			rows[i].Engine = "google-cache"
+		}
+		return rows
+	}
+	search := func(engine string) ([]searxResult, error) {
 		cacheKey := fmt.Sprintf("research:google:%x", sha256.Sum256([]byte(engine+"\n"+language+"\n"+query)))
 		if a.redis != nil {
 			if cached, err := a.redis.Get(ctx, cacheKey).Bytes(); err == nil && len(cached) > 0 {
@@ -668,6 +686,9 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 		if a.redis != nil {
 			if raw, err := json.Marshal(found.Results); err == nil {
 				ttl := 15 * time.Minute
+				if len(found.Results) > 0 {
+					_ = a.redis.Set(ctx, lastGoodKey, raw, 6*time.Hour).Err()
+				}
 				if len(found.Results) == 0 {
 					ttl = 30 * time.Second
 				}
@@ -687,12 +708,23 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 	} else if err != nil {
 		firstErr = err
 	}
-	if rows, err := search("google cse"); err == nil {
+	if rows, err := search("google cse"); err == nil && len(rows) > 0 {
 		return rows, nil
-	} else if firstErr != nil {
-		return nil, fmt.Errorf("Google Search unavailable: %v; Google CSE unavailable: %w", firstErr, err)
 	} else {
-		return nil, err
+		if rows := lastGood(); len(rows) > 0 {
+			return rows, nil
+		}
+		if firstErr != nil && err != nil {
+			return nil, fmt.Errorf("Google Search unavailable: %v; Google CSE unavailable: %w", firstErr, err)
+		}
+		if err != nil {
+			return nil, err
+		}
+		// An empty response is still a successful Google lookup. Preserve the
+		// historical caller contract so webResearch can report "no search results"
+		// distinctly from CAPTCHA/provider failures. LKG is used only for actual
+		// Google transport/provider errors above.
+		return nil, nil
 	}
 }
 func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, error) {

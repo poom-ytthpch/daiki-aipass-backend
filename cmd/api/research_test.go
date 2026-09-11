@@ -524,7 +524,7 @@ func TestLatestPriceFollowUpFallsBackToPreviousUserTopic(t *testing.T) {
 
 func TestCurrentThailandProductPlanDiscoversOfficialDistributorAndCampaign(t *testing.T) {
 	prefs := researchPreferences{Region: "TH", Locale: "th-TH", Scope: "local-first", Depth: "standard"}
-	plan := researchSearchPlan("BYD Sealion 7 ราคาล่าสุด", prefs)
+	plan := researchSearchPlan("BYD Sealion 7 ราคาล่าสุด สเปก", prefs)
 	joined := make([]string, 0, len(plan))
 	for _, item := range plan {
 		joined = append(joined, item.Query)

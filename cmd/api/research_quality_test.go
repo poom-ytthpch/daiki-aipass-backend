@@ -114,7 +114,7 @@ func TestResearchAuthorityDoesNotConfuseGovernmentWithProductPrimary(t *testing.
 
 func TestProductResearchPlanAvoidsBlindGovernmentSearch(t *testing.T) {
 	prefs := researchPreferences{Region: "TH", Locale: "th-TH", Scope: "local-first", Depth: "deep"}
-	productPlan := researchSearchPlan("BYD Sealion 7 ราคา ล่าสุด", prefs)
+	productPlan := researchSearchPlan("BYD Sealion 7 ราคา สเปก ล่าสุด", prefs)
 	var productQueries []string
 	for _, item := range productPlan {
 		productQueries = append(productQueries, item.Query)
@@ -137,6 +137,23 @@ func TestProductResearchPlanAvoidsBlindGovernmentSearch(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(regulatoryQueries, "\n"), "site:go.th") {
 		t.Fatalf("regulatory research should include government sources: %#v", regulatoryPlan)
+	}
+}
+
+func TestLatestPriceResearchUsesOnlyTwoHighValueGoogleQueries(t *testing.T) {
+	prefs := researchPreferences{Region: "TH", Locale: "th-TH", Scope: "local-first", Depth: "deep"}
+	plan := researchSearchPlan("BYD Sealion 7 ราคาล่าสุดเท่าไหร่", prefs)
+	if len(plan) != 2 {
+		t.Fatalf("price-only research should use two Google queries, got %d: %#v", len(plan), plan)
+	}
+	joined := strings.Join(researchPlanQueries(plan), "\n")
+	if !strings.Contains(joined, "ราคาล่าสุด Thailand") || !strings.Contains(joined, "Thailand official distributor") {
+		t.Fatalf("price-only research missing current/distributor discovery: %s", joined)
+	}
+	for _, forbidden := range []string{"site:facebook.com", "specifications", "รีวิว ปัญหา"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("price-only research should not spend Google quota on %q: %s", forbidden, joined)
+		}
 	}
 }
 

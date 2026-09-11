@@ -239,7 +239,14 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	focusQuery := strings.TrimSpace(query)
 	entityPhrase := researchEntityPhrase(query)
 	currentYear := time.Now().Year()
-	const maxQueries = 4
+	maxQueries := 4
+	priceOnly := researchPriceIntent(query) && !researchSpecificationIntent(query+" "+prefs.Focus) && !researchSocialIntent(query+" "+prefs.Focus) && !researchRegulatoryIntent(query) && !researchAcademicIntent(query)
+	if priceOnly {
+		// Current-price lookups spend Google budget on the canonical local seller
+		// and distributor discovery paths. Broad specs/social/global expansion
+		// adds request load without improving the price claim.
+		maxQueries = 2
+	}
 	plan := make([]researchSearchQuery, 0, maxQueries)
 	add := func(q, region, locale, stage string) {
 		q = strings.TrimSpace(q)
@@ -268,7 +275,11 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 			// returns zero results for over-constrained combinations such as
 			// "official distributor current campaign" even when relevant pages exist.
 			if researchFreshnessIntent(query) {
-				add(fmt.Sprintf(`%s ราคาล่าสุด สเปก Thailand %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary-current")
+				if priceOnly {
+					add(fmt.Sprintf(`%s ราคาล่าสุด Thailand %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary-current")
+				} else {
+					add(fmt.Sprintf(`%s ราคาล่าสุด สเปก Thailand %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary-current")
+				}
 			} else {
 				add(fmt.Sprintf(`%s ราคา สเปก Thailand %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary")
 			}
@@ -276,7 +287,7 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 		} else {
 			add(focusQuery+" Thailand", "TH", "th-TH", "local")
 		}
-		if prefs.Depth == "deep" || researchSocialIntent(query) {
+		if !priceOnly && (prefs.Depth == "deep" || researchSocialIntent(query)) {
 			base := focusQuery
 			if entityPhrase != "" {
 				base = entityPhrase + " Thailand รีวิว ปัญหา"
@@ -285,7 +296,7 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 		}
 	}
 
-	if prefs.Scope != "local-only" && len(plan) < maxQueries {
+	if !priceOnly && prefs.Scope != "local-only" && len(plan) < maxQueries {
 		if entityPhrase != "" {
 			add(entityPhrase+` specifications`, "GLOBAL", "all", "global-primary")
 		} else {

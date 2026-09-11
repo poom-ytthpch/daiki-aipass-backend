@@ -234,6 +234,16 @@ func researchPriceIntent(query string) bool {
 	return false
 }
 
+func researchSpecificationIntent(query string) bool {
+	q := strings.ToLower(query)
+	for _, signal := range []string{"spec", "specs", "specification", "specifications", "สเปก", "สมรรถนะ", "แบตเตอรี่", "battery", "range", "ระยะทาง"} {
+		if strings.Contains(q, signal) {
+			return true
+		}
+	}
+	return false
+}
+
 func researchMonthForYear(text string, year int) int {
 	lower := strings.ToLower(text)
 	normalized := strings.NewReplacer(",", " ", ".", " ", "-", " ", "/", " ", "_", " ").Replace(lower)
