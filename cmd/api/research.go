@@ -604,41 +604,50 @@ func (a *app) searxSearch(ctx context.Context, base, query string) ([]searxResul
 }
 
 func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language string) ([]searxResult, error) {
-	u, err := url.Parse(base + "/search")
-	if err != nil {
-		return nil, err
+	search := func(engines string) ([]searxResult, error) {
+		u, err := url.Parse(base + "/search")
+		if err != nil {
+			return nil, err
+		}
+		q := u.Query()
+		q.Set("q", query)
+		q.Set("format", "json")
+		if strings.TrimSpace(language) == "" {
+			language = "all"
+		}
+		q.Set("language", language)
+		q.Set("safesearch", "1")
+		if strings.TrimSpace(engines) != "" {
+			q.Set("engines", engines)
+		}
+		u.RawQuery = q.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("accept", "application/json")
+		req.Header.Set("user-agent", "DaikiAIResearch/1.0")
+		resp, err := a.http.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("search HTTP %d", resp.StatusCode)
+		}
+		var found searxResponse
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&found); err != nil {
+			return nil, fmt.Errorf("invalid search response: %w", err)
+		}
+		return found.Results, nil
 	}
-	q := u.Query()
-	q.Set("q", query)
-	q.Set("format", "json")
-	if strings.TrimSpace(language) == "" {
-		language = "all"
+	// google cse is the configured SearXNG engine that currently returns stable,
+	// high-quality indexed results from this deployment. If it is unavailable or
+	// empty, fall back to the instance defaults instead of pinning broken engines.
+	if results, err := search("google cse"); err == nil && len(results) > 0 {
+		return results, nil
 	}
-	q.Set("language", language)
-	q.Set("safesearch", "1")
-	// Use engines verified to return usable JSON results from this deployment.
-	// Avoid engines that routinely return CAPTCHA/429 responses from datacenter IPs.
-	q.Set("engines", "bing,google,yep")
-	u.RawQuery = q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("accept", "application/json")
-	req.Header.Set("user-agent", "DaikiAIResearch/1.0")
-	resp, err := a.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("search HTTP %d", resp.StatusCode)
-	}
-	var found searxResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&found); err != nil {
-		return nil, fmt.Errorf("invalid search response: %w", err)
-	}
-	return found.Results, nil
+	return search("")
 }
 func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, error) {
 	directURLs := append([]string{}, extractResearchURLs(query)...)

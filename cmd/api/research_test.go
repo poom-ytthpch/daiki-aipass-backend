@@ -312,6 +312,48 @@ func TestWebResearchNoResults(t *testing.T) {
 		t.Fatalf("expected no search results error, got %v", err)
 	}
 }
+
+func TestSearxSearchPrefersGoogleCSE(t *testing.T) {
+	var engines []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		engines = append(engines, r.URL.Query().Get("engines"))
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"BYD SEALION 7 | Rêver Automotive","url":"https://www.reverautomotive.com/model/sealion7/overview","content":"BYD SEALION 7 Thailand"}]}`))
+	}))
+	defer server.Close()
+	a := &app{http: server.Client()}
+	results, err := a.searxSearchWithLanguage(context.Background(), server.URL, "sealion 7 Thailand official", "th-TH")
+	if err != nil || len(results) != 1 {
+		t.Fatalf("preferred SearXNG search failed: results=%#v err=%v", results, err)
+	}
+	if len(engines) != 1 || engines[0] != "google cse" {
+		t.Fatalf("expected google cse preferred engine, got %#v", engines)
+	}
+}
+
+func TestSearxSearchFallsBackToInstanceDefaults(t *testing.T) {
+	var engines []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		engine := r.URL.Query().Get("engines")
+		engines = append(engines, engine)
+		w.Header().Set("content-type", "application/json")
+		if engine == "google cse" {
+			_, _ = w.Write([]byte(`{"results":[]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[{"title":"fallback result","url":"https://example.com/result","content":"fallback"}]}`))
+	}))
+	defer server.Close()
+	a := &app{http: server.Client()}
+	results, err := a.searxSearchWithLanguage(context.Background(), server.URL, "fallback query", "all")
+	if err != nil || len(results) != 1 {
+		t.Fatalf("default-engine fallback failed: results=%#v err=%v", results, err)
+	}
+	if len(engines) != 2 || engines[0] != "google cse" || engines[1] != "" {
+		t.Fatalf("expected preferred then default engine calls, got %#v", engines)
+	}
+}
+
 func TestExplicitWebResearchFailureStillLetsModelAnswer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("content-type", "application/json")
