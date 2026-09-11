@@ -64,7 +64,7 @@ func TestResponseLanguageUsesLatestSubstantiveUserLanguage(t *testing.T) {
 	}
 }
 
-func TestResponseLanguageUsesDominantConversationLanguage(t *testing.T) {
+func TestResponseLanguageSkipsSyntheticAttachmentPrompt(t *testing.T) {
 	body := languageBody(t,
 		map[string]any{"role": "user", "content": "สวัสดี ตอนนี้คุยกันเป็นภาษาไทยนะ"},
 		map[string]any{"role": "assistant", "content": "ได้ครับ"},
@@ -75,7 +75,35 @@ func TestResponseLanguageUsesDominantConversationLanguage(t *testing.T) {
 		map[string]any{"role": "user", "content": "Please review the attached content."},
 	)
 	pref := resolveResponseLanguage(body)
-	if pref.Code != "th-TH" {
+	if pref.Code != "en" || pref.Source != "latest-user" {
+		t.Fatalf("pref=%+v", pref)
+	}
+}
+
+func TestResponseLanguageLatestThaiWinsOverEarlierEnglish(t *testing.T) {
+	body := languageBody(t,
+		map[string]any{"role": "user", "content": "Explain the architecture briefly"},
+		map[string]any{"role": "assistant", "content": "Here is the architecture."},
+		map[string]any{"role": "user", "content": "List the deployment risks"},
+		map[string]any{"role": "assistant", "content": "The main risks are..."},
+		map[string]any{"role": "user", "content": "แล้วตอนนี้ควรแก้อะไรก่อน ช่วยตอบเป็นขั้นตอนหน่อย"},
+	)
+	pref := resolveResponseLanguage(body)
+	if pref.Code != "th-TH" || pref.Source != "latest-user" {
+		t.Fatalf("pref=%+v", pref)
+	}
+}
+
+func TestResponseLanguageLatestEnglishWinsOverEarlierThai(t *testing.T) {
+	body := languageBody(t,
+		map[string]any{"role": "user", "content": "ช่วยสรุประบบนี้ให้หน่อย"},
+		map[string]any{"role": "assistant", "content": "ได้ครับ"},
+		map[string]any{"role": "user", "content": "ขอรายละเอียดเรื่อง quota เพิ่ม"},
+		map[string]any{"role": "assistant", "content": "ได้ครับ"},
+		map[string]any{"role": "user", "content": "Now answer the next part in English"},
+	)
+	pref := resolveResponseLanguage(body)
+	if pref.Code != "en" {
 		t.Fatalf("pref=%+v", pref)
 	}
 }

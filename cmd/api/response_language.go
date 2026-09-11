@@ -91,7 +91,10 @@ func resolveResponseLanguage(body []byte) responseLanguagePreference {
 	}
 	messages, _ := payload["messages"].([]any)
 
-	// An explicit language request on the latest real user turn wins immediately.
+	// The latest substantive user turn is authoritative. In particular, a Thai
+	// question must get a Thai answer even if most earlier turns were English.
+	// Automatic attachment-review prompts are skipped because the client may
+	// synthesize them in English while the active conversation is still Thai.
 	for i := len(messages) - 1; i >= 0; i-- {
 		m, _ := messages[i].(map[string]any)
 		if m == nil || strings.ToLower(strings.TrimSpace(fmt.Sprint(m["role"]))) != "user" {
@@ -104,12 +107,16 @@ func resolveResponseLanguage(body []byte) responseLanguagePreference {
 		if explicit := explicitResponseLanguage(text); explicit.Code != "" {
 			return explicit
 		}
-		break
+		if detected := detectTextLanguage(text); detected.Code != "" {
+			detected.Source = "latest-user"
+			return detected
+		}
+		// If this turn is only symbols, numbers, or identifiers, keep walking
+		// backwards to the most recent user turn whose language can be detected.
 	}
 
-	// Otherwise use the dominant language across recent real user turns. This
-	// keeps a Thai conversation Thai even when one technical prompt is mostly
-	// English identifiers, while a new English conversation still resolves to en.
+	// Final fallback for unusual conversations where no individual user turn has
+	// enough natural-language signal: use the dominant recent conversation language.
 	votes := map[string]int{}
 	names := map[string]string{}
 	latestCode := ""
@@ -150,7 +157,7 @@ func languageInstruction(pref responseLanguagePreference) string {
 	if pref.Code == "" {
 		return ""
 	}
-	return fmt.Sprintf(`%s The active conversation language is %s (%s). Reply in %s unless the user explicitly asks to switch languages. An automatic attachment-review sentence may be English; it is language-neutral and must not change the conversation language. Keep filenames, code, identifiers, CSV/Excel column names, URLs, and quoted source text in their original form when useful, but write explanations, headings, summaries, caveats, and recommendations in %s. Do not switch to another language merely because an attachment contains foreign-language text.`, responseLanguageSystemPrefix, pref.Name, pref.Code, pref.Name, pref.Name)
+	return fmt.Sprintf(`%s The active conversation language is %s (%s). You MUST answer in %s unless the latest user message explicitly asks to switch languages. This applies to the entire user-facing answer, including headings, explanations, summaries, caveats, recommendations, and follow-up questions. An automatic attachment-review sentence may be English; it is language-neutral and must not change the conversation language. Keep filenames, code, identifiers, CSV/Excel column names, URLs, and quoted source text in their original form when useful. Do not switch to another language merely because earlier turns, an attachment, tool output, web evidence, or system context contain another language.`, responseLanguageSystemPrefix, pref.Name, pref.Code, pref.Name)
 }
 
 func applyResponseLanguage(body []byte) ([]byte, responseLanguagePreference, error) {
