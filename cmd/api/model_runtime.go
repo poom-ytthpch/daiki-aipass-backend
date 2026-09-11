@@ -19,34 +19,35 @@ import (
 )
 
 type modelRecoveryMeta struct {
-	Attempts                 int    `json:"attempts"`
-	ContextTrimmed           bool   `json:"contextTrimmed"`
-	OriginalInputTokens      int    `json:"originalInputTokens"`
-	FinalInputTokens         int    `json:"finalInputTokens"`
-	ObservedRateLimit        int    `json:"observedRateLimit,omitempty"`
-	ObservedRequested        int    `json:"observedRequested,omitempty"`
-	ObservedRateKind         string `json:"observedRateKind,omitempty"`
-	ObservedHTTPStatus       int    `json:"observedHttpStatus,omitempty"`
-	FailureKind              string `json:"failureKind,omitempty"`
-	CircuitBypass            bool   `json:"circuitBypass,omitempty"`
-	CircuitModel             string `json:"circuitModel,omitempty"`
-	FallbackFrom             string `json:"fallbackFrom,omitempty"`
-	PreflightFallback        bool   `json:"preflightFallback,omitempty"`
-	PredictedInputTokens     int    `json:"predictedInputTokens,omitempty"`
-	FallbackTo               string `json:"fallbackTo,omitempty"`
-	OutputCapped             bool   `json:"outputCapped,omitempty"`
-	OriginalOutputTokens     int    `json:"originalOutputTokens,omitempty"`
-	FinalOutputTokens        int    `json:"finalOutputTokens,omitempty"`
-	FinalModel               string `json:"finalModel"`
-	RuntimeProfile           string `json:"runtimeProfile,omitempty"`
-	AppliedOverheadTokens    int    `json:"appliedOverheadTokens,omitempty"`
-	AdmissionWaitMS          int64  `json:"admissionWaitMs,omitempty"`
-	AdmissionSpillover       bool   `json:"admissionSpillover,omitempty"`
-	AdmissionTokens          int    `json:"admissionTokens,omitempty"`
-	RequestedReasoningEffort string `json:"requestedReasoningEffort,omitempty"`
-	EffectiveReasoningEffort string `json:"effectiveReasoningEffort,omitempty"`
-	NativeReasoning          bool   `json:"nativeReasoning"`
-	ReasoningModel           string `json:"reasoningModel,omitempty"`
+	Attempts                   int    `json:"attempts"`
+	ContextTrimmed             bool   `json:"contextTrimmed"`
+	OriginalInputTokens        int    `json:"originalInputTokens"`
+	FinalInputTokens           int    `json:"finalInputTokens"`
+	ObservedRateLimit          int    `json:"observedRateLimit,omitempty"`
+	ObservedRequested          int    `json:"observedRequested,omitempty"`
+	ObservedRateKind           string `json:"observedRateKind,omitempty"`
+	ObservedHTTPStatus         int    `json:"observedHttpStatus,omitempty"`
+	FailureKind                string `json:"failureKind,omitempty"`
+	CircuitBypass              bool   `json:"circuitBypass,omitempty"`
+	CircuitModel               string `json:"circuitModel,omitempty"`
+	FallbackFrom               string `json:"fallbackFrom,omitempty"`
+	PreflightFallback          bool   `json:"preflightFallback,omitempty"`
+	PredictedInputTokens       int    `json:"predictedInputTokens,omitempty"`
+	FallbackTo                 string `json:"fallbackTo,omitempty"`
+	OutputCapped               bool   `json:"outputCapped,omitempty"`
+	OriginalOutputTokens       int    `json:"originalOutputTokens,omitempty"`
+	FinalOutputTokens          int    `json:"finalOutputTokens,omitempty"`
+	FinalModel                 string `json:"finalModel"`
+	RuntimeProfile             string `json:"runtimeProfile,omitempty"`
+	AppliedOverheadTokens      int    `json:"appliedOverheadTokens,omitempty"`
+	AdmissionWaitMS            int64  `json:"admissionWaitMs,omitempty"`
+	AdmissionSpillover         bool   `json:"admissionSpillover,omitempty"`
+	AdmissionTokens            int    `json:"admissionTokens,omitempty"`
+	RequestedReasoningEffort   string `json:"requestedReasoningEffort,omitempty"`
+	EffectiveReasoningEffort   string `json:"effectiveReasoningEffort,omitempty"`
+	NativeReasoning            bool   `json:"nativeReasoning"`
+	ReasoningModel             string `json:"reasoningModel,omitempty"`
+	ProviderCompatibilityRetry bool   `json:"providerCompatibilityRetry,omitempty"`
 }
 
 type rateLimitObservation struct {
@@ -90,6 +91,34 @@ func providerFailureStatus(raw []byte) int {
 		return http.StatusBadGateway
 	}
 	return 0
+}
+
+func applyTextOnlyProviderCompatibility(body []byte) []byte {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return body
+	}
+	delete(payload, "tools")
+	delete(payload, "tool_choice")
+	delete(payload, "parallel_tool_calls")
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return body
+	}
+	const instruction = "PROVIDER COMPATIBILITY: Return the answer as normal text only. Do not call, invoke, request, or emit any tool or function. Do not use provider-native browser_search, code_interpreter, or hidden tool calls. Use only the evidence already supplied in this conversation."
+	for _, raw := range messages {
+		msg, _ := raw.(map[string]any)
+		content, _ := msg["content"].(string)
+		if strings.Contains(content, "PROVIDER COMPATIBILITY: Return the answer as normal text only") {
+			return body
+		}
+	}
+	payload["messages"] = append([]any{map[string]any{"role": "system", "content": instruction}}, messages...)
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func failureKindForStatus(status int) string {
@@ -940,6 +969,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 	requestedReasoning := requestedReasoningEffort(body)
 	meta.RequestedReasoningEffort = requestedReasoning
 	maxRetries := m.MaxRetries
+	compatibilityRetried := false
 	if maxRetries < 0 {
 		maxRetries = 0
 	}
@@ -1020,6 +1050,17 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		if len(errBody) == 0 {
 			errBody, _ = io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 			_ = resp.Body.Close()
+		}
+		if unexpectedBlockedToolCall(errBody) && !compatibilityRetried {
+			// Some providers occasionally emit a tool call even when Hermes/LiteLLM
+			// explicitly set tool_choice=none. Give the request one bounded text-only
+			// compatibility retry regardless of the model's normal retry budget so
+			// Guest, foreground and background Deep Search recover consistently.
+			body = applyTextOnlyProviderCompatibility(body)
+			compatibilityRetried = true
+			meta.ProviderCompatibilityRetry = true
+			meta.FailureKind = "provider_tool_choice"
+			continue
 		}
 		meta.ObservedHTTPStatus = statusForRecovery
 		meta.FailureKind = failureKindForStatus(statusForRecovery)

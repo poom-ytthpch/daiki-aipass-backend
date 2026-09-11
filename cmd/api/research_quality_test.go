@@ -372,3 +372,24 @@ func TestAggregateResearchQualityTrustsIndependentGovernmentAndAcademicEvidence(
 		t.Fatalf("strong academic evidence score=%d grade=%s want A", academicScore, academicGrade)
 	}
 }
+
+func TestProductAuthorityDoesNotPromoteSecondaryArticlesFromPrimaryQueryStage(t *testing.T) {
+	query := "BYD Sealion 7 ราคา ล่าสุด Thailand"
+	cases := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{name: "manufacturer model page", url: "https://www.reverautomotive.com/model/sealion7/overview", want: "primary"},
+		{name: "automotive news article", url: "https://www.autoinfo.co.th/online/572782", want: "secondary"},
+		{name: "magazine specs article", url: "https://www.grandprix.co.th/byd-sealion-7-specs-price/", want: "secondary"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := researchAuthorityForCandidate(query, "BYD SEALION 7 Thailand price 2026", tc.url, "BYD SEALION 7 ราคาไทย 2026", "local-primary", false)
+			if got != tc.want {
+				t.Fatalf("authority=%q want=%q for %s", got, tc.want, tc.url)
+			}
+		})
+	}
+}

@@ -273,8 +273,24 @@ func researchPrimaryPath(rawURL string) bool {
 		return false
 	}
 	path := strings.ToLower(u.Path)
-	for _, marker := range []string{"/model/", "/models/", "/product/", "/products/", "/news/", "/press/", "/support/", "/spec"} {
+	for _, marker := range []string{"/model/", "/models/", "/product/", "/products/", "/vehicle/", "/vehicles/", "/support/", "/newsroom/"} {
 		if strings.Contains(path, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func researchHostMatchesEntity(query, rawURL string) bool {
+	host := normalizeResearchText(researchHost(rawURL))
+	if host == "" {
+		return false
+	}
+	for _, term := range researchEntityTerms(query) {
+		if len(term) < 3 || researchPureNumericModelTerm(term) {
+			continue
+		}
+		if strings.Contains(host, normalizeResearchText(term)) {
 			return true
 		}
 	}
@@ -295,7 +311,7 @@ func researchLikelyPrimaryHost(query string, row searxResult) bool {
 			return false
 		}
 	}
-	return strings.Contains(row.Stage, "primary") || researchPrimaryPath(row.URL)
+	return strings.Contains(row.Stage, "primary") && (researchPrimaryPath(row.URL) || researchHostMatchesEntity(query, row.URL))
 }
 
 func researchDiscoveredPrimaryHosts(query string, rows []searxResult) []string {
@@ -353,7 +369,7 @@ func researchAuthorityForCandidate(query, title, rawURL, content, stage string, 
 		return "interpretive"
 	}
 	relevance := researchRelevanceScore(query, title, rawURL, content)
-	if relevance >= 85 && (strings.Contains(stage, "primary") || researchPrimaryPath(rawURL)) {
+	if relevance >= 85 && strings.Contains(stage, "primary") && (researchPrimaryPath(rawURL) || researchHostMatchesEntity(query, rawURL)) {
 		return "primary"
 	}
 	return "secondary"
