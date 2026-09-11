@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -93,7 +94,11 @@ func (a *app) generateGuestImageViaOpenRouter(ctx context.Context, prompt string
 			return nil, "", "openrouter-images", readErr
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, "", "openrouter-images", fmt.Errorf("image provider returned status %d", resp.StatusCode)
+			detail := strings.TrimSpace(string(body))
+			if len(detail) > 2048 {
+				detail = detail[:2048]
+			}
+			return nil, "", "openrouter-images", fmt.Errorf("image provider returned status %d: %s", resp.StatusCode, detail)
 		}
 		data, mediaType, err := decodeOpenRouterImageResponse(body)
 		return data, mediaType, "openrouter-images:" + model, err
@@ -410,6 +415,7 @@ func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil || len(data) == 0 {
+		slog.Warn("guest image generation failed", "upstream", upstream, "error", err)
 		a.refundGuestDailyCapability(r.Context(), "imagegen", identity.Subject, p.ImageGenerationsPerDay)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "image_generation_unavailable", "upstream": upstream})
 		return
