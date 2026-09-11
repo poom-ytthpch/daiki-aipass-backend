@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -54,7 +53,7 @@ func decodeOpenRouterImageResponse(body []byte) ([]byte, string, error) {
 	return data, mediaType, nil
 }
 
-func (a *app) generateGuestImageViaOpenRouter(ctx context.Context, prompt string) ([]byte, string, string, error) {
+func (a *app) generateImageViaOpenRouter(ctx context.Context, prompt string) ([]byte, string, string, error) {
 	providers, err := a.store.ModelProviders(ctx)
 	if err != nil {
 		return nil, "", "", err
@@ -109,6 +108,51 @@ func (a *app) generateGuestImageViaOpenRouter(ctx context.Context, prompt string
 		return data, mediaType, "openrouter-images:" + model, err
 	}
 	return nil, "", "", errors.New("no OpenRouter image provider configured")
+}
+
+func detectGeneratedImageMediaType(data []byte) (string, error) {
+	switch {
+	case len(data) >= 8 && string(data[:8]) == "\x89PNG\r\n\x1a\n":
+		return "image/png", nil
+	case len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff:
+		return "image/jpeg", nil
+	case len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a"):
+		return "image/gif", nil
+	case len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP":
+		return "image/webp", nil
+	default:
+		return "", errors.New("generated image bytes are not a supported PNG, JPEG, GIF, or WebP image")
+	}
+}
+
+func generatedImageExtension(mediaType string) string {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	default:
+		return ".png"
+	}
+}
+
+func decodeGeneratedImageFromChatCompletion(body []byte) ([]byte, string, error) {
+	content := chatCompletionText(body)
+	match := generatedImageDataRE.FindStringSubmatch(content)
+	if len(match) != 3 {
+		return nil, "", errors.New("generation response did not contain an image data URL")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(match[2])
+	if err != nil || len(decoded) == 0 {
+		return nil, "", errors.New("generation response contained invalid image base64")
+	}
+	mediaType, err := detectGeneratedImageMediaType(decoded)
+	if err != nil {
+		return nil, "", err
+	}
+	return decoded, mediaType, nil
 }
 
 func (a *app) refundGuestDailyCapability(ctx context.Context, capability, subject string, limit int) {
@@ -393,7 +437,7 @@ func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prompt := strings.TrimSpace(body.Prompt)
-	data, mediaType, upstream, err := a.generateGuestImageViaOpenRouter(r.Context(), prompt)
+	data, mediaType, upstream, err := a.generateImageViaOpenRouter(r.Context(), prompt)
 	if err != nil && !errors.Is(err, errImageProviderAuth) {
 		// Preserve Hermes as a secondary path for installations that configure an
 		// image_gen provider such as FAL/OpenAI. match-infra currently has an
@@ -401,13 +445,8 @@ func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 		hermesPrompt := "Generate an image for this request using the image_generate capability and return the generated image. Request: " + prompt
 		responseBody, hermesUpstream, hermesErr := a.runGuestCoreGeneration(r.Context(), identity, p, "image-generation", "guest-media", hermesPrompt)
 		if hermesErr == nil {
-			content := chatCompletionText(responseBody)
-			match := generatedImageDataRE.FindStringSubmatch(content)
-			if len(match) == 3 {
-				decoded, decodeErr := base64.StdEncoding.DecodeString(match[2])
-				if decodeErr == nil && len(decoded) > 0 {
-					data, mediaType, upstream, err = decoded, match[1], hermesUpstream, nil
-				}
+			if decoded, detectedType, decodeErr := decodeGeneratedImageFromChatCompletion(responseBody); decodeErr == nil {
+				data, mediaType, upstream, err = decoded, detectedType, hermesUpstream, nil
 			}
 		}
 	}
@@ -421,15 +460,19 @@ func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": code, "upstream": upstream})
 		return
 	}
+	detectedType, detectErr := detectGeneratedImageMediaType(data)
+	if detectErr != nil {
+		a.refundGuestDailyCapability(r.Context(), "imagegen", identity.Subject, p.ImageGenerationsPerDay)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "generated_image_invalid"})
+		return
+	}
+	mediaType = detectedType
 	if (p.MaxGeneratedImageBytes > 0 && int64(len(data)) > p.MaxGeneratedImageBytes) || int64(len(data)) > maxInjectedImageBytes {
 		a.refundGuestDailyCapability(r.Context(), "imagegen", identity.Subject, p.ImageGenerationsPerDay)
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "generated_image_exceeds_limit"})
 		return
 	}
-	ext := ".png"
-	if exts, _ := mime.ExtensionsByType(mediaType); len(exts) > 0 {
-		ext = exts[0]
-	}
+	ext := generatedImageExtension(mediaType)
 	name := generatedName(body.Name, "generated"+ext)
 	if filepath.Ext(name) == "" {
 		name += ext

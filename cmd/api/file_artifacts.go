@@ -176,15 +176,112 @@ func normalizeGeneratedCSV(content string) ([]byte, error) {
 
 func normalizeGeneratedJSON(content string) ([]byte, error) {
 	content = stripGeneratedFence(content)
-	var value any
-	if err := json.Unmarshal([]byte(content), &value); err != nil {
-		return nil, fmt.Errorf("invalid generated json: %w", err)
+	candidates := []string{content}
+	if extracted := extractGeneratedJSONCandidate(content); extracted != "" && extracted != content {
+		candidates = append(candidates, extracted)
 	}
-	out, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return nil, err
+	for _, candidate := range candidates {
+		attempts := []string{candidate, removeGeneratedJSONTrailingCommas(candidate)}
+		for _, attempt := range attempts {
+			var value any
+			if err := json.Unmarshal([]byte(attempt), &value); err != nil {
+				continue
+			}
+			out, err := json.MarshalIndent(value, "", "  ")
+			if err != nil {
+				return nil, err
+			}
+			return append(out, '\n'), nil
+		}
 	}
-	return append(out, '\n'), nil
+	return nil, errors.New("invalid generated json after safe repair")
+}
+
+func removeGeneratedJSONTrailingCommas(content string) string {
+	var out strings.Builder
+	out.Grow(len(content))
+	inString := false
+	escaped := false
+	for i := 0; i < len(content); i++ {
+		c := content[i]
+		if !inString && c == ',' {
+			j := i + 1
+			for j < len(content) && (content[j] == ' ' || content[j] == '\n' || content[j] == '\r' || content[j] == '\t') {
+				j++
+			}
+			if j < len(content) && (content[j] == '}' || content[j] == ']') {
+				continue
+			}
+		}
+		out.WriteByte(c)
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+		}
+	}
+	return out.String()
+}
+
+func extractGeneratedJSONCandidate(content string) string {
+	content = strings.TrimSpace(content)
+	start := -1
+	for i, r := range content {
+		if r == '{' || r == '[' {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(content); i++ {
+		c := content[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+			if depth == 0 {
+				return strings.TrimSpace(content[start : i+1])
+			}
+			if depth < 0 {
+				return ""
+			}
+		}
+	}
+	return ""
 }
 
 func renderGeneratedPDF(content, title string) ([]byte, error) {

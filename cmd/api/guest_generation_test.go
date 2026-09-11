@@ -33,3 +33,12 @@ func TestDecodeOpenRouterImageResponseRejectsMissingImage(t *testing.T) {
 		t.Fatal("expected missing image error")
 	}
 }
+
+func TestDetectGeneratedImageMediaType(t *testing.T) {
+	if got, err := detectGeneratedImageMediaType([]byte("\x89PNG\r\n\x1a\nrest")); err != nil || got != "image/png" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	if _, err := detectGeneratedImageMediaType([]byte("<svg></svg>")); err == nil {
+		t.Fatal("expected active or unsupported image format to be rejected")
+	}
+}

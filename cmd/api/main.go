@@ -275,6 +275,7 @@ func main() {
 				r.Use(requirePrincipalScope("inference"))
 				r.Get("/models", a.models)
 				r.Post("/generate/file", a.generateFile)
+				r.Post("/generate/image", a.generateImage)
 			})
 		})
 	})

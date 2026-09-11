@@ -29,6 +29,27 @@ func TestNormalizeGeneratedCSV(t *testing.T) {
 	}
 }
 
+func TestNormalizeGeneratedJSONRepairsFenceProseAndTrailingComma(t *testing.T) {
+	data, err := normalizeGeneratedJSON("Here is the file:\n```json\n{\"name\":\"Daiki\",\"items\":[1,2,],}\n```\nDone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"name": "Daiki"`) || !strings.Contains(text, `"items": [`) {
+		t.Fatalf("json=%q", text)
+	}
+}
+
+func TestNormalizeGeneratedJSONDoesNotRewriteCommaInsideString(t *testing.T) {
+	data, err := normalizeGeneratedJSON(`{"message":"keep, } exactly","items":[1,2,]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"message": "keep, } exactly"`) {
+		t.Fatalf("json=%q", string(data))
+	}
+}
+
 func TestRenderGeneratedPDFIsReadableByAttachmentExtractor(t *testing.T) {
 	data, err := renderGeneratedPDF("# รายงานทดสอบ\n- จำนวนสินค้า 5 รายการ\nสวัสดีจาก Daiki", "รายงาน")
 	if err != nil {

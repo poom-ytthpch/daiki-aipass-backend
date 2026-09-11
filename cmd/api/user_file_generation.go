@@ -18,6 +18,9 @@ import (
 	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
 )
 
+var errGeneratedAttachmentTooLarge = errors.New("generated attachment exceeds configured size limit")
+var errGeneratedAttachmentStorageLimit = errors.New("generated attachment storage limit exceeded")
+
 func (a *app) runUserCoreGeneration(r *http.Request, capability, profile, prompt string) ([]byte, string, error) {
 	ctx := r.Context()
 	c := current(r)
@@ -138,11 +141,15 @@ func (a *app) storeGeneratedUserAttachment(ctx context.Context, subject string, 
 		return store.Attachment{}, err
 	}
 	if (resource.MaxStoredFiles > 0 && files >= int64(resource.MaxStoredFiles)) || (resource.MaxStoredBytes > 0 && bytesUsed+int64(len(data)) > resource.MaxStoredBytes) {
-		return store.Attachment{}, errors.New("attachment storage limit exceeded")
+		return store.Attachment{}, errGeneratedAttachmentStorageLimit
 	}
-	maxBytes := attachmentPolicyLimit(resource.MaxFileBytes, maxAttachmentBytes)
+	configuredMax, hardMax := resource.MaxFileBytes, maxAttachmentBytes
+	if source == "generated-image" || strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+		configuredMax, hardMax = resource.MaxImageBytes, int64(maxInjectedImageBytes)
+	}
+	maxBytes := attachmentPolicyLimit(configuredMax, hardMax)
 	if int64(len(data)) > maxBytes {
-		return store.Attachment{}, errors.New("generated file exceeds configured size limit")
+		return store.Attachment{}, errGeneratedAttachmentTooLarge
 	}
 	id, err := newAttachmentID()
 	if err != nil {
@@ -214,7 +221,14 @@ func (a *app) generateFile(w http.ResponseWriter, r *http.Request) {
 	}
 	rec, err := a.storeGeneratedUserAttachment(r.Context(), u.Subject, policy, spec.Name, "generated-file", spec.MediaType, data)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "generated_file_storage_failed"})
+		switch {
+		case errors.Is(err, errGeneratedAttachmentTooLarge):
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "generated_file_exceeds_limit"})
+		case errors.Is(err, errGeneratedAttachmentStorageLimit):
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "attachment_storage_limit"})
+		default:
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "generated_file_storage_failed"})
+		}
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"attachment": attachmentPublic(rec), "upstream": upstream, "format": spec.Format})
