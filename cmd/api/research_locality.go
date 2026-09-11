@@ -429,7 +429,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 			if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
 				title = u.Hostname()
 			}
-			source := researchSource{Title: title, URL: raw, Excerpt: clipText(text, 6500), Engine: "direct", Region: researchSourceRegion(title, raw, text, prefs), Authority: researchAuthorityForCandidate(query, title, raw, text, "direct", true), SourceType: researchSourceType(raw), Platform: researchSocialPlatform(raw), Stage: "direct"}
+			source := researchSource{Title: title, URL: raw, Excerpt: researchFocusedExcerpt(query, text, 6500), Engine: "direct", Region: researchSourceRegion(title, raw, text, prefs), Authority: researchAuthorityForCandidate(query, title, raw, text, "direct", true), SourceType: researchSourceType(raw), Platform: researchSocialPlatform(raw), Stage: "direct"}
 			scoreResearchSource(query, &source, time.Now())
 			direct = append(direct, source)
 		}
@@ -527,6 +527,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 			limit = 5
 		}
 	}
+	localCurrent := make([]researchSource, 0, limit)
 	localWeb := make([]researchSource, 0, limit)
 	localSocial := make([]researchSource, 0, limit)
 	globalWeb := make([]researchSource, 0, limit)
@@ -536,13 +537,23 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 			continue
 		}
 		source := researchSource{Title: clipText(row.Title, 300), URL: row.URL, Snippet: clipText(row.Content, 1200), Engine: clipText(row.Engine, 80), Region: researchSourceRegion(row.Title, row.URL, row.Content, prefs), Authority: researchAuthorityForCandidate(query, row.Title, row.URL, row.Content, row.Stage, false), SourceType: researchSourceType(row.URL), Platform: researchSocialPlatform(row.URL), Stage: row.Stage}
+		// A result discovered by a Thailand-scoped Google query remains local
+		// evidence even when the domain is .com and the short search snippet omits
+		// the word Thailand (common for official local distributor/model pages).
+		if prefs.Region == "TH" && strings.HasPrefix(row.Stage, "local-") {
+			source.Region = "TH"
+		}
 		scoreResearchSource(query, &source, time.Now())
+		boostResearchSourceForPlan(query, prefs, &source)
 		if source.QualityScore < 55 {
 			continue
 		}
 		if source.Region == "TH" && source.SourceType == "social" {
 			localSocial = append(localSocial, source)
 		} else if source.Region == "TH" {
+			if researchFreshnessIntent(query) && (strings.Contains(source.Stage, "primary-current") || strings.Contains(source.Stage, "local-market")) {
+				localCurrent = append(localCurrent, source)
+			}
 			localWeb = append(localWeb, source)
 		} else if source.SourceType == "social" {
 			globalSocial = append(globalSocial, source)
@@ -550,7 +561,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 			globalWeb = append(globalWeb, source)
 		}
 	}
-	for _, rows := range [][]researchSource{localWeb, localSocial, globalWeb, globalSocial} {
+	for _, rows := range [][]researchSource{localCurrent, localWeb, localSocial, globalWeb, globalSocial} {
 		sort.SliceStable(rows, func(i, j int) bool { return rows[i].QualityScore > rows[j].QualityScore })
 	}
 
@@ -572,6 +583,9 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 	}
 	appendRowsN(direct, 0)
 	if prefs.Region == "TH" && prefs.Scope != "global" {
+		if researchFreshnessIntent(query) {
+			appendRowsN(localCurrent, 1)
+		}
 		if prefs.Depth == "deep" {
 			localWebQuota, localSocialQuota, globalWebQuota := 3, 2, 2
 			if limit <= 5 {
@@ -653,7 +667,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 		go func(idx int) {
 			defer wg.Done()
 			if text, err := fetchPublicPage(ctx, client, sources[idx].URL); err == nil {
-				sources[idx].Excerpt = clipText(text, 6500)
+				sources[idx].Excerpt = researchFocusedExcerpt(query, text, 6500)
 				if sources[idx].Region != "TH" && researchSourceRegion(sources[idx].Title, sources[idx].URL, text, prefs) == "TH" {
 					sources[idx].Region = "TH"
 				}
@@ -673,6 +687,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 			continue
 		}
 		scoreResearchSource(query, source, now)
+		boostResearchSourceForPlan(query, prefs, source)
 		if source.Stage != "direct" && source.QualityScore < 58 {
 			continue
 		}

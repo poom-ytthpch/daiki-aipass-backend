@@ -404,3 +404,30 @@ func TestOfficialDistributorSignalCanPromoteLocalPrimarySource(t *testing.T) {
 		t.Fatalf("verified official distributor authority=%q want primary", got)
 	}
 }
+
+func TestResearchFocusedExcerptFindsCurrentPriceDeepInPage(t *testing.T) {
+	text := strings.Repeat("navigation filler ", 900) +
+		" BYD SEALION 7 ราคาจำหน่าย Premium ฿ 1,199,900 AWD Performance ฿ 1,299,900 AWD Ultimate ฿ 1,349,900 " +
+		strings.Repeat("footer filler ", 900)
+	got := researchFocusedExcerpt("BYD SEALION 7 ราคาล่าสุด ประเทศไทย", text, 6500)
+	for _, want := range []string{"1,199,900", "1,299,900", "1,349,900", "AWD Ultimate"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("focused excerpt missing %q: %q", want, got)
+		}
+	}
+	if len(got) > 6500 {
+		t.Fatalf("focused excerpt exceeded cap: %d", len(got))
+	}
+}
+
+func TestResearchFocusedExcerptFindsSpecsDeepInPage(t *testing.T) {
+	text := strings.Repeat("header filler ", 900) +
+		" BYD SEALION 7 Blade Battery 82.56 kWh DC charging 150 kW warranty 8 years 160,000 km " +
+		strings.Repeat("footer filler ", 900)
+	got := researchFocusedExcerpt("BYD SEALION 7 สเปกแบตเตอรี่ การชาร์จ รับประกัน", text, 6500)
+	for _, want := range []string{"82.56 kWh", "150 kW", "warranty", "160,000 km"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("focused excerpt missing %q: %q", want, got)
+		}
+	}
+}

@@ -695,6 +695,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		w.Header().Set("x-daiki-research-mode", researchMeta.Mode)
 		w.Header().Set("x-daiki-research-quality", strconv.Itoa(researchMeta.QualityScore))
 		w.Header().Set("x-daiki-research-quality-grade", researchMeta.QualityGrade)
+		w.Header().Set("x-daiki-research-engine", "google")
 	} else {
 		w.Header().Set("x-daiki-research-used", "false")
 		w.Header().Set("x-daiki-research-sources", "0")
@@ -726,6 +727,14 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	w.Header().Set("x-daiki-queue-wait-ms", fmt.Sprint(ticket.AcquiredAt.Sub(ticket.EnqueuedAt).Milliseconds()))
 	hermesProfile := chooseHermesProfile(upstreamBody, researchMeta, route, skills, commandSelection)
 	upstreamURL, upstreamKey, upstreamName := a.authenticatedHermesUpstream(path, hermesProfile)
+	if researchUsesHermesProfile(researchMeta) {
+		// Research has already been planned, searched, fetched, ranked and grounded
+		// by Daiki. The Hermes research profile exposes no tools and calls the same
+		// LiteLLM model, so routing through it adds agent latency/failure modes with
+		// no retrieval capability. Synthesize research evidence directly instead.
+		hermesProfile = "research-direct"
+		upstreamURL, upstreamKey, upstreamName = a.liteLLMUpstream(path)
+	}
 	w.Header().Set("x-daiki-hermes-profile", hermesProfile)
 	makeUpstreamRequest := func(payload []byte) (*http.Request, error) {
 		req, buildErr := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, strings.NewReader(string(payload)))

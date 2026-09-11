@@ -526,6 +526,113 @@ func scoreResearchSource(query string, source *researchSource, now time.Time) {
 	source.QualityScore = clampResearchScore((source.RelevanceScore*45 + source.AuthorityScore*25 + source.FreshnessScore*20 + source.EvidenceScore*10) / 100)
 }
 
+func researchFocusedExcerpt(query, text string, maxLen int) string {
+	text = researchSpaceRE.ReplaceAllString(strings.TrimSpace(text), " ")
+	if maxLen <= 0 || len(text) <= maxLen {
+		return text
+	}
+	lower := strings.ToLower(text)
+	markers := make([]string, 0, 32)
+	if researchFreshnessIntent(query) {
+		markers = append(markers, "฿", "ราคา", " price ", "starting price", "campaign", "โปรโมชั่น", "premium", "awd ultimate", "awd performance")
+	}
+	markers = append(markers,
+		"battery", "แบต", "kwh", "charging", "ชาร์จ", "warranty", "รับประกัน",
+		"safety", "ความปลอดภัย", "range", "ระยะทาง", "0-100", "power", "แรงบิด", "nm", "kw",
+	)
+	if phrase := strings.TrimSpace(researchEntityPhrase(query)); phrase != "" {
+		markers = append(markers, strings.ToLower(phrase))
+	}
+	for _, term := range researchEntityTerms(query) {
+		if len(term) >= 3 {
+			markers = append(markers, strings.ToLower(term))
+		}
+	}
+	type excerptRange struct{ start, end int }
+	ranges := make([]excerptRange, 0, 10)
+	addRange := func(pos int) {
+		if pos < 0 {
+			return
+		}
+		start := max(0, pos-500)
+		end := min(len(text), pos+1500)
+		for _, existing := range ranges {
+			if start < existing.end && end > existing.start {
+				return
+			}
+		}
+		ranges = append(ranges, excerptRange{start: start, end: end})
+	}
+	for _, marker := range markers {
+		if marker == "" {
+			continue
+		}
+		from := 0
+		for hits := 0; hits < 2 && from < len(lower); hits++ {
+			idx := strings.Index(lower[from:], marker)
+			if idx < 0 {
+				break
+			}
+			idx += from
+			addRange(idx)
+			from = idx + len(marker)
+		}
+		if len(ranges) >= 8 {
+			break
+		}
+	}
+	if len(ranges) == 0 {
+		return clipText(text, maxLen)
+	}
+	var b strings.Builder
+	for _, r := range ranges {
+		chunk := strings.TrimSpace(text[r.start:r.end])
+		if chunk == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(" … ")
+		}
+		remaining := maxLen - b.Len()
+		if remaining <= 0 {
+			break
+		}
+		if len(chunk) > remaining {
+			chunk = chunk[:remaining]
+		}
+		b.WriteString(chunk)
+		if b.Len() >= maxLen {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return clipText(text, maxLen)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func boostResearchSourceForPlan(query string, prefs researchPreferences, source *researchSource) {
+	if source == nil {
+		return
+	}
+	boost := 0
+	if prefs.Region == "TH" && source.Region == "TH" {
+		if strings.Contains(source.Stage, "primary-current") && researchFreshnessIntent(query) {
+			boost += 10
+		}
+		if strings.Contains(source.Stage, "primary-distributor") {
+			boost += 4
+		}
+		if researchFreshnessIntent(query) {
+			lower := strings.ToLower(source.Title + " " + source.Snippet + " " + source.Excerpt)
+			if strings.Contains(lower, "ราคา") || strings.Contains(lower, "price") || strings.Contains(lower, "฿") {
+				boost += 4
+			}
+		}
+	}
+	source.QualityScore = clampResearchScore(source.QualityScore + boost)
+}
+
 func researchQualityGrade(score int) string {
 	switch {
 	case score >= 90:

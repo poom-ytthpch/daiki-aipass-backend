@@ -366,6 +366,12 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 		if err != nil {
 			meta.Error = err.Error()
 			meta.Phase = "failed"
+			a.publishResearchProgress(ctx, safeRunResearchActivity(meta))
+			// Research is a trust boundary. Once Daiki decides fresh web evidence is
+			// required, never fall back to model memory: doing so produced plausible
+			// but false current prices/specifications in production. Fail closed and
+			// let the client retry Google Search instead.
+			return nil, meta, fmt.Errorf("fresh Google research unavailable: %w", err)
 		} else {
 			sources = result.Sources
 			meta.Used = len(sources) > 0
@@ -434,8 +440,6 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 		if strings.EqualFold(strings.TrimSpace(fmt.Sprint(payload["model"])), "auto") {
 			payload["model"] = "deep"
 		}
-	} else if useWeb && meta.Error != "" {
-		instruction += "\n\nWEB RESEARCH STATUS: FAILED for this request. The backend could not obtain fresh public-web evidence. Do not fabricate search results, citations, page contents, or claim that the URL was read successfully. Still answer helpfully from reliable existing knowledge when possible, and clearly say that fresh web verification was unavailable."
 	}
 	messages, _ := payload["messages"].([]any)
 	payload["messages"] = append([]any{map[string]any{"role": "system", "content": instruction}}, messages...)
@@ -641,13 +645,11 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 		}
 		return found.Results, nil
 	}
-	// google cse is the configured SearXNG engine that currently returns stable,
-	// high-quality indexed results from this deployment. If it is unavailable or
-	// empty, fall back to the instance defaults instead of pinning broken engines.
-	if results, err := search("google cse"); err == nil && len(results) > 0 {
-		return results, nil
-	}
-	return search("")
+	// Google Search is the only permitted research engine. The SearXNG instance
+	// is used purely as a private Google CSE transport; never fall back to its
+	// default engine set because that can silently mix Bing/Yep/other providers
+	// and make provenance/relevance nondeterministic.
+	return search("google cse")
 }
 func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, error) {
 	directURLs := append([]string{}, extractResearchURLs(query)...)
@@ -670,7 +672,7 @@ func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, 
 			if u != nil && u.Hostname() != "" {
 				title = u.Hostname()
 			}
-			direct = append(direct, researchSource{Index: len(direct) + 1, Title: title, URL: raw, Excerpt: clipText(text, 6500), Engine: "direct"})
+			direct = append(direct, researchSource{Index: len(direct) + 1, Title: title, URL: raw, Excerpt: researchFocusedExcerpt(query, text, 6500), Engine: "direct"})
 		}
 		if len(direct) > 0 {
 			return direct, nil
@@ -745,7 +747,7 @@ func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, 
 		go func(idx int) {
 			defer wg.Done()
 			if text, err := fetchPublicPage(ctx, client, sources[idx].URL); err == nil {
-				sources[idx].Excerpt = clipText(text, 6500)
+				sources[idx].Excerpt = researchFocusedExcerpt(query, text, 6500)
 			}
 		}(i)
 	}

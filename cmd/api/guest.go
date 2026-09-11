@@ -604,6 +604,13 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		guestProfile = "guest-skills"
 	}
 	upstreamURL, upstreamKey, upstreamName := a.guestHermesUpstream("/v1/chat/completions", guestProfile)
+	if researchUsesHermesProfile(researchMeta) && route.Workload != inference.WorkloadVision {
+		// Guest research uses the same evidence pipeline as authenticated research.
+		// Hermes' guest profile does not add research tools, so bypass it for the
+		// evidence-synthesis turn and keep Hermes for agent/skills/vision workloads.
+		guestProfile = "research-direct"
+		upstreamURL, upstreamKey, upstreamName = a.liteLLMUpstream("/v1/chat/completions")
+	}
 	makeGuestRequest := func(payload []byte) (*http.Request, error) {
 		req, buildErr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, strings.NewReader(string(payload)))
 		if buildErr != nil {
@@ -675,6 +682,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		w.Header().Set("x-daiki-research-sources", strconv.Itoa(len(researchMeta.Sources)))
 		w.Header().Set("x-daiki-research-quality", strconv.Itoa(researchMeta.QualityScore))
 		w.Header().Set("x-daiki-research-quality-grade", researchMeta.QualityGrade)
+		w.Header().Set("x-daiki-research-engine", "google")
 		if encodedSources := guestResearchSourcesHeader(researchMeta); encodedSources != "" {
 			w.Header().Set("x-daiki-research-sources-json", encodedSources)
 		}

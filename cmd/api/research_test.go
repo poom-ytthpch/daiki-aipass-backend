@@ -331,30 +331,28 @@ func TestSearxSearchPrefersGoogleCSE(t *testing.T) {
 	}
 }
 
-func TestSearxSearchFallsBackToInstanceDefaults(t *testing.T) {
+func TestSearxSearchUsesGoogleCSEOnlyWhenEmpty(t *testing.T) {
 	var engines []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		engine := r.URL.Query().Get("engines")
-		engines = append(engines, engine)
+		engines = append(engines, r.URL.Query().Get("engines"))
 		w.Header().Set("content-type", "application/json")
-		if engine == "google cse" {
-			_, _ = w.Write([]byte(`{"results":[]}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"results":[{"title":"fallback result","url":"https://example.com/result","content":"fallback"}]}`))
+		_, _ = w.Write([]byte(`{"results":[]}`))
 	}))
 	defer server.Close()
 	a := &app{http: server.Client()}
-	results, err := a.searxSearchWithLanguage(context.Background(), server.URL, "fallback query", "all")
-	if err != nil || len(results) != 1 {
-		t.Fatalf("default-engine fallback failed: results=%#v err=%v", results, err)
+	results, err := a.searxSearchWithLanguage(context.Background(), server.URL, "google-only query", "all")
+	if err != nil {
+		t.Fatalf("google-only search returned unexpected error: %v", err)
 	}
-	if len(engines) != 2 || engines[0] != "google cse" || engines[1] != "" {
-		t.Fatalf("expected preferred then default engine calls, got %#v", engines)
+	if len(results) != 0 {
+		t.Fatalf("expected empty Google result set, got %#v", results)
+	}
+	if len(engines) != 1 || engines[0] != "google cse" {
+		t.Fatalf("research must call Google CSE exactly once with no engine fallback, got %#v", engines)
 	}
 }
 
-func TestExplicitWebResearchFailureStillLetsModelAnswer(t *testing.T) {
+func TestExplicitWebResearchFailureFailsClosed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		_, _ = w.Write([]byte(`{"results":[]}`))
@@ -362,16 +360,14 @@ func TestExplicitWebResearchFailureStillLetsModelAnswer(t *testing.T) {
 	defer server.Close()
 	a := &app{cfg: config{SearXNGBase: server.URL}, http: server.Client()}
 	body, meta, err := a.enrichChatWithResearch(context.Background(), []byte(`{"model":"auto","researchMode":"web","messages":[{"role":"user","content":"find a thing that does not exist"}]}`))
-	if err != nil {
-		t.Fatalf("research failure should degrade gracefully, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "fresh Google research unavailable") {
+		t.Fatalf("research failure must fail closed instead of answering from model memory: body=%q meta=%#v err=%v", body, meta, err)
 	}
-	if meta.Used || meta.Error == "" {
+	if meta.Used || meta.Error == "" || meta.Phase != "failed" {
 		t.Fatalf("expected failed research metadata, got %#v", meta)
 	}
-	if !strings.Contains(string(body), "WEB RESEARCH STATUS: FAILED") {
-		t.Fatalf("model must receive explicit failed-research context: %s", body)
-	}
 }
+
 func TestInternetCapabilityQuestionDoesNotTriggerDateTimeTool(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"ตอนนี้เข้า internet ได้ยัง"}]}`)
 	if shouldEnableSmartTools(body) {
