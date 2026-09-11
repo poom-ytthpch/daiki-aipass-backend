@@ -591,7 +591,10 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		return
 	}
 	defer ticket.Release(context.Background())
-	if stream {
+	bufferResearchStream := stream && researchMeta.Used
+	if bufferResearchStream {
+		upstreamBody = forceChatNonStream(upstreamBody)
+	} else if stream {
 		upstreamBody = ensureStreamUsage(upstreamBody)
 	}
 	guestProfile := "guest"
@@ -702,7 +705,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	if decision.Remaining != nil {
 		w.Header().Set("x-daiki-quota-remaining", fmt.Sprint(*decision.Remaining))
 	}
-	if stream {
+	if stream && !bufferResearchStream {
 		if v := resp.Header.Get("content-type"); v != "" {
 			w.Header().Set("content-type", v)
 		}
@@ -734,7 +737,19 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid inference response"})
 		return
 	}
-	usage := parseUsagePayload(responseBody)
+	grounding := researchGroundingResult{Body: responseBody}
+	if resp.StatusCode < http.StatusBadRequest && researchMeta.Used {
+		grounding = a.enforceResearchGrounding(r.Context(), upstreamBody, responseBody, researchMeta, route.PhysicalModel, guestProfile, makeGuestRequest)
+		responseBody = grounding.Body
+		if grounding.Retried {
+			w.Header().Set("x-daiki-grounding-retry", "true")
+			w.Header().Set("x-daiki-grounding-violations", strconv.Itoa(len(grounding.Violations)))
+		}
+		if grounding.Fallback {
+			w.Header().Set("x-daiki-grounding-fallback", "true")
+		}
+	}
+	usage := addUsage(parseUsagePayload(responseBody), grounding.ExtraUsage)
 	status := "completed"
 	if resp.StatusCode >= 400 {
 		status = "failed"
@@ -747,6 +762,14 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	_ = a.store.MergeUsageMetadata(r.Context(), requestID, responseMeta)
 	_ = a.store.FinishUsage(r.Context(), requestID, status, usage)
 	a.releaseReservation(r.Context(), requestID, decision, reserved)
+	if bufferResearchStream {
+		w.Header().Set("content-type", "text/event-stream")
+		w.Header().Set("cache-control", "no-cache")
+		w.Header().Set("x-accel-buffering", "no")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(chatCompletionToSSE(responseBody))
+		return
+	}
 	if v := resp.Header.Get("content-type"); v != "" {
 		w.Header().Set("content-type", v)
 	}

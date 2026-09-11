@@ -242,7 +242,7 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	entityPhrase := researchEntityPhrase(query)
 	currentYear := time.Now().Year()
 	currentMonth := time.Now().Month().String()
-	plan := make([]researchSearchQuery, 0, 16)
+	plan := make([]researchSearchQuery, 0, 10)
 	add := func(q, region, locale, stage string) {
 		q = strings.TrimSpace(q)
 		if q == "" {
@@ -255,20 +255,12 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 		}
 		plan = append(plan, researchSearchQuery{Query: q, Region: region, Locale: locale, Stage: stage})
 	}
-	addSocial := func(base, region, locale, stage, locality string, compact bool) {
+	addSocial := func(base, region, locale, stage, locality string) {
 		locality = strings.TrimSpace(locality)
 		if locality != "" {
 			base = strings.TrimSpace(base + " " + locality)
 		}
-		add("site:facebook.com "+base, region, locale, stage)
-		add("site:instagram.com "+base, region, locale, stage)
-		add("site:tiktok.com "+base, region, locale, stage)
-		if compact {
-			add("(site:youtube.com OR site:reddit.com OR site:pantip.com OR site:x.com OR site:threads.net) "+base, region, locale, stage)
-			return
-		}
-		add("(site:youtube.com OR site:reddit.com OR site:pantip.com) "+base, region, locale, stage)
-		add("(site:x.com OR site:twitter.com OR site:threads.net OR site:linkedin.com) "+base, region, locale, stage)
+		add("(site:facebook.com OR site:instagram.com OR site:tiktok.com) "+base, region, locale, stage)
 	}
 
 	if prefs.Region == "TH" && prefs.Scope != "global" {
@@ -283,9 +275,10 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 			add(fmt.Sprintf(`%s Thailand price specifications %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary-current")
 		}
 		if !strings.Contains(lowerBase, "thailand") && !strings.Contains(localBase, "ประเทศไทย") && !strings.Contains(localBase, "ไทย") {
-			add(localBase+" ประเทศไทย", "TH", "th-TH", "local")
+			add(localBase+" Thailand", "TH", "th-TH", "local")
+		} else {
+			add(localBase, "TH", "th-TH", "local")
 		}
-		add(localBase+" Thailand", "TH", "th-TH", "local")
 		if researchRegulatoryIntent(query) {
 			add("site:go.th "+localBase, "TH", "th-TH", "local-regulatory")
 		}
@@ -301,9 +294,9 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 			default:
 				add(localBase+" ไทย ข่าว ข้อมูลล่าสุด", "TH", "th-TH", "local-current")
 			}
-			addSocial(localBase, "TH", "th-TH", "social-local", "ประเทศไทย Thailand ไทย", false)
+			addSocial(localBase, "TH", "th-TH", "social-local", "ประเทศไทย Thailand ไทย")
 		} else if researchSocialIntent(query) {
-			addSocial(localBase, "TH", "th-TH", "social-local", "ประเทศไทย Thailand ไทย", true)
+			addSocial(localBase, "TH", "th-TH", "social-local", "ประเทศไทย Thailand ไทย")
 		}
 	}
 
@@ -322,14 +315,14 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 			if strings.Contains(lower, "safe") || strings.Contains(lower, "safety") || strings.Contains(lower, "risk") || strings.Contains(lower, "อันตราย") || strings.Contains(lower, "ปลอดภัย") {
 				add(focusQuery+" safety risk recall", "GLOBAL", "all", "global-safety")
 			}
-			addSocial(focusQuery, "GLOBAL", "all", "social-global", "", true)
+			addSocial(focusQuery, "GLOBAL", "all", "social-global", "")
 		} else if researchSocialIntent(query) {
-			addSocial(focusQuery, "GLOBAL", "all", "social-global", "", true)
+			addSocial(focusQuery, "GLOBAL", "all", "social-global", "")
 		}
 	}
 
 	for _, variant := range researchQueryVariants(query) {
-		if len(plan) >= 16 {
+		if len(plan) >= 10 {
 			break
 		}
 		add(variant, "GLOBAL", "all", "entity")
@@ -337,8 +330,8 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	if prefs.Depth != "deep" && len(plan) > 5 {
 		plan = plan[:5]
 	}
-	if len(plan) > 16 {
-		plan = plan[:16]
+	if len(plan) > 10 {
+		plan = plan[:10]
 	}
 	return plan
 }

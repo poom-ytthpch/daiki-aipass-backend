@@ -63,13 +63,13 @@ func TestSealion7ResearchRelevanceRejectsMismatchedSources(t *testing.T) {
 
 func TestResearchAuthorityDoesNotConfuseGovernmentWithProductPrimary(t *testing.T) {
 	query := "BYD Sealion 7 ราคา ล่าสุด Thailand"
-	primary := researchAuthorityForCandidate(query,
+	localDistributor := researchAuthorityForCandidate(query,
 		"BYD SEALION 7 | RÊVER Automotive",
 		"https://www.reverautomotive.com/model/sealion7/overview",
 		"BYD SEALION 7 ราคา 1,199,900 บาท",
 		"local-primary", false)
-	if primary != "primary" {
-		t.Fatalf("manufacturer product page authority=%q want primary", primary)
+	if localDistributor != "secondary" {
+		t.Fatalf("local distributor without explicit official proof authority=%q want secondary", localDistributor)
 	}
 	government := researchAuthorityForCandidate(query,
 		"รถมือสอง One2car",
@@ -382,7 +382,7 @@ func TestProductAuthorityDoesNotPromoteSecondaryArticlesFromPrimaryQueryStage(t 
 		url  string
 		want string
 	}{
-		{name: "manufacturer model page", url: "https://www.reverautomotive.com/model/sealion7/overview", want: "primary"},
+		{name: "local distributor page without explicit official proof", url: "https://www.reverautomotive.com/model/sealion7/overview", want: "secondary"},
 		{name: "automotive news article", url: "https://www.autoinfo.co.th/online/572782", want: "secondary"},
 		{name: "magazine specs article", url: "https://www.grandprix.co.th/byd-sealion-7-specs-price/", want: "secondary"},
 		{name: "dealer domain contains brand token", url: "https://www.bydbdautogroup.com/th/byd-electric-car-price-th/", want: "secondary"},
@@ -394,5 +394,13 @@ func TestProductAuthorityDoesNotPromoteSecondaryArticlesFromPrimaryQueryStage(t 
 				t.Fatalf("authority=%q want=%q for %s", got, tc.want, tc.url)
 			}
 		})
+	}
+}
+
+func TestOfficialDistributorSignalCanPromoteLocalPrimarySource(t *testing.T) {
+	query := "BYD Sealion 7 Thailand price"
+	got := researchAuthorityForCandidate(query, "BYD SEALION 7", "https://local-distributor.example/model/sealion7", "Official distributor of BYD in Thailand", "local-primary-distributor", false)
+	if got != "primary" {
+		t.Fatalf("verified official distributor authority=%q want primary", got)
 	}
 }

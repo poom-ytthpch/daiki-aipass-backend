@@ -436,6 +436,20 @@ func researchDiscoveredPrimaryHosts(query string, rows []searxResult) []string {
 	return out
 }
 
+func researchOfficialDistributorSignal(title, content string) bool {
+	lower := strings.ToLower(title + " " + content)
+	for _, signal := range []string{
+		"official distributor", "authorized distributor", "official importer", "authorized importer",
+		"official dealer network", "ผู้นำเข้าและจัดจำหน่ายอย่างเป็นทางการ", "ผู้จัดจำหน่ายอย่างเป็นทางการ",
+		"ตัวแทนจำหน่ายอย่างเป็นทางการ", "ผู้นำเข้าอย่างเป็นทางการ",
+	} {
+		if strings.Contains(lower, signal) {
+			return true
+		}
+	}
+	return false
+}
+
 func researchAuthorityForCandidate(query, title, rawURL, content, stage string, direct bool) string {
 	host := researchHost(rawURL)
 	if researchSocialPlatform(rawURL) != "" {
@@ -457,7 +471,7 @@ func researchAuthorityForCandidate(query, title, rawURL, content, stage string, 
 		return "interpretive"
 	}
 	relevance := researchRelevanceScore(query, title, rawURL, content)
-	if relevance >= 85 && strings.Contains(stage, "primary") && (researchPrimaryPath(rawURL) || researchHostMatchesEntity(query, rawURL)) {
+	if relevance >= 85 && strings.Contains(stage, "primary") && (researchHostMatchesEntity(query, rawURL) || researchOfficialDistributorSignal(title, content)) {
 		return "primary"
 	}
 	return "secondary"

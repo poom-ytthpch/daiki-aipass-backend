@@ -683,7 +683,10 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 			upstreamBody = plannedBody
 		}
 	}
-	if stream {
+	bufferResearchStream := stream && researchMeta.Used
+	if bufferResearchStream {
+		upstreamBody = forceChatNonStream(upstreamBody)
+	} else if stream {
 		upstreamBody = ensureStreamUsage(upstreamBody)
 	}
 	if researchMeta.Used {
@@ -831,7 +834,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		w.Header().Set("x-daiki-quota-reset", decision.ResetAt.Format(time.RFC3339))
 	}
 
-	if stream {
+	if stream && !bufferResearchStream {
 		w.Header().Set("x-accel-buffering", "no")
 		w.WriteHeader(resp.StatusCode)
 		capture := &cappedBuffer{max: storedPayloadLimit}
@@ -865,7 +868,19 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, 502, map[string]string{"error": "invalid LiteLLM response"})
 		return
 	}
-	usage := parseUsagePayload(responseBody)
+	grounding := researchGroundingResult{Body: responseBody}
+	if resp.StatusCode < http.StatusBadRequest && researchMeta.Used {
+		grounding = a.enforceResearchGrounding(r.Context(), upstreamBody, responseBody, researchMeta, route.PhysicalModel, hermesProfile, makeUpstreamRequest)
+		responseBody = grounding.Body
+		if grounding.Retried {
+			w.Header().Set("x-daiki-grounding-retry", "true")
+			w.Header().Set("x-daiki-grounding-violations", strconv.Itoa(len(grounding.Violations)))
+		}
+		if grounding.Fallback {
+			w.Header().Set("x-daiki-grounding-fallback", "true")
+		}
+	}
+	usage := addUsage(parseUsagePayload(responseBody), grounding.ExtraUsage)
 	responseBody = sanitizeReasoningJSON(responseBody)
 	actual := usage.TotalTokens
 	if actual == 0 && resp.StatusCode < 400 {
@@ -883,6 +898,14 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	_ = a.store.MergeUsageMetadata(r.Context(), requestID, usageResponseMetadata(responseBody))
 	_ = a.store.FinishUsage(r.Context(), requestID, ledgerStatus, usage)
 	a.releaseReservation(r.Context(), requestID, decision, reserved)
+	if bufferResearchStream {
+		w.Header().Set("content-type", "text/event-stream")
+		w.Header().Set("cache-control", "no-cache")
+		w.Header().Set("x-accel-buffering", "no")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(chatCompletionToSSE(responseBody))
+		return
+	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(responseBody)
 }
