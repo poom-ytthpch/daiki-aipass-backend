@@ -397,6 +397,74 @@ func TestContextualFollowUpInheritsPreviousResearch(t *testing.T) {
 	}
 }
 
+func TestDetailedProductResearchIntentUsesWebAutomatically(t *testing.T) {
+	for _, query := range []string{
+		"หาข้อมูลรถ sealion 7 อย่างละเอียด",
+		"ค้นข้อมูล Sony WH-1000XM6 แบบละเอียด",
+		"find information about iPhone 17 Pro in detail",
+	} {
+		if !shouldAutoResearch(query) {
+			t.Fatalf("detailed research request must trigger web research: %q", query)
+		}
+	}
+}
+
+func TestLatestPriceFollowUpInheritsProductEntity(t *testing.T) {
+	payload := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "หาข้อมูลรถ sealion 7 อย่างละเอียด"},
+		map[string]any{"role": "assistant", "content": "BYD SEALION 7 เป็น SUV ไฟฟ้าที่จำหน่ายในประเทศไทย"},
+		map[string]any{"role": "user", "content": "ราคาล่าสุดเท่าไหร่"},
+	}}
+	query, resolved, useWeb, inherited, ctx := contextualResearchPlan(payload, "auto")
+	if query != "ราคาล่าสุดเท่าไหร่" {
+		t.Fatalf("query=%q", query)
+	}
+	if !ctx.IsFollowUp || !useWeb || !inherited {
+		t.Fatalf("latest price must inherit product context: ctx=%#v useWeb=%v inherited=%v", ctx, useWeb, inherited)
+	}
+	if !strings.Contains(strings.ToLower(resolved), "sealion 7") || !strings.Contains(resolved, "ราคาล่าสุดเท่าไหร่") {
+		t.Fatalf("resolved query lost Sealion 7 context: %q", resolved)
+	}
+	if phrase := researchEntityPhrase(resolved); !strings.Contains(phrase, "sealion") || strings.Contains(phrase, "follow-up") {
+		t.Fatalf("unexpected resolved entity phrase: %q", phrase)
+	}
+}
+
+func TestLatestPriceFollowUpFallsBackToPreviousUserTopic(t *testing.T) {
+	payload := map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "BYD Sealion 7 เป็นยังไง"},
+		map[string]any{"role": "assistant", "content": "เป็น SUV ไฟฟ้าของ BYD"},
+		map[string]any{"role": "user", "content": "ราคาล่าสุดเท่าไหร่"},
+	}}
+	_, resolved, useWeb, inherited, ctx := contextualResearchPlan(payload, "auto")
+	if !ctx.IsFollowUp || !useWeb || !inherited {
+		t.Fatalf("price follow-up must use previous user topic even without prior research: ctx=%#v useWeb=%v inherited=%v", ctx, useWeb, inherited)
+	}
+	if !strings.Contains(strings.ToLower(resolved), "byd sealion 7") {
+		t.Fatalf("resolved query must retain previous product subject: %q", resolved)
+	}
+}
+
+func TestCurrentThailandProductPlanDiscoversOfficialDistributorAndCampaign(t *testing.T) {
+	prefs := researchPreferences{Region: "TH", Locale: "th-TH", Scope: "local-first", Depth: "standard"}
+	plan := researchSearchPlan("BYD Sealion 7 ราคาล่าสุด", prefs)
+	joined := make([]string, 0, len(plan))
+	for _, item := range plan {
+		joined = append(joined, item.Query)
+	}
+	queries := strings.Join(joined, "\n")
+	for _, want := range []string{"Thailand official", "official distributor importer", "official price campaign", "price specifications"} {
+		if !strings.Contains(queries, want) {
+			t.Fatalf("current Thailand product plan missing %q: %s", want, queries)
+		}
+	}
+	for _, item := range plan {
+		if strings.Contains(item.Stage, "primary") && strings.Contains(item.Query, `"`) {
+			t.Fatalf("primary discovery query must stay unquoted for SearXNG engine compatibility: %#v", item)
+		}
+	}
+}
+
 func TestDetailExpansionTypoInheritsPreviousResearch(t *testing.T) {
 	payload := map[string]any{"messages": []any{
 		map[string]any{"role": "user", "content": "ค้นหาข้อมูล https://www.overdrive.qd.je/ แล้วสรุปมาเป็นภาษาไทย"},

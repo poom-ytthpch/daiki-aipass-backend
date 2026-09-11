@@ -241,6 +241,7 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	}
 	entityPhrase := researchEntityPhrase(query)
 	currentYear := time.Now().Year()
+	currentMonth := time.Now().Month().String()
 	plan := make([]researchSearchQuery, 0, 16)
 	add := func(q, region, locale, stage string) {
 		q = strings.TrimSpace(q)
@@ -274,8 +275,12 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 		localBase := focusQuery
 		lowerBase := strings.ToLower(localBase)
 		if entityPhrase != "" {
-			add(`"`+entityPhrase+`" Thailand official`, "TH", "th-TH", "local-primary")
-			add(fmt.Sprintf(`"%s" Thailand price specifications %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary-current")
+			add(entityPhrase+` Thailand official`, "TH", "th-TH", "local-primary")
+			add(entityPhrase+` Thailand official distributor importer`, "TH", "th-TH", "local-primary-distributor")
+			if researchFreshnessIntent(query) {
+				add(fmt.Sprintf(`%s Thailand official price campaign %s %d`, entityPhrase, currentMonth, currentYear), "TH", "th-TH", "local-primary-current")
+			}
+			add(fmt.Sprintf(`%s Thailand price specifications %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary-current")
 		}
 		if !strings.Contains(lowerBase, "thailand") && !strings.Contains(localBase, "ประเทศไทย") && !strings.Contains(localBase, "ไทย") {
 			add(localBase+" ประเทศไทย", "TH", "th-TH", "local")
@@ -306,7 +311,7 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 		add(focusQuery, "GLOBAL", "all", "global")
 		if prefs.Depth == "deep" {
 			if entityPhrase != "" {
-				add(`"`+entityPhrase+`" official specifications`, "GLOBAL", "all", "global-primary")
+				add(entityPhrase+` official specifications`, "GLOBAL", "all", "global-primary")
 			} else {
 				add(focusQuery+" official documentation", "GLOBAL", "all", "global-primary")
 			}
@@ -483,7 +488,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 	}
 	if entityPhrase := researchEntityPhrase(query); entityPhrase != "" && len(results) > 0 {
 		for _, host := range researchDiscoveredPrimaryHosts(query, results) {
-			primaryQuery := fmt.Sprintf(`site:%s "%s" %d`, host, entityPhrase, time.Now().Year())
+			primaryQuery := fmt.Sprintf(`site:%s %s %d`, host, entityPhrase, time.Now().Year())
 			found, err := a.searxSearchWithLanguage(ctx, base, primaryQuery, first(prefs.Locale, "all"))
 			if err != nil {
 				continue

@@ -162,7 +162,9 @@ func looksContextualFollowUp(q string) bool {
 	markers := []string{
 		"อันตราย", "ปลอดภัย", "มีผล", "ดีไหม", "ดีมั้ย", "ใช้ได้ไหม", "ใช้ได้มั้ย", "เป็นยังไง", "เป็นอย่างไร", "ทำไม", "ยังไง", "อย่างไร", "คุ้มไหม", "คุ้มมั้ย", "ควรไหม", "ควรมั้ย", "แล้ว", "อันนี้", "ตัวนี้", "แบบนี้", "มัน", "ต่อไหม", "ต่อมั้ย",
 		"รายละเอียด", "รายละเอ", "รายระเอ", "มากกว่านี้", "เพิ่มเติม", "เพิ่มอีก", "ขอเพิ่ม", "ขยายความ", "อธิบายเพิ่ม", "เจาะลึก", "ลงลึก", "ละเอียดกว่านี้",
+		"ราคา", "ล่าสุด", "เท่าไหร่", "เท่าไร", "กี่บาท", "มีรุ่นอะไร", "รุ่นไหน", "สเปก", "ประกัน", "โปรโมชั่น", "โปรล่าสุด", "ยังขายไหม", "ยังมีขายไหม",
 		"is it", "does it", "can it", "what about", "how about", "is this", "is that", "safe", "dangerous", "worth it", "why", "how does that", "what does that", "more detail", "more details", "tell me more", "expand", "elaborate", "go deeper",
+		"price", "latest price", "current price", "how much", "specs", "specifications", "warranty", "promotion", "availability", "still available",
 	}
 	for _, marker := range markers {
 		if strings.Contains(n, marker) {
@@ -216,7 +218,9 @@ func continuityContextFor(payload map[string]any) continuityContext {
 			}
 		}
 	}
-	ctx.IsFollowUp = ctx.PreviousUser != "" && looksContextualFollowUp(ctx.LatestUser)
+	// Treat a short omitted-subject question as contextual, but do not leak a
+	// previous topic into a new turn that explicitly names its own entity.
+	ctx.IsFollowUp = ctx.PreviousUser != "" && looksContextualFollowUp(ctx.LatestUser) && researchEntityPhrase(ctx.LatestUser) == ""
 	return ctx
 }
 
@@ -274,10 +278,16 @@ func contextualResearchPlan(payload map[string]any, mode string) (latestQuery, r
 	latestQuery = continuity.LatestUser
 	resolvedQuery = latestQuery
 	useWeb = mode == "web" || (mode == "auto" && !attachmentAutoResearchSuppressed(payload, latestQuery) && (shouldAutoResearch(latestQuery) || isWebCapabilityQuestion(latestQuery)))
-	if !useWeb && mode == "auto" && continuity.IsFollowUp && continuity.PreviousResearch != "" {
-		useWeb = true
-		inherited = true
-		resolvedQuery = strings.TrimSpace(continuity.PreviousResearch + "\nFollow-up: " + latestQuery)
+	if mode != "off" && continuity.IsFollowUp {
+		previousTopic := strings.TrimSpace(continuity.PreviousResearch)
+		if previousTopic == "" {
+			previousTopic = strings.TrimSpace(continuity.PreviousUser)
+		}
+		if previousTopic != "" {
+			useWeb = true
+			inherited = true
+			resolvedQuery = strings.TrimSpace(previousTopic + "\nFollow-up: " + latestQuery)
+		}
 	}
 	return
 }
@@ -291,8 +301,8 @@ func shouldAutoResearch(q string) bool {
 		return true
 	}
 	keywords := []string{
-		"latest", "current", "today", "tonight", "this week", "this month", "news", "recent", "price", "release", "version", "documentation", "docs", "research", "search the web", "internet", "compare", "comparison", "review", "availability", "status", "outage", "weather", "market",
-		"ล่าสุด", "ปัจจุบัน", "วันนี้", "สัปดาห์นี้", "เดือนนี้", "ข่าว", "ราคา", "เวอร์ชัน", "เอกสาร", "ค้น", "อินเทอร์เน็ต", "เว็บ", "เปรียบเทียบ", "รีวิว", "สถานะ", "มีขาย", "อัปเดต",
+		"latest", "current", "today", "tonight", "this week", "this month", "news", "recent", "price", "release", "version", "documentation", "docs", "research", "research this", "find information", "look up", "search the web", "internet", "compare", "comparison", "review", "availability", "status", "outage", "weather", "market", "in detail", "detailed information", "deep dive",
+		"ล่าสุด", "ปัจจุบัน", "วันนี้", "สัปดาห์นี้", "เดือนนี้", "ข่าว", "ราคา", "เวอร์ชัน", "เอกสาร", "ค้น", "ค้นข้อมูล", "หาข้อมูล", "อินเทอร์เน็ต", "เว็บ", "เปรียบเทียบ", "รีวิว", "สถานะ", "มีขาย", "อัปเดต", "อย่างละเอียด", "รายละเอียดล่าสุด", "เจาะลึก",
 	}
 	for _, k := range keywords {
 		if strings.Contains(q, k) {

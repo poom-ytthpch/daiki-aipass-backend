@@ -23,7 +23,7 @@ var researchEntityStopwords = map[string]bool{
 	"docs": true, "documentation": true, "changelog": true, "version": true, "versions": true,
 	"owner": true, "owners": true, "issue": true, "issues": true, "social": true,
 	"the": true, "meaning": true, "traditional": true, "interpretation": true, "interpretive": true,
-	"horoscope": true, "astrology": true, "astrological": true, "ephemeris": true,
+	"horoscope": true, "astrology": true, "astrological": true, "ephemeris": true, "follow-up": true, "followup": true,
 	"january": true, "february": true, "march": true, "april": true, "may": true, "june": true,
 	"july": true, "august": true, "september": true, "october": true, "november": true, "december": true,
 	"guide": true, "reference": true,
