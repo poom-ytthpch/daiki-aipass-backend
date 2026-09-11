@@ -238,7 +238,13 @@ func (a *app) executeChatRun(ctx context.Context, run store.ChatRun, identity ch
 	profile := thinkingProfileFor(run.ThinkingMode)
 	researchPrefs := chatRunResearchPreferences(run)
 	researchActivity := map[string]any{"mode": run.ResearchMode, "query": clipText(lastUserText, 500), "region": researchPrefs.Region, "locale": researchPrefs.Locale, "scope": researchPrefs.Scope, "depth": researchPrefs.Depth, "focus": researchPrefs.Focus, "phase": "planning"}
-	_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"research": researchActivity, "thinking": map[string]any{"mode": run.ThinkingMode, "reasoningBudget": profile.ReasoningBudget}, "commands": map[string]any{"mode": run.CommandMode, "skills": run.CommandSkills}})
+	initialThinking := map[string]any{
+		"mode": run.ThinkingMode, "policyScore": thinkingPolicyScore(profile), "taskClass": thinkingTaskClassFromText(lastUserText),
+		"reasoningBudget": profile.ReasoningBudget, "analysisPasses": profile.AnalysisPasses, "verificationPasses": profile.VerificationPasses,
+		"alternativePaths": profile.AlternativePaths, "constraintAudit": profile.ConstraintAudit, "counterexampleAudit": profile.CounterexampleAudit,
+		"uncertaintyAudit": profile.UncertaintyAudit, "taskAdaptation": profile.TaskAdaptation,
+	}
+	_ = a.store.UpdateChatRunActivity(ctx, run.ID, map[string]any{"research": researchActivity, "thinking": initialThinking, "commands": map[string]any{"mode": run.CommandMode, "skills": run.CommandSkills}})
 	payload := map[string]any{
 		"model": session.ModelAlias, "researchMode": run.ResearchMode, "researchRegion": researchPrefs.Region, "researchLocale": researchPrefs.Locale,
 		"researchScope": researchPrefs.Scope, "researchDepth": researchPrefs.Depth, "researchFocus": researchPrefs.Focus,
@@ -441,9 +447,11 @@ func (a *app) chatRunActivity(ctx context.Context, requestID string, headers htt
 		activity["research"] = safe
 	}
 	if thinking, ok := meta["thinking"].(map[string]any); ok {
-		thinkingActivity["mode"] = thinking["mode"]
-		thinkingActivity["reasoningBudget"] = thinking["reasoningBudget"]
-		thinkingActivity["estimate"] = thinking["estimate"]
+		for _, key := range []string{"mode", "policyScore", "taskClass", "reasoningBudget", "analysisPasses", "verificationPasses", "alternativePaths", "constraintAudit", "counterexampleAudit", "uncertaintyAudit", "taskAdaptation", "estimate"} {
+			if value, exists := thinking[key]; exists {
+				thinkingActivity[key] = value
+			}
+		}
 	}
 	if recovery, ok := meta["modelRecovery"].(map[string]any); ok {
 		if value := strings.TrimSpace(fmt.Sprint(recovery["requestedReasoningEffort"])); value != "" {

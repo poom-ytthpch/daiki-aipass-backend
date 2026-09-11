@@ -378,7 +378,7 @@ func TestThinkingModeAppliesBudgetAndRemovesInternalField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profile.Mode != "high" || profile.ReasoningBudget != 1536 || profile.MaxCompletionTokens != 4096 {
+	if profile.Mode != "high" || profile.ReasoningBudget != 4096 || profile.MaxCompletionTokens != 8192 {
 		t.Fatalf("unexpected profile %#v", profile)
 	}
 	var payload map[string]any
@@ -396,7 +396,7 @@ func TestThinkingModeAppliesBudgetAndRemovesInternalField(t *testing.T) {
 	if reasoning["enabled"] != true || reasoning["effort"] != "high" {
 		t.Fatalf("unexpected Hermes reasoning options %#v", reasoning)
 	}
-	if payload["max_completion_tokens"] != float64(4096) {
+	if payload["max_completion_tokens"] != float64(8192) {
 		t.Fatalf("unexpected completion budget %#v", payload["max_completion_tokens"])
 	}
 }
@@ -404,7 +404,7 @@ func TestThinkingModeAppliesBudgetAndRemovesInternalField(t *testing.T) {
 func TestTokenEstimateIncludesThinkingBudget(t *testing.T) {
 	p := thinkingProfileFor("medium")
 	e := estimateTokens([]byte(`{"messages":[{"role":"user","content":"hello"}]}`), p)
-	if e.ThinkingBudget != 768 || e.CompletionBudget != 2560 {
+	if e.ThinkingBudget != 2048 || e.CompletionBudget != 6144 {
 		t.Fatalf("unexpected estimate %#v", e)
 	}
 	if e.TotalBudget != e.InputTokens+e.CompletionBudget {

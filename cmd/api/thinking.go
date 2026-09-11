@@ -12,26 +12,136 @@ type thinkingProfile struct {
 	ReasoningBudget       int64  `json:"reasoningBudget"`
 	MaxCompletionTokens   int64  `json:"maxCompletionTokens"`
 	NativeReasoningEffort string `json:"-"`
+	AnalysisPasses        int    `json:"analysisPasses"`
+	VerificationPasses    int    `json:"verificationPasses"`
+	AlternativePaths      int    `json:"alternativePaths"`
+	ConstraintAudit       bool   `json:"constraintAudit"`
+	CounterexampleAudit   bool   `json:"counterexampleAudit"`
+	UncertaintyAudit      bool   `json:"uncertaintyAudit"`
+	TaskAdaptation        bool   `json:"taskAdaptation"`
 	Instruction           string `json:"-"`
 }
 
 var thinkingProfiles = map[string]thinkingProfile{
 	"off": {
-		Mode: "off", Label: "Off", ReasoningBudget: 0, MaxCompletionTokens: 1024, NativeReasoningEffort: "none",
-		Instruction: "Answer directly. Do not spend extra tokens on deliberate reasoning unless needed for correctness.",
+		Mode: "off", Label: "Off", ReasoningBudget: 0, MaxCompletionTokens: 2048, NativeReasoningEffort: "none",
+		Instruction: "Answer directly and prioritize correctness. Do not perform an extended deliberation workflow unless it is necessary to avoid an obvious mistake.",
 	},
 	"low": {
-		Mode: "low", Label: "Low", ReasoningBudget: 384, MaxCompletionTokens: 1536, NativeReasoningEffort: "low",
-		Instruction: "Use a small internal reasoning budget. Check the most important assumption once, then answer concisely.",
+		Mode: "low", Label: "Low", ReasoningBudget: 1024, MaxCompletionTokens: 4096, NativeReasoningEffort: "low",
+		AnalysisPasses: 1, VerificationPasses: 1, AlternativePaths: 1, ConstraintAudit: true, TaskAdaptation: true,
+		Instruction: "Use one deliberate solve pass plus one sanity check. Identify the user's goal and hard constraints, solve the task directly, then verify the highest-risk assumption, calculation, or factual dependency once before answering. State material uncertainty instead of guessing.",
 	},
 	"medium": {
-		Mode: "medium", Label: "Medium", ReasoningBudget: 768, MaxCompletionTokens: 2560, NativeReasoningEffort: "medium",
-		Instruction: "Use moderate internal reasoning. Break the task into a few verifiable steps, check key facts and then answer.",
+		Mode: "medium", Label: "Medium", ReasoningBudget: 2048, MaxCompletionTokens: 6144, NativeReasoningEffort: "medium",
+		AnalysisPasses: 2, VerificationPasses: 2, AlternativePaths: 2, ConstraintAudit: true, UncertaintyAudit: true, TaskAdaptation: true,
+		Instruction: "Use a structured internal workflow: frame the goal, constraints, and unknowns; decompose the task into verifiable parts; solve them; independently re-check important calculations or factual dependencies; compare at least one plausible alternative when it could change the answer; reconcile contradictions before answering. State material uncertainty instead of filling gaps with guesses.",
 	},
 	"high": {
-		Mode: "high", Label: "High", ReasoningBudget: 1536, MaxCompletionTokens: 4096, NativeReasoningEffort: "high",
-		Instruction: "Use a larger internal reasoning budget. Examine alternatives and edge cases, verify important facts and calculations, then give only the useful conclusion and supporting rationale. Never reveal private chain-of-thought.",
+		Mode: "high", Label: "High", ReasoningBudget: 4096, MaxCompletionTokens: 8192, NativeReasoningEffort: "high",
+		AnalysisPasses: 3, VerificationPasses: 3, AlternativePaths: 3, ConstraintAudit: true, CounterexampleAudit: true, UncertaintyAudit: true, TaskAdaptation: true,
+		Instruction: "Use a robust internal workflow: define the task and acceptance criteria; separate known facts, assumptions, and unknowns; generate multiple candidate approaches when meaningful; solve using the strongest candidate; adversarially challenge it with edge cases, counterexamples, failure modes, and conflicting evidence; independently verify critical calculations and constraints; reconcile any inconsistency; then synthesize the best answer with calibrated uncertainty. Repeat a verification pass when a critical inconsistency remains.",
 	},
+}
+
+func thinkingPolicyScore(profile thinkingProfile) int {
+	score := 10
+	score += min(profile.AnalysisPasses, 3) * 10
+	score += min(profile.VerificationPasses, 3) * 10
+	score += min(profile.AlternativePaths, 3) * 5
+	if profile.ConstraintAudit {
+		score += 5
+	}
+	if profile.CounterexampleAudit {
+		score += 5
+	}
+	if profile.UncertaintyAudit {
+		score += 5
+	}
+	if profile.TaskAdaptation {
+		score += 5
+	}
+	return min(score, 100)
+}
+
+func thinkingContainsAny(text string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func thinkingTaskClass(body []byte) string {
+	return thinkingTaskClassFromText(latestUserText(body))
+}
+
+func thinkingTaskClassFromText(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return "general"
+	}
+	if thinkingContainsAny(text, "debug", "bug", "stack trace", "exception", "typescript", "javascript", "nestjs", "next.js", "nextjs", "react", "sql", "function", "code", "โค้ด", "บั๊ก", "แก้ error", "แก้ไข error") {
+		return "coding"
+	}
+	if thinkingContainsAny(text, "calculate", "calculation", "equation", "probability", "percent", "percentage", "ratio", "formula", "คำนวณ", "สมการ", "เปอร์เซ็นต์", "ความน่าจะเป็น") {
+		return "quantitative"
+	}
+	if thinkingContainsAny(text, "compare", "comparison", "choose", "recommend", "tradeoff", "pros and cons", "decision", "เปรียบเทียบ", "เลือก", "แนะนำ", "ข้อดีข้อเสีย", "ตัดสินใจ") {
+		return "decision"
+	}
+	if thinkingContainsAny(text, "research", "latest", "current", "source", "evidence", "citation", "specification", "specs", "ราคา", "ล่าสุด", "ปัจจุบัน", "แหล่งข้อมูล", "หลักฐาน", "สเปก", "วิจัย", "ค้นข้อมูล") {
+		return "factual"
+	}
+	return "general"
+}
+
+func thinkingTaskInstruction(taskClass string) string {
+	switch taskClass {
+	case "coding":
+		return "TASK-SPECIFIC CHECK: trace the relevant input/state/control flow before proposing a fix; preserve existing contracts; identify likely regression surfaces; and include the smallest useful validation or test evidence."
+	case "quantitative":
+		return "TASK-SPECIFIC CHECK: compute carefully, track units and boundary conditions, then independently recompute or cross-check the result before presenting it."
+	case "decision":
+		return "TASK-SPECIFIC CHECK: identify decision criteria and hard constraints, compare realistic alternatives on the same criteria, surface material tradeoffs, and test whether the recommendation changes under a plausible counterfactual."
+	case "factual":
+		return "TASK-SPECIFIC CHECK: separate evidence from inference, prefer supplied or tool-grounded evidence for freshness-sensitive claims, check source authority and recency, and never invent a source, citation, measurement, or missing fact."
+	default:
+		return "TASK-SPECIFIC CHECK: make the user's requirements explicit, check for contradictions or missing constraints, and verify the conclusion against the original request before answering."
+	}
+}
+
+func thinkingInstruction(profile thinkingProfile, taskClass string) string {
+	parts := []string{
+		"THINKING MODE: " + strings.ToUpper(profile.Mode) + ".",
+		profile.Instruction,
+	}
+	if profile.TaskAdaptation {
+		parts = append(parts, thinkingTaskInstruction(taskClass))
+	}
+	parts = append(parts,
+		"Treat the workflow as private scratch work: never reveal hidden chain-of-thought, private deliberation, or internal token-by-token reasoning. Return only the useful answer, concise supporting rationale, and any verification result or uncertainty that materially helps the user.",
+		"The provider receives the matching native reasoning effort when supported; otherwise these reasoning and verification gates remain mandatory prompt-guided behavior.",
+	)
+	return strings.Join(parts, " ")
+}
+
+func thinkingMetadata(profile thinkingProfile, body []byte) map[string]any {
+	return map[string]any{
+		"mode":                profile.Mode,
+		"policyScore":         thinkingPolicyScore(profile),
+		"taskClass":           thinkingTaskClass(body),
+		"reasoningBudget":     profile.ReasoningBudget,
+		"maxCompletionTokens": profile.MaxCompletionTokens,
+		"analysisPasses":      profile.AnalysisPasses,
+		"verificationPasses":  profile.VerificationPasses,
+		"alternativePaths":    profile.AlternativePaths,
+		"constraintAudit":     profile.ConstraintAudit,
+		"counterexampleAudit": profile.CounterexampleAudit,
+		"uncertaintyAudit":    profile.UncertaintyAudit,
+		"taskAdaptation":      profile.TaskAdaptation,
+	}
 }
 
 func normalizeThinkingMode(v any) string {
@@ -60,6 +170,7 @@ func applyThinkingMode(body []byte) ([]byte, thinkingProfile, error) {
 	}
 	mode := normalizeThinkingMode(payload["thinkingMode"])
 	profile := thinkingProfileFor(mode)
+	taskClass := thinkingTaskClass(body)
 	delete(payload, "thinkingMode")
 	// Hermes API Server consumes per-request reasoning from model_options. Keep
 	// provider wire fields out of the top-level request here; the runtime adapter
@@ -82,7 +193,7 @@ func applyThinkingMode(body []byte) ([]byte, thinkingProfile, error) {
 	delete(payload, "max_tokens")
 
 	messages, _ := payload["messages"].([]any)
-	instruction := "THINKING MODE: " + strings.ToUpper(profile.Mode) + ". " + profile.Instruction + " The provider receives the matching native reasoning effort when supported. Keep hidden reasoning private and return only the useful answer/rationale."
+	instruction := thinkingInstruction(profile, taskClass)
 	if len(messages) > 0 {
 		if first, ok := messages[0].(map[string]any); ok && strings.EqualFold(strings.TrimSpace(fmt.Sprint(first["role"])), "system") {
 			first["content"] = strings.TrimSpace(fmt.Sprint(first["content"])) + "\n\n" + instruction

@@ -635,7 +635,9 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	if responseLanguage.Code != "" {
 		requestMeta["responseLanguage"] = responseLanguage
 	}
-	requestMeta["thinking"] = map[string]any{"mode": thinkingProfile.Mode, "reasoningBudget": thinkingProfile.ReasoningBudget, "maxCompletionTokens": thinkingProfile.MaxCompletionTokens, "estimate": tokenEstimate}
+	thinkingMeta := thinkingMetadata(thinkingProfile, body)
+	thinkingMeta["estimate"] = tokenEstimate
+	requestMeta["thinking"] = thinkingMeta
 	_ = a.store.MergeUsageMetadata(r.Context(), requestID, requestMeta)
 	principalID := "user:" + c.Sub
 	if currentPrincipal(r).APIKeyID != "" {
@@ -720,6 +722,8 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		w.Header().Set("x-daiki-response-language", responseLanguage.Code)
 	}
 	w.Header().Set("x-daiki-thinking-mode", thinkingProfile.Mode)
+	w.Header().Set("x-daiki-thinking-policy-score", strconv.Itoa(thinkingPolicyScore(thinkingProfile)))
+	w.Header().Set("x-daiki-thinking-task-class", thinkingTaskClass(body))
 	w.Header().Set("x-daiki-token-estimate-input", fmt.Sprint(tokenEstimate.InputTokens))
 	w.Header().Set("x-daiki-token-estimate-thinking", fmt.Sprint(tokenEstimate.ThinkingBudget))
 	w.Header().Set("x-daiki-token-estimate-output", fmt.Sprint(tokenEstimate.VisibleBudget))
