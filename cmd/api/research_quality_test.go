@@ -110,10 +110,12 @@ func TestFreshnessScoringPrefersCurrentEvidence(t *testing.T) {
 	now := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
 	query := "BYD Sealion 7 ราคา ล่าสุด"
 	current := researchFreshnessScore(query, "โปรโมชั่น กันยายน 2026", now)
+	february := researchFreshnessScore(query, "ราคาอัปเดต กุมภาพันธ์ 2569", now)
 	lastYear := researchFreshnessScore(query, "ราคาเปิดตัว November 2025", now)
+	yearOnly := researchFreshnessScore(query, "ราคาและข้อมูลปี 2026", now)
 	old := researchFreshnessScore(query, "ข้อมูลปี 2022", now)
-	if !(current > lastYear && lastYear > old) {
-		t.Fatalf("freshness ordering current=%d lastYear=%d old=%d", current, lastYear, old)
+	if !(current > yearOnly && yearOnly > february && february > lastYear && lastYear > old) {
+		t.Fatalf("freshness ordering current=%d yearOnly=%d february=%d lastYear=%d old=%d", current, yearOnly, february, lastYear, old)
 	}
 }
 
@@ -383,6 +385,7 @@ func TestProductAuthorityDoesNotPromoteSecondaryArticlesFromPrimaryQueryStage(t 
 		{name: "manufacturer model page", url: "https://www.reverautomotive.com/model/sealion7/overview", want: "primary"},
 		{name: "automotive news article", url: "https://www.autoinfo.co.th/online/572782", want: "secondary"},
 		{name: "magazine specs article", url: "https://www.grandprix.co.th/byd-sealion-7-specs-price/", want: "secondary"},
+		{name: "dealer domain contains brand token", url: "https://www.bydbdautogroup.com/th/byd-electric-car-price-th/", want: "secondary"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

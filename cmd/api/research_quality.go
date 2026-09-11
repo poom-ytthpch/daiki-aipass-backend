@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -201,6 +202,50 @@ func researchFreshnessIntent(query string) bool {
 	return false
 }
 
+func researchMonthForYear(text string, year int) int {
+	lower := strings.ToLower(text)
+	normalized := strings.NewReplacer(",", " ", ".", " ", "-", " ", "/", " ", "_", " ").Replace(lower)
+	fields := strings.Fields(normalized)
+	monthNames := map[string]int{
+		"january": 1, "jan": 1, "มกราคม": 1,
+		"february": 2, "feb": 2, "กุมภาพันธ์": 2,
+		"march": 3, "mar": 3, "มีนาคม": 3,
+		"april": 4, "apr": 4, "เมษายน": 4,
+		"may": 5, "พฤษภาคม": 5,
+		"june": 6, "jun": 6, "มิถุนายน": 6,
+		"july": 7, "jul": 7, "กรกฎาคม": 7,
+		"august": 8, "aug": 8, "สิงหาคม": 8,
+		"september": 9, "sep": 9, "sept": 9, "กันยายน": 9,
+		"october": 10, "oct": 10, "ตุลาคม": 10,
+		"november": 11, "nov": 11, "พฤศจิกายน": 11,
+		"december": 12, "dec": 12, "ธันวาคม": 12,
+	}
+	yearTokens := map[string]bool{strconv.Itoa(year): true, strconv.Itoa(year + 543): true}
+	best := 0
+	for i, field := range fields {
+		month := monthNames[field]
+		if month == 0 {
+			continue
+		}
+		start, end := max(0, i-2), min(len(fields), i+3)
+		for _, nearby := range fields[start:end] {
+			if yearTokens[nearby] && month > best {
+				best = month
+			}
+		}
+	}
+	for i, field := range fields {
+		if !yearTokens[field] || i+1 >= len(fields) {
+			continue
+		}
+		month, err := strconv.Atoi(fields[i+1])
+		if err == nil && month >= 1 && month <= 12 && month > best {
+			best = month
+		}
+	}
+	return best
+}
+
 func researchFreshnessScore(query, text string, now time.Time) int {
 	if !researchFreshnessIntent(query) {
 		return 75
@@ -223,15 +268,46 @@ func researchFreshnessScore(query, text string, now time.Time) int {
 		return 58
 	}
 	delta := currentYear - bestYear
+	if month := researchMonthForYear(text, bestYear); month > 0 {
+		monthsOld := delta*12 + int(now.Month()) - month
+		switch {
+		case monthsOld <= 0:
+			return 100
+		case monthsOld == 1:
+			return 96
+		case monthsOld == 2:
+			return 90
+		case monthsOld == 3:
+			return 84
+		case monthsOld == 4:
+			return 78
+		case monthsOld == 5:
+			return 74
+		case monthsOld == 6:
+			return 70
+		case monthsOld == 7:
+			return 66
+		case monthsOld == 8:
+			return 62
+		case monthsOld == 9:
+			return 58
+		case monthsOld <= 12:
+			return 52
+		case monthsOld <= 24:
+			return 40
+		default:
+			return 30
+		}
+	}
 	switch {
 	case delta <= 0:
-		return 100
+		return 90
 	case delta == 1:
-		return 82
+		return 72
 	case delta == 2:
-		return 66
+		return 56
 	case delta == 3:
-		return 50
+		return 44
 	default:
 		return 30
 	}
@@ -282,15 +358,27 @@ func researchPrimaryPath(rawURL string) bool {
 }
 
 func researchHostMatchesEntity(query, rawURL string) bool {
-	host := normalizeResearchText(researchHost(rawURL))
+	host := researchHost(rawURL)
 	if host == "" {
+		return false
+	}
+	label := strings.Split(host, ".")[0]
+	label = strings.ReplaceAll(normalizeResearchText(label), " ", "")
+	if label == "" {
 		return false
 	}
 	for _, term := range researchEntityTerms(query) {
 		if len(term) < 3 || researchPureNumericModelTerm(term) {
 			continue
 		}
-		if strings.Contains(host, normalizeResearchText(term)) {
+		norm := strings.ReplaceAll(normalizeResearchText(term), " ", "")
+		if label == norm {
+			return true
+		}
+		// Allow a distinctive long brand token to be part of the registrable
+		// label (e.g. newbalance), but do not promote short tokens such as BYD
+		// inside dealer domains like bydbdautogroup.com.
+		if len(norm) >= 5 && strings.Contains(label, norm) && len(norm)*100/max(1, len(label)) >= 55 {
 			return true
 		}
 	}
