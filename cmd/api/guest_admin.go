@@ -5,11 +5,24 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 )
+
+func guestSubjectParam(r *http.Request) string {
+	value := strings.TrimSpace(chi.URLParam(r, "guestSubject"))
+	for i := 0; i < 2; i++ {
+		decoded, err := url.PathUnescape(value)
+		if err != nil || decoded == value {
+			break
+		}
+		value = decoded
+	}
+	return strings.TrimSpace(value)
+}
 
 func (a *app) clearGuestRuntimeState(ctx context.Context, subject string) {
 	if a.redis == nil || !strings.HasPrefix(subject, "guest:") {
@@ -50,7 +63,7 @@ func (a *app) clearGuestRuntimeState(ctx context.Context, subject string) {
 }
 
 func (a *app) adminGuestDetail(w http.ResponseWriter, r *http.Request) {
-	subject := strings.TrimSpace(chi.URLParam(r, "guestSubject"))
+	subject := guestSubjectParam(r)
 	if !strings.HasPrefix(subject, "guest:") || len(subject) > 96 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid guest identity"})
 		return
@@ -105,7 +118,7 @@ func (a *app) adminGuestDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminResetGuestQuota(w http.ResponseWriter, r *http.Request) {
-	subject := strings.TrimSpace(chi.URLParam(r, "guestSubject"))
+	subject := guestSubjectParam(r)
 	if !strings.HasPrefix(subject, "guest:") || len(subject) > 96 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid guest identity"})
 		return

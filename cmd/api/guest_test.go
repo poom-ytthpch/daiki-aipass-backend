@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"github.com/go-chi/chi/v5"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -293,5 +294,15 @@ func TestGuestActivityTextIsBounded(t *testing.T) {
 	got := guestActivityText(strings.Repeat("x", 100), 16)
 	if len(got) > 20 || !strings.HasSuffix(got, "…") {
 		t.Fatalf("bounded guest activity text = %q", got)
+	}
+}
+
+func TestGuestSubjectParamDecodesEncodedPath(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/v1/admin/guests/guest%253A46a0f15bb1a642f4435f4d22", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("guestSubject", "guest%253A46a0f15bb1a642f4435f4d22")
+	r = r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+	if got := guestSubjectParam(r); got != "guest:46a0f15bb1a642f4435f4d22" {
+		t.Fatalf("guestSubjectParam=%q", got)
 	}
 }
