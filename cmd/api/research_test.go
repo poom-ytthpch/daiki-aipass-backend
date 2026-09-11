@@ -222,10 +222,16 @@ func TestDeepThailandResearchPlanSearchesLocalAndSocialBeforeGlobal(t *testing.T
 		}
 	}
 	queries := strings.Join(joined, "\n")
-	for _, want := range []string{"site:go.th", "site:facebook.com", "site:instagram.com", "site:tiktok.com"} {
+	for _, want := range []string{"Thailand official", "price specifications", "site:facebook.com", "site:instagram.com", "site:tiktok.com"} {
 		if !strings.Contains(queries, want) {
 			t.Fatalf("deep Thailand plan missing %q: %#v", want, plan)
 		}
+	}
+	if strings.Contains(queries, "site:go.th") || strings.Contains(queries, "site:ac.th") {
+		t.Fatalf("generic product research must not blindly search government/academic domains: %#v", plan)
+	}
+	if !seenStage["local-primary"] || !seenStage["local-primary-current"] {
+		t.Fatalf("deep product research must discover current primary sources before broad search: %#v", plan)
 	}
 	if !seenStage["social-local"] {
 		t.Fatalf("deep Thailand plan must include a local social stage: %#v", plan)
@@ -262,7 +268,7 @@ func TestSocialPlatformClassification(t *testing.T) {
 func TestThailandRankingBoostsRelevantLocalSource(t *testing.T) {
 	prefs := researchPreferences{Region: "TH", Scope: "local-first", Depth: "deep"}
 	query := "BYD Sealion 7 price"
-	local := researchResultRankForPreferences(query, "BYD Sealion 7 ราคาไทย", "https://example.co.th/sealion-7", "ราคา Thailand ประเทศไทย", 1, prefs)
+	local := researchResultRankForPreferences(query, "BYD Sealion 7 price ราคาไทย", "https://example.co.th/sealion-7", "current price Thailand ประเทศไทย", 1, prefs)
 	global := researchResultRankForPreferences(query, "BYD Sealion 7 price", "https://example.com/sealion-7", "global price overview", 1, prefs)
 	if local <= global {
 		t.Fatalf("Thailand-relevant result should outrank global result: local=%v global=%v", local, global)

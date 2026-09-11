@@ -361,7 +361,7 @@ func (a *app) failBackgroundRun(run store.ChatRun, started time.Time, message, r
 }
 
 func safeRunResearchActivity(meta researchMetadata) map[string]any {
-	out := map[string]any{"mode": meta.Mode, "query": meta.Query, "used": meta.Used, "error": meta.Error, "contextInherited": meta.ContextInherited, "region": meta.Region, "locale": meta.Locale, "scope": meta.Scope, "depth": meta.Depth, "focus": meta.Focus, "phase": meta.Phase, "localSourceCount": meta.LocalSourceCount, "globalSourceCount": meta.GlobalSourceCount, "socialSourceCount": meta.SocialSourceCount, "socialPlatforms": meta.SocialPlatforms}
+	out := map[string]any{"mode": meta.Mode, "query": meta.Query, "used": meta.Used, "error": meta.Error, "contextInherited": meta.ContextInherited, "region": meta.Region, "locale": meta.Locale, "scope": meta.Scope, "depth": meta.Depth, "focus": meta.Focus, "phase": meta.Phase, "localSourceCount": meta.LocalSourceCount, "globalSourceCount": meta.GlobalSourceCount, "socialSourceCount": meta.SocialSourceCount, "socialPlatforms": meta.SocialPlatforms, "qualityScore": meta.QualityScore, "qualityGrade": meta.QualityGrade}
 	if meta.ResolvedQuery != "" && meta.ResolvedQuery != meta.Query {
 		out["resolvedQuery"] = clipText(meta.ResolvedQuery, 900)
 	}
@@ -376,7 +376,7 @@ func safeRunResearchActivity(meta researchMetadata) map[string]any {
 		sources := make([]map[string]any, 0, min(len(meta.Sources), 8))
 		for _, source := range meta.Sources[:min(len(meta.Sources), 8)] {
 			sources = append(sources, map[string]any{
-				"index": source.Index, "title": source.Title, "url": source.URL, "engine": source.Engine, "region": source.Region, "authority": source.Authority, "sourceType": source.SourceType, "platform": source.Platform,
+				"index": source.Index, "title": source.Title, "url": source.URL, "engine": source.Engine, "region": source.Region, "authority": source.Authority, "sourceType": source.SourceType, "platform": source.Platform, "stage": source.Stage, "qualityScore": source.QualityScore, "relevanceScore": source.RelevanceScore, "freshnessScore": source.FreshnessScore, "authorityScore": source.AuthorityScore, "evidenceScore": source.EvidenceScore,
 				"snippet": clipText(strings.TrimSpace(source.Snippet), 280),
 			})
 		}
@@ -414,7 +414,7 @@ func (a *app) chatRunActivity(ctx context.Context, requestID string, headers htt
 		safe := map[string]any{
 			"mode": research["mode"], "query": research["query"], "used": research["used"], "error": research["error"],
 			"region": research["region"], "locale": research["locale"], "scope": research["scope"], "depth": research["depth"], "focus": research["focus"],
-			"phase": "completed", "localSourceCount": research["localSourceCount"], "globalSourceCount": research["globalSourceCount"], "socialSourceCount": research["socialSourceCount"], "socialPlatforms": research["socialPlatforms"],
+			"phase": "completed", "localSourceCount": research["localSourceCount"], "globalSourceCount": research["globalSourceCount"], "socialSourceCount": research["socialSourceCount"], "socialPlatforms": research["socialPlatforms"], "qualityScore": research["qualityScore"], "qualityGrade": research["qualityGrade"],
 		}
 		if value := research["resolvedQuery"]; value != nil {
 			safe["resolvedQuery"] = value
@@ -433,7 +433,7 @@ func (a *app) chatRunActivity(ctx context.Context, requestID string, headers htt
 				if !ok {
 					continue
 				}
-				sources = append(sources, map[string]any{"index": m["index"], "title": m["title"], "url": m["url"], "engine": m["engine"], "region": m["region"], "authority": m["authority"], "sourceType": m["sourceType"], "platform": m["platform"], "snippet": clipText(strings.TrimSpace(fmt.Sprint(m["snippet"])), 280)})
+				sources = append(sources, map[string]any{"index": m["index"], "title": m["title"], "url": m["url"], "engine": m["engine"], "region": m["region"], "authority": m["authority"], "sourceType": m["sourceType"], "platform": m["platform"], "stage": m["stage"], "qualityScore": m["qualityScore"], "relevanceScore": m["relevanceScore"], "freshnessScore": m["freshnessScore"], "authorityScore": m["authorityScore"], "evidenceScore": m["evidenceScore"], "snippet": clipText(strings.TrimSpace(fmt.Sprint(m["snippet"])), 280)})
 			}
 			safe["sources"] = sources
 			safe["sourceCount"] = len(sources)

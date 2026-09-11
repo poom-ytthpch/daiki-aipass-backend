@@ -33,6 +33,8 @@ type webResearchResult struct {
 	GlobalSourceCount int
 	SocialSourceCount int
 	SocialPlatforms   []string
+	QualityScore      int
+	QualityGrade      string
 }
 
 type researchRunContextKey struct{}
@@ -191,8 +193,8 @@ func researchThailandSource(title, rawURL, content string) bool {
 func researchAuthority(rawURL string) string {
 	host := researchHost(rawURL)
 	switch {
-	case researchOfficialHost(rawURL):
-		return "official"
+	case strings.HasSuffix(host, ".go.th") || strings.HasSuffix(host, ".gov") || strings.Contains(host, ".gov."):
+		return "government"
 	case strings.HasSuffix(host, ".ac.th") || strings.HasSuffix(host, ".edu") || strings.Contains(host, ".edu."):
 		return "academic"
 	case researchSocialPlatform(rawURL) != "":
@@ -204,20 +206,25 @@ func researchAuthority(rawURL string) string {
 
 func researchResultRankForPreferences(query, title, rawURL, content string, base float64, prefs researchPreferences) float64 {
 	rank := researchResultRank(query, title, rawURL, content, base)
+	relevance := researchRelevanceScore(query, title, rawURL, content)
+	rank += float64(relevance) / 8
+	if researchFreshnessIntent(query) {
+		rank += float64(researchFreshnessScore(query, title+" "+content, time.Now())) / 30
+	}
 	if prefs.Region == "TH" {
 		if researchThailandSource(title, rawURL, content) {
-			rank += 7
+			rank += 4
 		}
 		host := researchHost(rawURL)
-		if strings.HasSuffix(host, ".go.th") {
-			rank += 5
-		} else if strings.HasSuffix(host, ".ac.th") {
-			rank += 3
-		} else if strings.HasSuffix(host, ".or.th") || strings.HasSuffix(host, ".co.th") {
+		if strings.HasSuffix(host, ".go.th") && researchRegulatoryIntent(query) {
 			rank += 2
+		} else if strings.HasSuffix(host, ".ac.th") && researchAcademicIntent(query) {
+			rank += 2
+		} else if strings.HasSuffix(host, ".or.th") || strings.HasSuffix(host, ".co.th") {
+			rank += 1
 		}
 		if containsThai(title + " " + content) {
-			rank += 1.25
+			rank += 0.75
 		}
 	}
 	return rank
@@ -232,7 +239,9 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	if prefs.Focus != "" {
 		focusQuery = strings.TrimSpace(query + " " + prefs.Focus)
 	}
-	plan := make([]researchSearchQuery, 0, 14)
+	entityPhrase := researchEntityPhrase(query)
+	currentYear := time.Now().Year()
+	plan := make([]researchSearchQuery, 0, 16)
 	add := func(q, region, locale, stage string) {
 		q = strings.TrimSpace(q)
 		if q == "" {
@@ -264,13 +273,21 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	if prefs.Region == "TH" && prefs.Scope != "global" {
 		localBase := focusQuery
 		lowerBase := strings.ToLower(localBase)
+		if entityPhrase != "" {
+			add(`"`+entityPhrase+`" Thailand official`, "TH", "th-TH", "local-primary")
+			add(fmt.Sprintf(`"%s" Thailand price specifications %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary-current")
+		}
 		if !strings.Contains(lowerBase, "thailand") && !strings.Contains(localBase, "ประเทศไทย") && !strings.Contains(localBase, "ไทย") {
 			add(localBase+" ประเทศไทย", "TH", "th-TH", "local")
 		}
 		add(localBase+" Thailand", "TH", "th-TH", "local")
-		add("site:go.th "+localBase, "TH", "th-TH", "local-official")
+		if researchRegulatoryIntent(query) {
+			add("site:go.th "+localBase, "TH", "th-TH", "local-regulatory")
+		}
 		if prefs.Depth == "deep" {
-			add("site:ac.th "+localBase, "TH", "th-TH", "local-academic")
+			if researchAcademicIntent(query) {
+				add("site:ac.th "+localBase, "TH", "th-TH", "local-academic")
+			}
 			switch {
 			case strings.Contains(lowerBase, "price") || strings.Contains(lowerBase, "promo") || strings.Contains(lowerBase, "ราคา") || strings.Contains(lowerBase, "โปรโมชั่น"):
 				add(localBase+" ราคา โปรโมชั่น ตัวแทนจำหน่าย ไทย", "TH", "th-TH", "local-market")
@@ -288,7 +305,11 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	if prefs.Scope != "local-only" {
 		add(focusQuery, "GLOBAL", "all", "global")
 		if prefs.Depth == "deep" {
-			add(focusQuery+" official documentation", "GLOBAL", "all", "global-official")
+			if entityPhrase != "" {
+				add(`"`+entityPhrase+`" official specifications`, "GLOBAL", "all", "global-primary")
+			} else {
+				add(focusQuery+" official documentation", "GLOBAL", "all", "global-primary")
+			}
 			lower := strings.ToLower(focusQuery)
 			if strings.Contains(lower, "compare") || strings.Contains(lower, "comparison") || strings.Contains(lower, "เปรียบเทียบ") {
 				add(focusQuery+" comparison review", "GLOBAL", "all", "global-comparison")
@@ -303,7 +324,7 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	}
 
 	for _, variant := range researchQueryVariants(query) {
-		if len(plan) >= 14 {
+		if len(plan) >= 16 {
 			break
 		}
 		add(variant, "GLOBAL", "all", "entity")
@@ -311,8 +332,8 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	if prefs.Depth != "deep" && len(plan) > 5 {
 		plan = plan[:5]
 	}
-	if len(plan) > 14 {
-		plan = plan[:14]
+	if len(plan) > 16 {
+		plan = plan[:16]
 	}
 	return plan
 }
@@ -376,6 +397,7 @@ func summarizeWebResearchResult(sources []researchSource, queries []string) webR
 			}
 		}
 	}
+	result.QualityScore, result.QualityGrade = aggregateResearchQuality(sources)
 	return result
 }
 
@@ -409,7 +431,9 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 			if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
 				title = u.Hostname()
 			}
-			direct = append(direct, researchSource{Title: title, URL: raw, Excerpt: clipText(text, 6500), Engine: "direct", Region: researchSourceRegion(title, raw, text, prefs), Authority: researchAuthority(raw), SourceType: researchSourceType(raw), Platform: researchSocialPlatform(raw)})
+			source := researchSource{Title: title, URL: raw, Excerpt: clipText(text, 6500), Engine: "direct", Region: researchSourceRegion(title, raw, text, prefs), Authority: researchAuthorityForCandidate(query, title, raw, text, "direct", true), SourceType: researchSourceType(raw), Platform: researchSocialPlatform(raw), Stage: "direct"}
+			scoreResearchSource(query, &source, time.Now())
+			direct = append(direct, source)
 		}
 		if len(direct) > 0 && prefs.Depth != "deep" {
 			for i := range direct {
@@ -451,7 +475,26 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 			lastSearchErr = err
 			continue
 		}
+		for j := range found {
+			found[j].Stage = item.Stage
+			found[j].SearchQuery = item.Query
+		}
 		results = append(results, found...)
+	}
+	if entityPhrase := researchEntityPhrase(query); entityPhrase != "" && len(results) > 0 {
+		for _, host := range researchDiscoveredPrimaryHosts(query, results) {
+			primaryQuery := fmt.Sprintf(`site:%s "%s" %d`, host, entityPhrase, time.Now().Year())
+			found, err := a.searxSearchWithLanguage(ctx, base, primaryQuery, first(prefs.Locale, "all"))
+			if err != nil {
+				continue
+			}
+			for j := range found {
+				found[j].Stage = "discovered-primary"
+				found[j].SearchQuery = primaryQuery
+			}
+			results = append(results, found...)
+			queries = append(queries, primaryQuery)
+		}
 	}
 	if len(results) == 0 {
 		if len(direct) > 0 {
@@ -491,10 +534,14 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 	globalWeb := make([]researchSource, 0, limit)
 	globalSocial := make([]researchSource, 0, limit)
 	for _, row := range results {
-		if !isHTTPURL(row.URL) || !researchResultRelevant(query, row.Title, row.URL, row.Content) {
+		if !isHTTPURL(row.URL) || !researchCandidateRelevant(query, row.Title, row.URL, row.Content) {
 			continue
 		}
-		source := researchSource{Title: clipText(row.Title, 300), URL: row.URL, Snippet: clipText(row.Content, 1200), Engine: clipText(row.Engine, 80), Region: researchSourceRegion(row.Title, row.URL, row.Content, prefs), Authority: researchAuthority(row.URL), SourceType: researchSourceType(row.URL), Platform: researchSocialPlatform(row.URL)}
+		source := researchSource{Title: clipText(row.Title, 300), URL: row.URL, Snippet: clipText(row.Content, 1200), Engine: clipText(row.Engine, 80), Region: researchSourceRegion(row.Title, row.URL, row.Content, prefs), Authority: researchAuthorityForCandidate(query, row.Title, row.URL, row.Content, row.Stage, false), SourceType: researchSourceType(row.URL), Platform: researchSocialPlatform(row.URL), Stage: row.Stage}
+		scoreResearchSource(query, &source, time.Now())
+		if source.QualityScore < 55 {
+			continue
+		}
 		if source.Region == "TH" && source.SourceType == "social" {
 			localSocial = append(localSocial, source)
 		} else if source.Region == "TH" {
@@ -504,6 +551,9 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 		} else {
 			globalWeb = append(globalWeb, source)
 		}
+	}
+	for _, rows := range [][]researchSource{localWeb, localSocial, globalWeb, globalSocial} {
+		sort.SliceStable(rows, func(i, j int) bool { return rows[i].QualityScore > rows[j].QualityScore })
 	}
 
 	sources := make([]researchSource, 0, limit)
@@ -613,7 +663,31 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 		}(idx)
 	}
 	wg.Wait()
+	verified := make([]researchSource, 0, len(sources))
+	now := time.Now()
+	for i := range sources {
+		source := &sources[i]
+		// For fetched web pages, the page body is stronger evidence than the search
+		// snippet. Drop candidates whose actual page is not about the requested
+		// entity/topic even if the search engine produced a misleading snippet.
+		if source.SourceType != "social" && source.Stage != "direct" && strings.TrimSpace(source.Excerpt) != "" &&
+			!researchCandidateRelevant(query, source.Title, source.URL, source.Excerpt) {
+			continue
+		}
+		scoreResearchSource(query, source, now)
+		if source.Stage != "direct" && source.QualityScore < 58 {
+			continue
+		}
+		verified = append(verified, *source)
+	}
+	if len(verified) == 0 {
+		return webResearchResult{}, errors.New("no verified research sources")
+	}
+	sources = verified
+	for i := range sources {
+		sources[i].Index = i + 1
+	}
 	result := summarizeWebResearchResult(sources, queries)
-	a.publishResearchProgress(ctx, map[string]any{"phase": "verifying-sources", "region": prefs.Region, "scope": prefs.Scope, "depth": prefs.Depth, "queries": queries, "sourceCount": len(sources), "localSourceCount": result.LocalSourceCount, "globalSourceCount": result.GlobalSourceCount, "socialSourceCount": result.SocialSourceCount, "socialPlatforms": result.SocialPlatforms})
+	a.publishResearchProgress(ctx, map[string]any{"phase": "verifying-sources", "region": prefs.Region, "scope": prefs.Scope, "depth": prefs.Depth, "queries": queries, "sourceCount": len(sources), "localSourceCount": result.LocalSourceCount, "globalSourceCount": result.GlobalSourceCount, "socialSourceCount": result.SocialSourceCount, "socialPlatforms": result.SocialPlatforms, "qualityScore": result.QualityScore, "qualityGrade": result.QualityGrade})
 	return result, nil
 }

@@ -690,6 +690,8 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		w.Header().Set("x-daiki-research-used", "true")
 		w.Header().Set("x-daiki-research-sources", strconv.Itoa(len(researchMeta.Sources)))
 		w.Header().Set("x-daiki-research-mode", researchMeta.Mode)
+		w.Header().Set("x-daiki-research-quality", strconv.Itoa(researchMeta.QualityScore))
+		w.Header().Set("x-daiki-research-quality-grade", researchMeta.QualityGrade)
 	} else {
 		w.Header().Set("x-daiki-research-used", "false")
 		w.Header().Set("x-daiki-research-sources", "0")

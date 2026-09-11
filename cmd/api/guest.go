@@ -376,7 +376,7 @@ func guestResearchSourcesHeader(meta researchMetadata) string {
 	for limit > 0 {
 		rows := make([]map[string]any, 0, limit)
 		for _, source := range meta.Sources[:limit] {
-			rows = append(rows, map[string]any{"index": source.Index, "title": clipText(source.Title, 180), "url": source.URL, "engine": source.Engine, "region": source.Region, "authority": source.Authority, "sourceType": source.SourceType, "platform": source.Platform})
+			rows = append(rows, map[string]any{"index": source.Index, "title": clipText(source.Title, 180), "url": source.URL, "engine": source.Engine, "region": source.Region, "authority": source.Authority, "sourceType": source.SourceType, "platform": source.Platform, "qualityScore": source.QualityScore, "relevanceScore": source.RelevanceScore, "freshnessScore": source.FreshnessScore})
 		}
 		raw, err := json.Marshal(rows)
 		if err != nil {
@@ -670,6 +670,8 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	if researchMeta.Used {
 		w.Header().Set("x-daiki-research-used", "true")
 		w.Header().Set("x-daiki-research-sources", strconv.Itoa(len(researchMeta.Sources)))
+		w.Header().Set("x-daiki-research-quality", strconv.Itoa(researchMeta.QualityScore))
+		w.Header().Set("x-daiki-research-quality-grade", researchMeta.QualityGrade)
 		if encodedSources := guestResearchSourcesHeader(researchMeta); encodedSources != "" {
 			w.Header().Set("x-daiki-research-sources-json", encodedSources)
 		}
