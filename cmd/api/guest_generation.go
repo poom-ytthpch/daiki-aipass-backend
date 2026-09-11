@@ -199,6 +199,7 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 		"authKind": "guest", "guestCapability": capability, "resolvedAlias": "fast",
 		"physicalModel": alias.LiteLLMModelName, "guestNetworkId": identity.Subject,
 		"guestDeviceId": identity.DeviceID, "guestDeviceName": identity.DeviceName,
+		"guestPrompt": guestActivityText(prompt, 32<<10),
 	})
 	ticket, err := a.queue.Acquire(ctx, requestID, identity.Subject, inference.WorkloadFast, 0)
 	if err != nil {
@@ -258,6 +259,9 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 	if status == "completed" && usage.TotalTokens == 0 {
 		usage.TotalTokens = reserved
 	}
+	responseMeta := usageResponseMetadata(responseBody)
+	responseMeta["guestResponse"] = guestResponseText(responseBody)
+	_ = a.store.MergeUsageMetadata(context.Background(), requestID, responseMeta)
 	_ = a.store.FinishUsage(context.Background(), requestID, status, usage)
 	a.releaseReservation(context.Background(), requestID, decision, reserved)
 	if readErr != nil {

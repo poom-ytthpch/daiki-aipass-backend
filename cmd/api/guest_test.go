@@ -281,3 +281,17 @@ func TestGuestUploadLimitSeparatesFileAndImage(t *testing.T) {
 		t.Fatalf("unlimited image policy should retain platform safety cap: %d", got)
 	}
 }
+
+func TestGuestResponseTextFromSSE(t *testing.T) {
+	body := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"สวัสดี\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ครับ\"}}]}\n\ndata: [DONE]\n")
+	if got := guestResponseText(body); got != "สวัสดีครับ" {
+		t.Fatalf("guest response = %q, want %q", got, "สวัสดีครับ")
+	}
+}
+
+func TestGuestActivityTextIsBounded(t *testing.T) {
+	got := guestActivityText(strings.Repeat("x", 100), 16)
+	if len(got) > 20 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("bounded guest activity text = %q", got)
+	}
+}

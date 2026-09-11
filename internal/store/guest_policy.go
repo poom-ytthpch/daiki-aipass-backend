@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -227,4 +228,87 @@ func (s *Store) ResetGuestQuota(ctx context.Context, guestSubject, actor, note s
 		_, _ = s.DB.Exec(ctx, `INSERT INTO access_audit_log(actor_subject,action,target_type,target_id,new_value) VALUES($1,'guest.quota.reset','guest',$2,jsonb_build_object('note',$3,'resetAt',$4))`, actor, guestSubject, note, t)
 	}
 	return t, err
+}
+
+type GuestQuotaResetEvent struct {
+	ID           int64     `json:"id"`
+	GuestSubject string    `json:"guestSubject"`
+	ActorSubject string    `json:"actorSubject"`
+	ResetAt      time.Time `json:"resetAt"`
+	Note         string    `json:"note"`
+}
+
+func (s *Store) GuestDevicesForSubject(ctx context.Context, guestSubject string) ([]GuestDeviceUsage, error) {
+	rows, err := s.DB.Query(ctx, `SELECT d.guest_subject,d.device_id,d.device_name,d.last_seen_at,
+		COALESCE(count(l.request_id) FILTER (WHERE l.status='completed'),0),
+		COALESCE(sum(l.input_tokens) FILTER (WHERE l.status='completed'),0),
+		COALESCE(sum(l.output_tokens) FILTER (WHERE l.status='completed'),0),
+		COALESCE(sum(l.total_tokens) FILTER (WHERE l.status='completed'),0),
+		max(l.started_at) FILTER (WHERE l.status='completed')
+	FROM guest_devices d
+	LEFT JOIN usage_ledger l ON l.subject_id=d.guest_subject AND COALESCE(l.metadata->>'guestDeviceId','')=d.device_id
+	WHERE d.guest_subject=$1
+	GROUP BY d.guest_subject,d.device_id,d.device_name,d.last_seen_at
+	ORDER BY d.last_seen_at DESC`, guestSubject)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []GuestDeviceUsage{}
+	for rows.Next() {
+		var x GuestDeviceUsage
+		if err := rows.Scan(&x.GuestSubject, &x.DeviceID, &x.DeviceName, &x.LastSeenAt, &x.Requests, &x.InputTokens, &x.OutputTokens, &x.TotalTokens, &x.LastUsedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) RecentActivityForGuest(ctx context.Context, guestSubject, deviceID string, limit int) ([]ActivityRow, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	q := `SELECT request_id,api_key_id,model_alias,workload,input_tokens,output_tokens,total_tokens,status,metadata,started_at,completed_at FROM usage_ledger WHERE user_subject=$1`
+	args := []any{guestSubject}
+	if strings.TrimSpace(deviceID) != "" {
+		q += ` AND COALESCE(metadata->>'guestDeviceId','')=$2`
+		args = append(args, deviceID)
+	}
+	q += ` ORDER BY started_at DESC LIMIT $` + fmt.Sprint(len(args)+1)
+	args = append(args, limit)
+	rows, err := s.DB.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ActivityRow{}
+	for rows.Next() {
+		var x ActivityRow
+		if err := rows.Scan(&x.RequestID, &x.APIKeyID, &x.ModelAlias, &x.Workload, &x.InputTokens, &x.OutputTokens, &x.TotalTokens, &x.Status, &x.Metadata, &x.StartedAt, &x.CompletedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GuestQuotaResetEvents(ctx context.Context, guestSubject string, limit int) ([]GuestQuotaResetEvent, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.DB.Query(ctx, `SELECT id,guest_subject,actor_subject,reset_at,note FROM guest_quota_reset_events WHERE guest_subject=$1 ORDER BY reset_at DESC LIMIT $2`, guestSubject, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []GuestQuotaResetEvent{}
+	for rows.Next() {
+		var x GuestQuotaResetEvent
+		if err := rows.Scan(&x.ID, &x.GuestSubject, &x.ActorSubject, &x.ResetAt, &x.Note); err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
 }

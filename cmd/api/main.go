@@ -256,6 +256,7 @@ func main() {
 				r.Put("/token-policy", a.adminSystemQuota)
 				r.Get("/guest-policy", a.adminGuestPolicy)
 				r.Put("/guest-policy", a.adminGuestPolicy)
+				r.Get("/guests/{guestSubject}", a.adminGuestDetail)
 				r.Post("/guests/{guestSubject}/quota-reset", a.adminResetGuestQuota)
 				r.Get("/audit", a.adminAudit)
 			})

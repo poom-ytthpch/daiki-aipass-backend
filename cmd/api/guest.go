@@ -379,6 +379,54 @@ func guestResearchSourcesHeader(meta researchMetadata) string {
 	return ""
 }
 
+func guestActivityText(value string, maxBytes int) string {
+	value = strings.TrimSpace(value)
+	if maxBytes <= 0 || len(value) <= maxBytes {
+		return value
+	}
+	return strings.TrimSpace(value[:maxBytes]) + "…"
+}
+func guestResponseText(body []byte) string {
+	if text := chatCompletionText(body); text != "" {
+		return guestActivityText(text, 64<<10)
+	}
+	var out strings.Builder
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		raw := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(raw) == 0 || bytes.Equal(raw, []byte("[DONE]")) {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content any `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal(raw, &chunk) != nil || len(chunk.Choices) == 0 {
+			continue
+		}
+		switch content := chunk.Choices[0].Delta.Content.(type) {
+		case string:
+			out.WriteString(content)
+		case []any:
+			for _, itemRaw := range content {
+				item, _ := itemRaw.(map[string]any)
+				if text, _ := item["text"].(string); text != "" {
+					out.WriteString(text)
+				}
+			}
+		}
+		if out.Len() >= 64<<10 {
+			break
+		}
+	}
+	return guestActivityText(out.String(), 64<<10)
+}
 func guestModelAlias(route inference.Route) string {
 	if route.ResolvedAlias == "vision" || route.Workload == inference.WorkloadVision {
 		return "vision"
@@ -420,6 +468,11 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
+	}
+	guestPrompt := ""
+	var guestPromptPayload map[string]any
+	if json.Unmarshal(body, &guestPromptPayload) == nil {
+		guestPrompt = guestActivityText(lastUserText(guestPromptPayload), 32<<10)
 	}
 	body, attachments, err := a.expandGuestChatAttachments(r.Context(), identity, body, p)
 	if err != nil {
@@ -508,7 +561,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	guestMeta := map[string]any{
 		"authKind": "guest", "resolvedAlias": guestAlias, "physicalModel": route.PhysicalModel,
 		"guestNetworkId": identity.Subject, "guestDeviceId": identity.DeviceID, "guestDeviceName": identity.DeviceName,
-		"attachments": attachments, "commands": commandSelection, "research": safeRunResearchActivity(researchMeta),
+		"guestPrompt": guestPrompt, "attachments": attachments, "commands": commandSelection, "research": safeRunResearchActivity(researchMeta),
 	}
 	if responseLanguage.Code != "" {
 		guestMeta["responseLanguage"] = responseLanguage
@@ -641,7 +694,8 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		}
 		w.Header().Set("x-accel-buffering", "no")
 		w.WriteHeader(resp.StatusCode)
-		usage, copyErr := copySSEWithUsage(w, resp.Body)
+		capture := &cappedBuffer{max: storedPayloadLimit}
+		usage, copyErr := copySSEWithUsage(io.MultiWriter(w, capture), resp.Body)
 		status := "completed"
 		if copyErr != nil || r.Context().Err() != nil {
 			status = "cancelled"
@@ -652,6 +706,9 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		} else if usage.TotalTokens == 0 {
 			usage.TotalTokens = reserved
 		}
+		responseMeta := usageResponseMetadata(capture.Bytes())
+		responseMeta["guestResponse"] = guestResponseText(capture.Bytes())
+		_ = a.store.MergeUsageMetadata(context.Background(), requestID, responseMeta)
 		_ = a.store.FinishUsage(context.Background(), requestID, status, usage)
 		a.releaseReservation(context.Background(), requestID, decision, reserved)
 		return
@@ -671,6 +728,9 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 	} else if usage.TotalTokens == 0 {
 		usage.TotalTokens = reserved
 	}
+	responseMeta := usageResponseMetadata(responseBody)
+	responseMeta["guestResponse"] = guestResponseText(responseBody)
+	_ = a.store.MergeUsageMetadata(r.Context(), requestID, responseMeta)
 	_ = a.store.FinishUsage(r.Context(), requestID, status, usage)
 	a.releaseReservation(r.Context(), requestID, decision, reserved)
 	if v := resp.Header.Get("content-type"); v != "" {

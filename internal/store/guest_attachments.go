@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -112,6 +113,34 @@ func (s *Store) ExpireGuestAttachments(ctx context.Context, before time.Time, li
 		limit = 200
 	}
 	rows, err := s.DB.Query(ctx, `UPDATE guest_attachments SET deleted_at=now() WHERE id IN (SELECT id FROM guest_attachments WHERE deleted_at IS NULL AND created_at < $1 ORDER BY created_at ASC LIMIT $2) RETURNING `+guestAttachmentColumns, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []GuestAttachment{}
+	for rows.Next() {
+		a, err := scanGuestAttachment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GuestAttachmentsForAdmin(ctx context.Context, guestSubject, deviceID string, limit int) ([]GuestAttachment, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	q := `SELECT ` + guestAttachmentColumns + ` FROM guest_attachments WHERE guest_subject=$1 AND deleted_at IS NULL`
+	args := []any{guestSubject}
+	if deviceID != "" {
+		q += ` AND device_id=$2`
+		args = append(args, deviceID)
+	}
+	q += ` ORDER BY created_at DESC LIMIT $` + fmt.Sprint(len(args)+1)
+	args = append(args, limit)
+	rows, err := s.DB.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
