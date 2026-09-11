@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -388,5 +389,25 @@ func TestApplyReasoningForGPTOSSClampsOffToLow(t *testing.T) {
 	}
 	if requestedReasoningEffort(out) != "low" {
 		t.Fatalf("expected clamped low in payload, got %q", requestedReasoningEffort(out))
+	}
+}
+
+func TestProviderFailureStatusDetectsHermesToolChoiceConflict(t *testing.T) {
+	raw := []byte(`{"choices":[{"message":{"role":"assistant","content":"API call failed after 1 retries: litellm.APIConnectionError: OpenAIException - Tool choice is none, but model called a tool"},"finish_reason":"error"}],"hermes":{"completed":false,"failed":true,"error_code":"agent_error"}}`)
+	if got := providerFailureStatus(raw); got != http.StatusBadGateway {
+		t.Fatalf("tool-choice conflict status=%d want=%d", got, http.StatusBadGateway)
+	}
+}
+
+func TestInspectHermesSoftFailureDetectsToolChoiceConflict(t *testing.T) {
+	raw := []byte(`{"choices":[{"message":{"role":"assistant","content":"Tool choice is none, but model called a tool"},"finish_reason":"error"}],"hermes":{"completed":false,"failed":true}}`)
+	resp := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(raw)), ContentLength: int64(len(raw))}
+	resp.Header.Set("content-type", "application/json")
+	gotRaw, gotStatus, err := inspectHermesSoftFailure(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotStatus != http.StatusBadGateway || !bytes.Contains(gotRaw, []byte("Tool choice is none")) {
+		t.Fatalf("soft failure status=%d body=%s", gotStatus, gotRaw)
 	}
 }

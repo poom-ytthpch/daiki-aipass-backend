@@ -80,6 +80,15 @@ func providerFailureStatus(raw []byte) int {
 	if strings.Contains(lower, "ratelimiterror") || strings.Contains(lower, "rate limit") {
 		return http.StatusTooManyRequests
 	}
+	// Hermes can surface provider/tool incompatibilities inside an HTTP 200
+	// completion with finish_reason=error. Treat the deterministic no-tools
+	// conflict as an upstream failure so the normal model recovery path can
+	// retry/fallback and, if Hermes still cannot complete, fall back to direct
+	// LiteLLM instead of returning an agent error as a successful assistant turn.
+	if (strings.Contains(lower, `"finish_reason": "error"`) || strings.Contains(lower, `"finish_reason":"error"`) || strings.Contains(lower, `"failed": true`) || strings.Contains(lower, `"failed":true`)) &&
+		strings.Contains(lower, "tool choice is none") && strings.Contains(lower, "called a tool") {
+		return http.StatusBadGateway
+	}
 	return 0
 }
 
