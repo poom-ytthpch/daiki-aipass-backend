@@ -200,6 +200,25 @@ func TestGuestSubjectUsesCanonicalNetworkIPAndIgnoresUserAgent(t *testing.T) {
 	}
 }
 
+func TestGuestRateSubjectIsDeviceScopedWithinOneNetwork(t *testing.T) {
+	networkSubject := "guest:network-hash"
+	deviceA := guestIdentity{Subject: networkSubject, DeviceID: "device-a"}
+	deviceB := guestIdentity{Subject: networkSubject, DeviceID: "device-b"}
+	if guestRateSubject(deviceA) == guestRateSubject(deviceB) {
+		t.Fatal("different guest devices behind one network must have independent request cooldowns")
+	}
+	if guestRateSubject(deviceA) != guestRateSubject(guestIdentity{Subject: networkSubject, DeviceID: "device-a"}) {
+		t.Fatal("same guest network/device must keep a stable request cooldown identity")
+	}
+	if strings.Contains(guestRateSubject(deviceA), deviceA.DeviceID) || strings.Contains(guestRateSubject(deviceA), networkSubject) {
+		t.Fatal("rate limiter key must not expose raw network or device identifiers")
+	}
+	// Quota remains network scoped: only the request cooldown identity is split per device.
+	if deviceA.Subject != deviceB.Subject {
+		t.Fatal("test setup must keep the token quota subject shared across devices")
+	}
+}
+
 func TestGuestModelAliasUsesVisionForImageWorkload(t *testing.T) {
 	vision := inference.Route{ResolvedAlias: "vision", Workload: inference.WorkloadVision}
 	if got := guestModelAlias(vision); got != "vision" {

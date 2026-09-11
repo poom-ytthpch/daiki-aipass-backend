@@ -40,7 +40,7 @@ func (a *app) guestPolicyPublic(w http.ResponseWriter, r *http.Request) {
 	if decision, _, quotaErr := a.guestQuota(r.Context(), identity.Subject, p); quotaErr == nil {
 		payload["quota"] = decision
 	}
-	if retryAfter, rateErr := a.guestRateRetryAfter(r.Context(), identity.Subject, p); rateErr == nil {
+	if retryAfter, rateErr := a.guestRateRetryAfter(r.Context(), guestRateSubject(identity), p); rateErr == nil {
 		payload["rateRetryAfterSeconds"] = max(0, int(retryAfter.Seconds()))
 	}
 	writeJSON(w, http.StatusOK, payload)
@@ -126,6 +126,14 @@ func guestIdentityForRequest(r *http.Request) guestIdentity {
 	deviceName := cleanGuestHeader(r.Header.Get("X-Daiki-Guest-Device-Name"), 120)
 	ua := sha256.Sum256([]byte(r.UserAgent()))
 	return guestIdentity{Subject: guestSubject(r), DeviceID: deviceID, DeviceName: deviceName, UserAgentHash: hex.EncodeToString(ua[:8])}
+}
+func guestRateSubject(id guestIdentity) string {
+	// Token quota intentionally stays network-scoped so changing browser/device metadata
+	// cannot create a fresh allowance. Request cooldowns are device-scoped, however, so
+	// unrelated Guest users behind the same office/home/carrier NAT do not throttle one
+	// another. The raw device identifier is not persisted in the Redis limiter key.
+	sum := sha256.Sum256([]byte(id.Subject + "\x00" + id.DeviceID))
+	return "guest-rate:" + hex.EncodeToString(sum[:12])
 }
 func (a *app) recordGuestIdentity(ctx context.Context, id guestIdentity) {
 	if a.store != nil {
@@ -437,7 +445,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		writeJSON(w, http.StatusTooManyRequests, payload)
 		return
 	}
-	if retry, rateErr := a.enforceGuestRate(r.Context(), subject, p); rateErr != nil {
+	if retry, rateErr := a.enforceGuestRate(r.Context(), guestRateSubject(identity), p); rateErr != nil {
 		if retry > 0 {
 			seconds := max(1, int(retry.Seconds()))
 			w.Header().Set("Retry-After", strconv.Itoa(seconds))

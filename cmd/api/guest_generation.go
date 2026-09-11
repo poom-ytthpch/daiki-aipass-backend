@@ -23,6 +23,7 @@ import (
 )
 
 var generatedImageDataRE = regexp.MustCompile(`data:(image/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)`)
+var errImageProviderAuth = errors.New("image provider authentication failed")
 
 const defaultOpenRouterImageModel = "google/gemini-3.1-flash-lite-image"
 
@@ -97,6 +98,10 @@ func (a *app) generateGuestImageViaOpenRouter(ctx context.Context, prompt string
 			detail := strings.TrimSpace(string(body))
 			if len(detail) > 2048 {
 				detail = detail[:2048]
+			}
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				_ = a.store.SetProviderTest(ctx, provider.ID, "error", "image generation provider authentication failed")
+				return nil, "", "openrouter-images", fmt.Errorf("%w: status %d", errImageProviderAuth, resp.StatusCode)
 			}
 			return nil, "", "openrouter-images", fmt.Errorf("image provider returned status %d: %s", resp.StatusCode, detail)
 		}
@@ -397,7 +402,7 @@ func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 	}
 	prompt := strings.TrimSpace(body.Prompt)
 	data, mediaType, upstream, err := a.generateGuestImageViaOpenRouter(r.Context(), prompt)
-	if err != nil {
+	if err != nil && !errors.Is(err, errImageProviderAuth) {
 		// Preserve Hermes as a secondary path for installations that configure an
 		// image_gen provider such as FAL/OpenAI. match-infra currently has an
 		// OpenRouter provider, so normal traffic uses the dedicated Images API.
@@ -417,7 +422,11 @@ func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 	if err != nil || len(data) == 0 {
 		slog.Warn("guest image generation failed", "upstream", upstream, "error", err)
 		a.refundGuestDailyCapability(r.Context(), "imagegen", identity.Subject, p.ImageGenerationsPerDay)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "image_generation_unavailable", "upstream": upstream})
+		code := "image_generation_unavailable"
+		if errors.Is(err, errImageProviderAuth) {
+			code = "image_generation_provider_auth_failed"
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": code, "upstream": upstream})
 		return
 	}
 	if (p.MaxGeneratedImageBytes > 0 && int64(len(data)) > p.MaxGeneratedImageBytes) || int64(len(data)) > maxInjectedImageBytes {
