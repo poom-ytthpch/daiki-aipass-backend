@@ -235,17 +235,14 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	if query == "" {
 		return nil
 	}
-	focusQuery := query
-	if prefs.Focus != "" {
-		focusQuery = strings.TrimSpace(query + " " + prefs.Focus)
-	}
+	focusQuery := strings.TrimSpace(query)
 	entityPhrase := researchEntityPhrase(query)
 	currentYear := time.Now().Year()
-	currentMonth := time.Now().Month().String()
-	plan := make([]researchSearchQuery, 0, 10)
+	const maxQueries = 4
+	plan := make([]researchSearchQuery, 0, maxQueries)
 	add := func(q, region, locale, stage string) {
 		q = strings.TrimSpace(q)
-		if q == "" {
+		if q == "" || len(plan) >= maxQueries {
 			return
 		}
 		for _, existing := range plan {
@@ -255,87 +252,55 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 		}
 		plan = append(plan, researchSearchQuery{Query: q, Region: region, Locale: locale, Stage: stage})
 	}
-	addSocial := func(base, region, locale, stage, locality string) {
-		locality = strings.TrimSpace(locality)
-		if locality != "" {
-			base = strings.TrimSpace(base + " " + locality)
-		}
-		add("(site:facebook.com OR site:instagram.com OR site:tiktok.com) "+base, region, locale, stage)
+	addSocial := func(base, region, locale, stage string) {
+		add("(site:facebook.com OR site:instagram.com OR site:tiktok.com OR site:youtube.com OR site:reddit.com OR site:pantip.com) "+base, region, locale, stage)
 	}
 
 	if prefs.Region == "TH" && prefs.Scope != "global" {
-		localBase := focusQuery
-		lowerBase := strings.ToLower(localBase)
-		if entityPhrase != "" {
-			add(entityPhrase+` Thailand official`, "TH", "th-TH", "local-primary")
-			add(entityPhrase+` Thailand official distributor importer`, "TH", "th-TH", "local-primary-distributor")
-			if researchFreshnessIntent(query) {
-				add(fmt.Sprintf(`%s Thailand official price campaign %s %d`, entityPhrase, currentMonth, currentYear), "TH", "th-TH", "local-primary-current")
-			}
-			add(fmt.Sprintf(`%s Thailand price specifications %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary-current")
-		}
-		if !strings.Contains(lowerBase, "thailand") && !strings.Contains(localBase, "ประเทศไทย") && !strings.Contains(localBase, "ไทย") {
-			add(localBase+" Thailand", "TH", "th-TH", "local")
-		} else {
-			add(localBase, "TH", "th-TH", "local")
-		}
 		if researchRegulatoryIntent(query) {
-			add("site:go.th "+localBase, "TH", "th-TH", "local-regulatory")
+			add("site:go.th "+focusQuery, "TH", "th-TH", "local-regulatory")
+		} else if researchAcademicIntent(query) {
+			add("site:ac.th "+focusQuery, "TH", "th-TH", "local-academic")
 		}
-		if prefs.Depth == "deep" {
-			if researchAcademicIntent(query) {
-				add("site:ac.th "+localBase, "TH", "th-TH", "local-academic")
-			}
-			switch {
-			case strings.Contains(lowerBase, "price") || strings.Contains(lowerBase, "promo") || strings.Contains(lowerBase, "ราคา") || strings.Contains(lowerBase, "โปรโมชั่น"):
-				add(localBase+" ราคา โปรโมชั่น ตัวแทนจำหน่าย ไทย", "TH", "th-TH", "local-market")
-			case strings.Contains(lowerBase, "car") || strings.Contains(lowerBase, "รถ") || strings.Contains(lowerBase, "ev"):
-				add(localBase+" ไทย สเปก ราคา ศูนย์บริการ ประกัน", "TH", "th-TH", "local-market")
-			default:
-				add(localBase+" ไทย ข่าว ข้อมูลล่าสุด", "TH", "th-TH", "local-current")
-			}
-			addSocial(localBase, "TH", "th-TH", "social-local", "ประเทศไทย Thailand ไทย")
-		} else if researchSocialIntent(query) {
-			addSocial(localBase, "TH", "th-TH", "social-local", "ประเทศไทย Thailand ไทย")
-		}
-	}
-
-	if prefs.Scope != "local-only" {
-		add(focusQuery, "GLOBAL", "all", "global")
-		if prefs.Depth == "deep" {
-			if entityPhrase != "" {
-				add(entityPhrase+` official specifications`, "GLOBAL", "all", "global-primary")
+		if entityPhrase != "" {
+			// Keep the first query intentionally simple/high-recall. Google frequently
+			// returns zero results for over-constrained combinations such as
+			// "official distributor current campaign" even when relevant pages exist.
+			if researchFreshnessIntent(query) {
+				add(fmt.Sprintf(`%s ราคาล่าสุด สเปก Thailand %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary-current")
 			} else {
-				add(focusQuery+" official documentation", "GLOBAL", "all", "global-primary")
+				add(fmt.Sprintf(`%s ราคา สเปก Thailand %d`, entityPhrase, currentYear), "TH", "th-TH", "local-primary")
 			}
-			lower := strings.ToLower(focusQuery)
-			if strings.Contains(lower, "compare") || strings.Contains(lower, "comparison") || strings.Contains(lower, "เปรียบเทียบ") {
-				add(focusQuery+" comparison review", "GLOBAL", "all", "global-comparison")
+			add(entityPhrase+` Thailand official distributor`, "TH", "th-TH", "local-primary-distributor")
+		} else {
+			add(focusQuery+" Thailand", "TH", "th-TH", "local")
+		}
+		if prefs.Depth == "deep" || researchSocialIntent(query) {
+			base := focusQuery
+			if entityPhrase != "" {
+				base = entityPhrase + " Thailand รีวิว ปัญหา"
 			}
-			if strings.Contains(lower, "safe") || strings.Contains(lower, "safety") || strings.Contains(lower, "risk") || strings.Contains(lower, "อันตราย") || strings.Contains(lower, "ปลอดภัย") {
-				add(focusQuery+" safety risk recall", "GLOBAL", "all", "global-safety")
-			}
-			addSocial(focusQuery, "GLOBAL", "all", "social-global", "")
-		} else if researchSocialIntent(query) {
-			addSocial(focusQuery, "GLOBAL", "all", "social-global", "")
+			addSocial(base, "TH", "th-TH", "social-local")
 		}
 	}
 
-	for _, variant := range researchQueryVariants(query) {
-		if len(plan) >= 10 {
-			break
+	if prefs.Scope != "local-only" && len(plan) < maxQueries {
+		if entityPhrase != "" {
+			add(entityPhrase+` specifications`, "GLOBAL", "all", "global-primary")
+		} else {
+			add(focusQuery+" official documentation", "GLOBAL", "all", "global-primary")
 		}
-		add(variant, "GLOBAL", "all", "entity")
 	}
-	if prefs.Depth != "deep" && len(plan) > 5 {
-		plan = plan[:5]
-	}
-	if len(plan) > 10 {
-		plan = plan[:10]
+	if len(plan) < maxQueries {
+		for _, variant := range researchQueryVariants(query) {
+			add(variant, "GLOBAL", "all", "entity")
+			if len(plan) >= maxQueries {
+				break
+			}
+		}
 	}
 	return plan
 }
-
 func researchPlanQueries(plan []researchSearchQuery) []string {
 	out := make([]string, 0, len(plan))
 	for _, item := range plan {

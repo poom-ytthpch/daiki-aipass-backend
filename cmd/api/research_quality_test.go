@@ -92,8 +92,11 @@ func TestProductResearchPlanAvoidsBlindGovernmentSearch(t *testing.T) {
 	if strings.Contains(joined, "site:go.th") {
 		t.Fatalf("product research should not blindly query .go.th: %s", joined)
 	}
-	if !strings.Contains(joined, "Thailand official") || !strings.Contains(joined, "price specifications") {
-		t.Fatalf("product research missing primary/current discovery queries: %s", joined)
+	if !strings.Contains(joined, "ราคาล่าสุด สเปก Thailand") || !strings.Contains(joined, "Thailand official distributor") {
+		t.Fatalf("product research missing high-recall current/distributor discovery queries: %s", joined)
+	}
+	if len(productPlan) > 4 {
+		t.Fatalf("Google-only research must keep query fan-out bounded, got %d: %#v", len(productPlan), productPlan)
 	}
 
 	regulatoryPlan := researchSearchPlan("กฎหมายภาษีนำเข้า BYD Sealion 7 ประเทศไทย", prefs)

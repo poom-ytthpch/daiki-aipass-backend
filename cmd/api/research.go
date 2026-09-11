@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,7 +70,8 @@ type searxResult struct {
 	SearchQuery string  `json:"-"`
 }
 type searxResponse struct {
-	Results []searxResult `json:"results"`
+	Results             []searxResult `json:"results"`
+	UnresponsiveEngines [][]string    `json:"unresponsive_engines"`
 }
 
 var (
@@ -401,6 +403,9 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 		if prefs.Region == "TH" && prefs.Scope == "local-first" {
 			fmt.Fprintf(&b, "\n\nLOCALITY STRATEGY: The user is in Thailand. Research deliberately prioritized Thailand-relevant evidence first (%d local sources), then expanded to international evidence (%d global sources). For market-specific facts such as price, availability, warranty, regulation, service, promotions, local versions, and launch timing, prefer Thailand evidence. Use global sources to fill gaps, compare technology, and cross-check claims rather than overwriting Thailand-specific facts.\n", meta.LocalSourceCount, meta.GlobalSourceCount)
 		}
+		if prefs.Focus != "" {
+			fmt.Fprintf(&b, "\nUSER-SELECTED RESEARCH FOCUS: %s. Use this to prioritize synthesis and follow-up evidence, but never relax source-quality or claim-grounding requirements.\n", clipText(prefs.Focus, 240))
+		}
 		if prefs.Depth == "deep" {
 			b.WriteString("\nDEEP RESEARCH OUTPUT: Produce a polished research report, not a search-result list. Lead with an Executive Summary; briefly state the research approach; organize findings by the user's decision-relevant themes; surface Thailand-specific findings before global context when applicable; compare conflicting evidence; include risks/limitations; and end with a clear recommendation or conclusion when the request supports one. Keep the report readable and avoid ceremonial filler.\n")
 		}
@@ -608,7 +613,19 @@ func (a *app) searxSearch(ctx context.Context, base, query string) ([]searxResul
 }
 
 func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language string) ([]searxResult, error) {
-	search := func(engines string) ([]searxResult, error) {
+	search := func(engine string) ([]searxResult, error) {
+		if strings.TrimSpace(language) == "" {
+			language = "all"
+		}
+		cacheKey := fmt.Sprintf("research:google:%x", sha256.Sum256([]byte(engine+"\n"+language+"\n"+query)))
+		if a.redis != nil {
+			if cached, err := a.redis.Get(ctx, cacheKey).Bytes(); err == nil && len(cached) > 0 {
+				var rows []searxResult
+				if json.Unmarshal(cached, &rows) == nil {
+					return rows, nil
+				}
+			}
+		}
 		u, err := url.Parse(base + "/search")
 		if err != nil {
 			return nil, err
@@ -616,14 +633,9 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 		q := u.Query()
 		q.Set("q", query)
 		q.Set("format", "json")
-		if strings.TrimSpace(language) == "" {
-			language = "all"
-		}
 		q.Set("language", language)
 		q.Set("safesearch", "1")
-		if strings.TrimSpace(engines) != "" {
-			q.Set("engines", engines)
-		}
+		q.Set("engines", engine)
 		u.RawQuery = q.Encode()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
@@ -637,19 +649,48 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("search HTTP %d", resp.StatusCode)
+			return nil, fmt.Errorf("Google search HTTP %d via %s", resp.StatusCode, engine)
 		}
 		var found searxResponse
 		if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&found); err != nil {
-			return nil, fmt.Errorf("invalid search response: %w", err)
+			return nil, fmt.Errorf("invalid Google search response via %s: %w", engine, err)
+		}
+		if len(found.Results) == 0 && len(found.UnresponsiveEngines) > 0 {
+			reasons := make([]string, 0, len(found.UnresponsiveEngines))
+			for _, row := range found.UnresponsiveEngines {
+				reasons = append(reasons, strings.Join(row, ": "))
+			}
+			return nil, fmt.Errorf("%s unavailable: %s", engine, strings.Join(reasons, "; "))
+		}
+		if a.redis != nil {
+			if raw, err := json.Marshal(found.Results); err == nil {
+				ttl := 15 * time.Minute
+				if len(found.Results) == 0 {
+					ttl = 30 * time.Second
+				}
+				_ = a.redis.Set(ctx, cacheKey, raw, ttl).Err()
+			}
 		}
 		return found.Results, nil
 	}
-	// Google Search is the only permitted research engine. The SearXNG instance
-	// is used purely as a private Google CSE transport; never fall back to its
-	// default engine set because that can silently mix Bing/Yep/other providers
-	// and make provenance/relevance nondeterministic.
-	return search("google cse")
+
+	// Google Search is the only permitted provider. Use the regular Google web
+	// engine first, then Google CSE as a same-provider fallback. Never fall back
+	// to Bing/Yep/default SearXNG engines. A short Redis cache protects Google
+	// from repeated follow-up queries and reduces temporary anti-bot suspensions.
+	var firstErr error
+	if rows, err := search("google"); err == nil && len(rows) > 0 {
+		return rows, nil
+	} else if err != nil {
+		firstErr = err
+	}
+	if rows, err := search("google cse"); err == nil {
+		return rows, nil
+	} else if firstErr != nil {
+		return nil, fmt.Errorf("Google Search unavailable: %v; Google CSE unavailable: %w", firstErr, err)
+	} else {
+		return nil, err
+	}
 }
 func (a *app) webResearch(ctx context.Context, query string) ([]researchSource, error) {
 	directURLs := append([]string{}, extractResearchURLs(query)...)

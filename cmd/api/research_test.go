@@ -203,7 +203,7 @@ func TestResearchPreferencesThailandDefaultsLocalFirst(t *testing.T) {
 
 func TestDeepThailandResearchPlanSearchesLocalAndSocialBeforeGlobal(t *testing.T) {
 	prefs := researchPreferences{Region: "TH", Locale: "th-TH", Scope: "local-first", Depth: "deep", Focus: "ราคาและประสบการณ์ผู้ใช้จริง"}
-	plan := researchSearchPlan("BYD Sealion 7", prefs)
+	plan := researchSearchPlan("BYD Sealion 7 ราคาล่าสุด", prefs)
 	if len(plan) == 0 {
 		t.Fatal("expected a research plan")
 	}
@@ -222,16 +222,19 @@ func TestDeepThailandResearchPlanSearchesLocalAndSocialBeforeGlobal(t *testing.T
 		}
 	}
 	queries := strings.Join(joined, "\n")
-	for _, want := range []string{"Thailand official", "price specifications", "site:facebook.com", "site:instagram.com", "site:tiktok.com"} {
+	for _, want := range []string{"ราคาล่าสุด สเปก Thailand", "Thailand official distributor", "site:facebook.com", "site:instagram.com", "site:tiktok.com"} {
 		if !strings.Contains(queries, want) {
 			t.Fatalf("deep Thailand plan missing %q: %#v", want, plan)
 		}
 	}
+	if len(plan) > 4 {
+		t.Fatalf("deep Google-only plan must stay within four queries, got %d: %#v", len(plan), plan)
+	}
 	if strings.Contains(queries, "site:go.th") || strings.Contains(queries, "site:ac.th") {
 		t.Fatalf("generic product research must not blindly search government/academic domains: %#v", plan)
 	}
-	if !seenStage["local-primary"] || !seenStage["local-primary-current"] {
-		t.Fatalf("deep product research must discover current primary sources before broad search: %#v", plan)
+	if !seenStage["local-primary-current"] || !seenStage["local-primary-distributor"] {
+		t.Fatalf("deep product research must discover current local primary/distributor sources before broad search: %#v", plan)
 	}
 	if !seenStage["social-local"] {
 		t.Fatalf("deep Thailand plan must include a local social stage: %#v", plan)
@@ -313,7 +316,7 @@ func TestWebResearchNoResults(t *testing.T) {
 	}
 }
 
-func TestSearxSearchPrefersGoogleCSE(t *testing.T) {
+func TestSearxSearchPrefersGoogleWeb(t *testing.T) {
 	var engines []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		engines = append(engines, r.URL.Query().Get("engines"))
@@ -324,14 +327,37 @@ func TestSearxSearchPrefersGoogleCSE(t *testing.T) {
 	a := &app{http: server.Client()}
 	results, err := a.searxSearchWithLanguage(context.Background(), server.URL, "sealion 7 Thailand official", "th-TH")
 	if err != nil || len(results) != 1 {
-		t.Fatalf("preferred SearXNG search failed: results=%#v err=%v", results, err)
+		t.Fatalf("Google web search failed: results=%#v err=%v", results, err)
 	}
-	if len(engines) != 1 || engines[0] != "google cse" {
-		t.Fatalf("expected google cse preferred engine, got %#v", engines)
+	if len(engines) != 1 || engines[0] != "google" {
+		t.Fatalf("expected regular Google web engine first, got %#v", engines)
 	}
 }
 
-func TestSearxSearchUsesGoogleCSEOnlyWhenEmpty(t *testing.T) {
+func TestSearxSearchFallsBackOnlyToGoogleCSE(t *testing.T) {
+	var engines []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		engine := r.URL.Query().Get("engines")
+		engines = append(engines, engine)
+		w.Header().Set("content-type", "application/json")
+		if engine == "google" {
+			_, _ = w.Write([]byte(`{"results":[]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[{"title":"Google CSE result","url":"https://example.com/google","content":"google fallback"}]}`))
+	}))
+	defer server.Close()
+	a := &app{http: server.Client()}
+	results, err := a.searxSearchWithLanguage(context.Background(), server.URL, "google-only query", "all")
+	if err != nil || len(results) != 1 {
+		t.Fatalf("Google CSE fallback failed: results=%#v err=%v", results, err)
+	}
+	if got := strings.Join(engines, ","); got != "google,google cse" {
+		t.Fatalf("only Google engines may be used, got %q", got)
+	}
+}
+
+func TestSearxSearchDoesNotFallBackOutsideGoogle(t *testing.T) {
 	var engines []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		engines = append(engines, r.URL.Query().Get("engines"))
@@ -340,15 +366,15 @@ func TestSearxSearchUsesGoogleCSEOnlyWhenEmpty(t *testing.T) {
 	}))
 	defer server.Close()
 	a := &app{http: server.Client()}
-	results, err := a.searxSearchWithLanguage(context.Background(), server.URL, "google-only query", "all")
+	results, err := a.searxSearchWithLanguage(context.Background(), server.URL, "empty google query", "all")
 	if err != nil {
-		t.Fatalf("google-only search returned unexpected error: %v", err)
+		t.Fatalf("empty Google result set should not be an HTTP error: %v", err)
 	}
 	if len(results) != 0 {
-		t.Fatalf("expected empty Google result set, got %#v", results)
+		t.Fatalf("expected no Google results, got %#v", results)
 	}
-	if len(engines) != 1 || engines[0] != "google cse" {
-		t.Fatalf("research must call Google CSE exactly once with no engine fallback, got %#v", engines)
+	if got := strings.Join(engines, ","); got != "google,google cse" {
+		t.Fatalf("research must never call non-Google/default engines, got %q", got)
 	}
 }
 
@@ -491,10 +517,21 @@ func TestCurrentThailandProductPlanDiscoversOfficialDistributorAndCampaign(t *te
 		joined = append(joined, item.Query)
 	}
 	queries := strings.Join(joined, "\n")
-	for _, want := range []string{"Thailand official", "official distributor importer", "official price campaign", "price specifications"} {
-		if !strings.Contains(queries, want) {
+	for _, want := range []string{"ราคาล่าสุด สเปก Thailand", "Thailand official distributor", "sealion 7 specifications"} {
+		if !strings.Contains(strings.ToLower(queries), strings.ToLower(want)) {
 			t.Fatalf("current Thailand product plan missing %q: %s", want, queries)
 		}
+	}
+	if len(plan) > 4 {
+		t.Fatalf("current Google-only plan exceeded four queries: %#v", plan)
+	}
+	seenCurrent, seenDistributor := false, false
+	for _, item := range plan {
+		seenCurrent = seenCurrent || item.Stage == "local-primary-current"
+		seenDistributor = seenDistributor || item.Stage == "local-primary-distributor"
+	}
+	if !seenCurrent || !seenDistributor {
+		t.Fatalf("current product plan must retain current-price and distributor stages: %#v", plan)
 	}
 	for _, item := range plan {
 		if strings.Contains(item.Stage, "primary") && strings.Contains(item.Query, `"`) {
