@@ -566,6 +566,11 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	poolCtx, poolSelection := a.selectInitialFreePoolModel(r.Context(), route.ResolvedAlias, route.PhysicalModel)
+	if poolSelection.Model != "" && poolSelection.Model != route.PhysicalModel {
+		upstreamBody = setRequestModel(upstreamBody, poolSelection.Model)
+		route.PhysicalModel = poolSelection.Model
+	}
 	decision, policy, err := a.quotaFor(r)
 	if err != nil {
 		writeJSON(w, 503, map[string]string{"error": "quota service unavailable"})
@@ -629,6 +634,7 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 	}
 	requestMeta["resolvedAlias"] = route.ResolvedAlias
 	requestMeta["physicalModel"] = route.PhysicalModel
+	requestMeta["pool"] = poolSelection
 	requestMeta["workload"] = string(route.Workload)
 	requestMeta["research"] = researchMeta
 	requestMeta["commands"] = commandSelection
@@ -761,7 +767,12 @@ func (a *app) proxyLiteLLM(w http.ResponseWriter, r *http.Request, path string, 
 		return req, nil
 	}
 	w.Header().Set("x-daiki-inference-upstream", upstreamName)
-	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, hermesProfile, makeUpstreamRequest)
+	if poolSelection.Model != "" {
+		w.Header().Set("x-daiki-pool-route", poolSelection.Route)
+		w.Header().Set("x-daiki-pool-selected", poolSelection.Model)
+		w.Header().Set("x-daiki-pool-candidates", strconv.Itoa(poolSelection.CandidateCount))
+	}
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(poolCtx, upstreamBody, route.PhysicalModel, hermesProfile, makeUpstreamRequest)
 	upstreamBody = recoveredBody
 	if recoveredModel != "" {
 		route.PhysicalModel = recoveredModel

@@ -305,6 +305,11 @@ CREATE TABLE IF NOT EXISTS provider_models (
     otpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (otpm_limit >= 0),
     rpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (rpm_limit >= 0),
     rpd_limit INTEGER NOT NULL DEFAULT 0 CHECK (rpd_limit >= 0),
+    free_pool_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    free_pool_routes TEXT[] NOT NULL DEFAULT '{}',
+    free_pool_weight INTEGER NOT NULL DEFAULT 100 CHECK (free_pool_weight >= 1 AND free_pool_weight <= 1000),
+    free_pool_priority INTEGER NOT NULL DEFAULT 100 CHECK (free_pool_priority >= 1 AND free_pool_priority <= 1000),
+    quality_score INTEGER NOT NULL DEFAULT 50 CHECK (quality_score >= 0 AND quality_score <= 100),
     timeout_seconds INTEGER NOT NULL DEFAULT 300 CHECK (timeout_seconds > 0 AND timeout_seconds <= 1800),
     stream_timeout_seconds INTEGER NOT NULL DEFAULT 300 CHECK (stream_timeout_seconds > 0 AND stream_timeout_seconds <= 1800),
     max_retries INTEGER NOT NULL DEFAULT 2 CHECK (max_retries >= 0 AND max_retries <= 8),
@@ -326,6 +331,11 @@ ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS itpm_limit INTEGER NOT NULL
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS otpm_limit INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS rpm_limit INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS rpd_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS free_pool_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS free_pool_routes TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS free_pool_weight INTEGER NOT NULL DEFAULT 100;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS free_pool_priority INTEGER NOT NULL DEFAULT 100;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS quality_score INTEGER NOT NULL DEFAULT 50;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS timeout_seconds INTEGER NOT NULL DEFAULT 300;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS stream_timeout_seconds INTEGER NOT NULL DEFAULT 300;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 2;

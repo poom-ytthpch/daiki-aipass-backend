@@ -42,6 +42,12 @@ func (a *app) runUserCoreGeneration(r *http.Request, capability, profile, prompt
 		"max_completion_tokens": 4096,
 		"stream":                false,
 	})
+	poolCtx, poolSelection := a.selectInitialFreePoolModel(ctx, "fast", alias.LiteLLMModelName)
+	physicalModel := alias.LiteLLMModelName
+	if poolSelection.Model != "" {
+		body = setRequestModel(body, poolSelection.Model)
+		physicalModel = poolSelection.Model
+	}
 	reserved := reservationTokens(body)
 	requestID := fmt.Sprintf("user-%s-%d", strings.ReplaceAll(capability, ":", "-"), time.Now().UnixNano())
 	if err := a.reserveQuota(ctx, requestID, decision, reserved); err != nil {
@@ -53,7 +59,7 @@ func (a *app) runUserCoreGeneration(r *http.Request, capability, profile, prompt
 	}
 	_ = a.store.MergeUsageMetadata(ctx, requestID, map[string]any{
 		"authKind": principal.AuthKind, "generatedCapability": capability, "resolvedAlias": "fast",
-		"physicalModel": alias.LiteLLMModelName, "generatedPrompt": guestActivityText(prompt, 32<<10),
+		"physicalModel": physicalModel, "pool": poolSelection, "generatedPrompt": guestActivityText(prompt, 32<<10),
 	})
 	principalID := "user:" + c.Sub
 	if principal.APIKeyID != "" {
@@ -91,7 +97,7 @@ func (a *app) runUserCoreGeneration(r *http.Request, capability, profile, prompt
 		applyHermesSessionScope(req, baseKey, payload)
 		return req, nil
 	}
-	resp, _, recoveredModel, recovery, err := a.doModelRequestWithRecovery(ctx, body, alias.LiteLLMModelName, profile, makeReq)
+	resp, _, recoveredModel, recovery, err := a.doModelRequestWithRecovery(poolCtx, body, physicalModel, profile, makeReq)
 	if recoveredModel != "" {
 		_ = a.store.MergeUsageMetadata(ctx, requestID, map[string]any{"physicalModel": recoveredModel})
 	}

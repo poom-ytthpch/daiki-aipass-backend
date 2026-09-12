@@ -226,6 +226,12 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 		"max_completion_tokens": p.MaxCompletionTokens,
 		"stream":                false,
 	})
+	poolCtx, poolSelection := a.selectInitialFreePoolModel(ctx, "fast", alias.LiteLLMModelName)
+	physicalModel := alias.LiteLLMModelName
+	if poolSelection.Model != "" {
+		body = setRequestModel(body, poolSelection.Model)
+		physicalModel = poolSelection.Model
+	}
 	decision, _, err := a.guestQuota(ctx, identity.Subject, p)
 	if err != nil {
 		return nil, "", errors.New("guest quota unavailable")
@@ -241,7 +247,7 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 	}
 	_ = a.store.MergeUsageMetadata(ctx, requestID, map[string]any{
 		"authKind": "guest", "guestCapability": capability, "resolvedAlias": "fast",
-		"physicalModel": alias.LiteLLMModelName, "guestNetworkId": identity.Subject,
+		"physicalModel": physicalModel, "pool": poolSelection, "guestNetworkId": identity.Subject,
 		"guestDeviceId": identity.DeviceID, "guestDeviceName": identity.DeviceName,
 		"guestPrompt": guestActivityText(prompt, 32<<10),
 	})
@@ -274,7 +280,7 @@ func (a *app) runGuestCoreGeneration(ctx context.Context, identity guestIdentity
 		applyHermesSessionScope(req, baseKey, payload)
 		return req, nil
 	}
-	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(ctx, body, alias.LiteLLMModelName, profile, makeReq)
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(poolCtx, body, physicalModel, profile, makeReq)
 	_ = recoveredBody
 	if recoveredModel != "" {
 		_ = a.store.MergeUsageMetadata(ctx, requestID, map[string]any{"physicalModel": recoveredModel})

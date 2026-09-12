@@ -546,6 +546,11 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 			route.PhysicalModel = alias.LiteLLMModelName
 		}
 	}
+	poolCtx, poolSelection := a.selectInitialFreePoolModel(r.Context(), guestAlias, route.PhysicalModel)
+	if poolSelection.Model != "" && poolSelection.Model != route.PhysicalModel {
+		upstreamBody = setRequestModel(upstreamBody, poolSelection.Model)
+		route.PhysicalModel = poolSelection.Model
+	}
 	reserved := reservationTokens(body)
 	requestID := middleware.GetReqID(r.Context())
 	if requestID == "" {
@@ -571,7 +576,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		return
 	}
 	guestMeta := map[string]any{
-		"authKind": "guest", "resolvedAlias": guestAlias, "physicalModel": route.PhysicalModel,
+		"authKind": "guest", "resolvedAlias": guestAlias, "physicalModel": route.PhysicalModel, "pool": poolSelection,
 		"guestNetworkId": identity.Subject, "guestDeviceId": identity.DeviceID, "guestDeviceName": identity.DeviceName,
 		"guestPrompt": guestPrompt, "attachments": attachments, "commands": commandSelection, "research": safeRunResearchActivity(researchMeta),
 	}
@@ -628,7 +633,7 @@ func (a *app) proxyGuestInference(w http.ResponseWriter, r *http.Request, stream
 		}
 		return req, nil
 	}
-	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(r.Context(), upstreamBody, route.PhysicalModel, guestProfile, makeGuestRequest)
+	resp, recoveredBody, recoveredModel, recovery, err := a.doModelRequestWithRecovery(poolCtx, upstreamBody, route.PhysicalModel, guestProfile, makeGuestRequest)
 	upstreamBody = recoveredBody
 	if recoveredModel != "" {
 		route.PhysicalModel = recoveredModel

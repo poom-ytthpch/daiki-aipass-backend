@@ -306,7 +306,13 @@ func (a *app) adminModelProviders(w http.ResponseWriter, r *http.Request) {
 	for i := range providers {
 		providers[i] = providerPublic(providers[i])
 	}
-	writeJSON(w, 200, map[string]any{"providers": providers, "models": models, "aliases": aliases})
+	poolHealth := map[string]modelPoolAdminStatus{}
+	for _, model := range models {
+		if model.FreePoolEnabled {
+			poolHealth[model.LiteLLMModelName] = a.modelPoolStatus(r.Context(), model)
+		}
+	}
+	writeJSON(w, 200, map[string]any{"providers": providers, "models": models, "aliases": aliases, "poolHealth": poolHealth})
 }
 
 func (a *app) adminSaveModelProvider(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +518,11 @@ func providerLiteLLMModelInfo(m store.ProviderModel, id string) map[string]any {
 	info["daiki_agent_overhead_tokens"] = m.AgentOverheadTokens
 	info["daiki_research_overhead_tokens"] = m.ResearchOverheadTokens
 	info["daiki_fallback_model"] = m.FallbackModelName
+	info["daiki_free_pool_enabled"] = m.FreePoolEnabled
+	info["daiki_free_pool_routes"] = m.FreePoolRoutes
+	info["daiki_free_pool_weight"] = m.FreePoolWeight
+	info["daiki_free_pool_priority"] = m.FreePoolPriority
+	info["daiki_quality_score"] = m.QualityScore
 	return info
 }
 
@@ -522,23 +533,28 @@ func (a *app) adminUpdateProviderModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		MaxInputTokens         int    `json:"maxInputTokens"`
-		MaxOutputTokens        int    `json:"maxOutputTokens"`
-		TPMLimit               int    `json:"tpmLimit"`
-		ITPMLimit              int    `json:"itpmLimit"`
-		OTPMLimit              int    `json:"otpmLimit"`
-		RPMLimit               int    `json:"rpmLimit"`
-		RPDLimit               int    `json:"rpdLimit"`
-		TimeoutSeconds         int    `json:"timeoutSeconds"`
-		StreamTimeoutSeconds   int    `json:"streamTimeoutSeconds"`
-		MaxRetries             int    `json:"maxRetries"`
-		ProviderMaxRetries     int    `json:"providerMaxRetries"`
-		RetryBackoffMS         int    `json:"retryBackoffMs"`
-		ContextStrategy        string `json:"contextStrategy"`
-		ContextTargetTokens    int    `json:"contextTargetTokens"`
-		AgentOverheadTokens    int    `json:"agentOverheadTokens"`
-		ResearchOverheadTokens int    `json:"researchOverheadTokens"`
-		FallbackModelName      string `json:"fallbackModelName"`
+		MaxInputTokens         int      `json:"maxInputTokens"`
+		MaxOutputTokens        int      `json:"maxOutputTokens"`
+		TPMLimit               int      `json:"tpmLimit"`
+		ITPMLimit              int      `json:"itpmLimit"`
+		OTPMLimit              int      `json:"otpmLimit"`
+		RPMLimit               int      `json:"rpmLimit"`
+		RPDLimit               int      `json:"rpdLimit"`
+		FreePoolEnabled        bool     `json:"freePoolEnabled"`
+		FreePoolRoutes         []string `json:"freePoolRoutes"`
+		FreePoolWeight         int      `json:"freePoolWeight"`
+		FreePoolPriority       int      `json:"freePoolPriority"`
+		QualityScore           int      `json:"qualityScore"`
+		TimeoutSeconds         int      `json:"timeoutSeconds"`
+		StreamTimeoutSeconds   int      `json:"streamTimeoutSeconds"`
+		MaxRetries             int      `json:"maxRetries"`
+		ProviderMaxRetries     int      `json:"providerMaxRetries"`
+		RetryBackoffMS         int      `json:"retryBackoffMs"`
+		ContextStrategy        string   `json:"contextStrategy"`
+		ContextTargetTokens    int      `json:"contextTargetTokens"`
+		AgentOverheadTokens    int      `json:"agentOverheadTokens"`
+		ResearchOverheadTokens int      `json:"researchOverheadTokens"`
+		FallbackModelName      string   `json:"fallbackModelName"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid model settings"})
@@ -551,6 +567,11 @@ func (a *app) adminUpdateProviderModel(w http.ResponseWriter, r *http.Request) {
 	currentModel.OTPMLimit = in.OTPMLimit
 	currentModel.RPMLimit = in.RPMLimit
 	currentModel.RPDLimit = in.RPDLimit
+	currentModel.FreePoolEnabled = in.FreePoolEnabled
+	currentModel.FreePoolRoutes = append([]string(nil), in.FreePoolRoutes...)
+	currentModel.FreePoolWeight = in.FreePoolWeight
+	currentModel.FreePoolPriority = in.FreePoolPriority
+	currentModel.QualityScore = in.QualityScore
 	currentModel.TimeoutSeconds = in.TimeoutSeconds
 	currentModel.StreamTimeoutSeconds = in.StreamTimeoutSeconds
 	currentModel.MaxRetries = in.MaxRetries

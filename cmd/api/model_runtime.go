@@ -53,6 +53,9 @@ type modelRecoveryMeta struct {
 	NativeReasoning            bool   `json:"nativeReasoning"`
 	ReasoningModel             string `json:"reasoningModel,omitempty"`
 	ProviderCompatibilityRetry bool   `json:"providerCompatibilityRetry,omitempty"`
+	PoolRoute                  string `json:"poolRoute,omitempty"`
+	PoolInitialModel           string `json:"poolInitialModel,omitempty"`
+	PoolCandidateCount         int    `json:"poolCandidateCount,omitempty"`
 }
 
 type rateLimitObservation struct {
@@ -686,10 +689,11 @@ func pacificAdmissionWindow(now time.Time) (string, time.Duration) {
 	return local.Format("2006-01-02"), ttl
 }
 func (a *app) tryModelDailyAdmission(ctx context.Context, model string, m store.ProviderModel) (bool, int, int, error) {
-	if a.redis == nil || m.RPDLimit <= 0 {
+	limit := a.effectiveModelRPDLimit(ctx, model, m.RPDLimit)
+	if a.redis == nil || limit <= 0 {
 		return true, 0, 0, nil
 	}
-	capacity := modelDailyAdmissionCapacity(m.RPDLimit)
+	capacity := modelDailyAdmissionCapacity(limit)
 	day, ttl := pacificAdmissionWindow(time.Now())
 	key := "model:rpd:" + strings.TrimPrefix(modelCircuitKey(model), "model:circuit:") + ":" + day
 	// Check-and-increment is atomic so concurrent replicas cannot over-admit the
@@ -1030,6 +1034,7 @@ func applyFallbackModel(ctx context.Context, a *app, body []byte, currentModel, 
 	currentModel = m.FallbackModelName
 	body = setRequestModel(body, currentModel)
 	m = a.runtimeModel(ctx, currentModel)
+	m = a.preparePoolFallback(ctx, currentModel, m)
 	overhead := runtimeAgentOverhead(m, profile)
 	meta.AppliedOverheadTokens = overhead
 	meta.FinalModel = currentModel
@@ -1043,14 +1048,23 @@ func applyFallbackModel(ctx context.Context, a *app, body []byte, currentModel, 
 
 func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model, profile string, makeReq inferenceRequestFactory) (*http.Response, []byte, string, modelRecoveryMeta, error) {
 	m := a.runtimeModel(ctx, model)
+	m = a.preparePoolFallback(ctx, model, m)
 	overhead := runtimeAgentOverhead(m, profile)
 	meta := modelRecoveryMeta{Attempts: 0, OriginalInputTokens: estimateChatInputTokens(body), FinalModel: model, RuntimeProfile: profile, AppliedOverheadTokens: overhead}
+	if state := modelPoolState(ctx); state != nil {
+		meta.PoolRoute = state.Route
+		meta.PoolInitialModel = state.Initial.Model
+		meta.PoolCandidateCount = state.Initial.CandidateCount
+	}
 	meta.PredictedInputTokens = meta.OriginalInputTokens + overhead
 	currentModel := model
-	// Never downgrade an image request to a text-only model fallback. The dedicated
-	// Vision alias must resolve to a model that can actually inspect pixels; a clear
-	// vision failure is safer than a plausible answer produced without seeing the image.
+	// Image requests may fail over only inside the explicitly configured Vision pool.
+	// Without a Vision pool, preserve the previous safety rule and never downgrade
+	// pixels to a text-only fallback model.
 	allowModelFallback := !chatPayloadHasImage(body)
+	if state := modelPoolState(ctx); state != nil && state.Route == "vision" {
+		allowModelFallback = true
+	}
 	strategy := m.ContextStrategy
 	if strategy == "" {
 		strategy = "adaptive"
@@ -1076,6 +1090,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		currentModel = m.FallbackModelName
 		body = setRequestModel(body, currentModel)
 		m = a.runtimeModel(ctx, currentModel)
+		m = a.preparePoolFallback(ctx, currentModel, m)
 		overhead = runtimeAgentOverhead(m, profile)
 		meta.AppliedOverheadTokens = overhead
 		strategy = m.ContextStrategy
@@ -1108,6 +1123,12 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 	compatibilityRetried := false
 	if maxRetries < 0 {
 		maxRetries = 0
+	}
+	if state := modelPoolState(ctx); state != nil && state.Initial.CandidateCount > 1 {
+		poolRetries := min(4, state.Initial.CandidateCount-1)
+		if poolRetries > maxRetries {
+			maxRetries = poolRetries
+		}
 	}
 	if maxRetries > 4 {
 		maxRetries = 4
@@ -1150,8 +1171,8 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		if dailyErr != nil {
 			return nil, body, currentModel, meta, dailyErr
 		}
-		if m.RPDLimit > 0 {
-			meta.DailyRequestLimit = m.RPDLimit
+		if effectiveRPD := a.effectiveModelRPDLimit(ctx, currentModel, m.RPDLimit); effectiveRPD > 0 {
+			meta.DailyRequestLimit = effectiveRPD
 			meta.DailyRequestCapacity = dailyCapacity
 			meta.DailyRequestsUsed = dailyUsed
 		}
@@ -1171,8 +1192,10 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		if err != nil {
 			return nil, body, currentModel, meta, err
 		}
+		attemptStarted := time.Now()
 		resp, err := a.inferenceHTTP.Do(req)
 		if err != nil {
+			a.recordModelPoolHealth(ctx, currentModel, 0, time.Since(attemptStarted))
 			meta.FailureKind = "hermes_transport"
 			a.openModelCircuit(ctx, currentModel, 0, meta.FailureKind)
 			if allowModelFallback && attempt < maxRetries && strategy != "reject" && modelCanFallback(m, currentModel, strategy) {
@@ -1187,6 +1210,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		if resp.StatusCode == http.StatusOK {
 			softBody, softStatus, inspectErr := inspectHermesSoftFailure(resp)
 			if inspectErr != nil {
+				a.recordModelPoolHealth(ctx, currentModel, 0, time.Since(attemptStarted))
 				return resp, body, currentModel, meta, inspectErr
 			}
 			if softStatus != 0 {
@@ -1196,6 +1220,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 				resp.Status = fmt.Sprintf("%d %s", softStatus, http.StatusText(softStatus))
 			}
 		}
+		a.recordModelPoolHealth(ctx, currentModel, statusForRecovery, time.Since(attemptStarted))
 		if statusForRecovery == http.StatusBadRequest {
 			errBody, _ = io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 			_ = resp.Body.Close()
@@ -1243,6 +1268,7 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		if statusForRecovery == http.StatusTooManyRequests {
 			meta.ObservedRateKind, meta.ObservedRateLimit, meta.ObservedRequested = obs.Kind, obs.Limit, obs.Requested
 			if obs.Kind == "rpd" && obs.Limit > 0 {
+				a.observeModelRPDLimit(ctx, currentModel, obs.Limit)
 				a.markModelDailyExhausted(ctx, currentModel, obs.Limit)
 			}
 		}
