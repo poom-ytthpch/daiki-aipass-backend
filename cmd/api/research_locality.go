@@ -866,6 +866,11 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 			limit = 5
 		}
 	}
+	if priceOnly && limit > 6 {
+		// Price-only synthesis benefits more from a compact, high-signal evidence
+		// set than from filling all deep-research slots with generic catalog pages.
+		limit = 6
+	}
 	localCurrent := make([]researchSource, 0, limit)
 	localWeb := make([]researchSource, 0, limit)
 	localSocial := make([]researchSource, 0, limit)

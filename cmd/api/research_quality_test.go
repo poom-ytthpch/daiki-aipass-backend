@@ -149,6 +149,7 @@ func TestSiblingModelTitleCannotBeRescuedByRequestedModelInSnippet(t *testing.T)
 	}{
 		{title: "โปรโมชั่น BYD SEALION 6 DM-i", url: "https://dealer.example/promotion/byd-sealion6", content: "ดูรุ่นอื่น BYD SEALION 7 ราคา 1,199,900 บาท"},
 		{title: "โปรโมชั่น BYD SEALION 5 DM-i", url: "https://dealer.example/promotion/byd-sealion5", content: "เทียบกับ BYD SEALION 7 ราคา 1,199,900 บาท"},
+		{title: "เปิดตัว BYD SEALION 6 DM-i & BYD SEALION 7", url: "https://dealer.example/sealion-6-and-sealion-7", content: "BYD SEALION 7 AWD Ultimate ราคา 1,349,900 บาท"},
 	}
 	for _, tc := range cases {
 		if researchCandidateRelevant(query, tc.title, tc.url, tc.content) {

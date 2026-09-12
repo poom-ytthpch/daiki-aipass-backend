@@ -300,19 +300,11 @@ func researchExplicitSiblingModelMismatch(query, title, rawURL string) bool {
 		if anchor == "" {
 			continue
 		}
-		exact := false
-		for _, candidate := range []string{anchor + number, anchor + " " + number, anchor + " model " + number, anchor + " series " + number, anchor + " รุ่น " + number} {
-			if strings.Contains(subject, candidate) {
-				exact = true
-				break
-			}
-		}
-		if exact {
-			continue
-		}
 		// Search titles/URLs (strong entity identity fields) for the same family
 		// followed by another short model number. Search snippets often mention
-		// related products, so they must not rescue an explicitly sibling page.
+		// related products, so they must not rescue a sibling or mixed-model page.
+		// A single-model query should also reject titles such as "SEALION 6 &
+		// SEALION 7"; comparison queries bypass this gate at the caller.
 		re := regexp.MustCompile(`(?:^|\s)` + regexp.QuoteMeta(anchor) + `\s*([0-9]{1,3})(?:\s|$)`)
 		for _, match := range re.FindAllStringSubmatch(strings.TrimSpace(subject), -1) {
 			if len(match) > 1 && match[1] != number {

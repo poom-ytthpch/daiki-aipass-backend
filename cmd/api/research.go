@@ -292,6 +292,13 @@ func contextualResearchPlan(payload map[string]any, mode string) (latestQuery, r
 			useWeb = true
 			inherited = true
 			resolvedQuery = strings.TrimSpace(previousTopic + "\nFollow-up: " + latestQuery)
+			// For a single-entity follow-up, keep the referent but search the latest
+			// intent instead of replaying the full previous broad request. This makes
+			// "SEALION 7 ..." -> "ราคาล่าสุดเท่าไหร่" a focused current-price
+			// lookup while preserving comparison topics unchanged.
+			if entity := strings.TrimSpace(researchEntityPhrase(previousTopic)); entity != "" && len(extractResearchURLs(previousTopic)) == 0 && !researchComparisonIntent(previousTopic) {
+				resolvedQuery = strings.TrimSpace(entity + " " + latestQuery)
+			}
 		}
 	}
 	return
@@ -412,8 +419,8 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 		if prefs.Depth == "deep" {
 			b.WriteString("\nDEEP RESEARCH OUTPUT: Produce a polished research report, not a search-result list. Lead with an Executive Summary; briefly state the research approach; organize findings by the user's decision-relevant themes; surface Thailand-specific findings before global context when applicable; compare conflicting evidence; include risks/limitations; and end with a clear recommendation or conclusion when the request supports one. Keep the report readable and avoid ceremonial filler.\n")
 		}
-		if researchPriceOnlyIntent(searchQuery, prefs) {
-			b.WriteString("\nPRICE-FOCUSED OUTPUT: The user is asking for current/latest price. Answer the requested price/model lineup first and keep the response tightly scoped to pricing evidence. Do not add specifications, charging, warranty, insurance, accessories, financing, or promotional benefits unless the user explicitly asked for them. Do not speculate about why conflicting prices differ; report the dated conflict and prefer the newest applicable primary/local evidence.\n")
+		if researchPriceOnlyIntent(query, prefs) {
+			b.WriteString("\nPRICE-FOCUSED OUTPUT: The latest user message is asking for current/latest price. Answer only the requested current price/model lineup and keep the response tightly scoped to pricing evidence. Do not add specifications, charging, warranty, insurance, accessories, financing, promotional benefits, or historical/pre-discount/list prices unless the user explicitly asked for them. If current sources genuinely conflict, report the dated conflict without speculating about the cause and prefer the newest applicable primary/local evidence.\n")
 		}
 		if meta.SocialSourceCount > 0 {
 			fmt.Fprintf(&b, "\nSOCIAL RESEARCH: Retrieved %d public/indexed social sources across %s. Treat social posts, comments, videos and community discussions as useful evidence for user experience, sentiment, emerging issues, promotions and firsthand reports, but not as sole proof of hard facts. Corroborate important claims with official/primary or independent web sources whenever possible. Distinguish anecdote from verified fact.\n", meta.SocialSourceCount, strings.Join(meta.SocialPlatforms, ", "))

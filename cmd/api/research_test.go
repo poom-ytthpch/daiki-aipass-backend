@@ -521,6 +521,9 @@ func TestLatestPriceFollowUpInheritsProductEntity(t *testing.T) {
 	if !strings.Contains(strings.ToLower(resolved), "sealion 7") || !strings.Contains(resolved, "ราคาล่าสุดเท่าไหร่") {
 		t.Fatalf("resolved query lost Sealion 7 context: %q", resolved)
 	}
+	if strings.Contains(strings.ToLower(resolved), "อย่างละเอียด") || strings.Contains(strings.ToLower(resolved), "follow-up") {
+		t.Fatalf("price follow-up should narrow retrieval to entity + latest intent: %q", resolved)
+	}
 	if phrase := researchEntityPhrase(resolved); !strings.Contains(phrase, "sealion") || strings.Contains(phrase, "follow-up") {
 		t.Fatalf("unexpected resolved entity phrase: %q", phrase)
 	}
