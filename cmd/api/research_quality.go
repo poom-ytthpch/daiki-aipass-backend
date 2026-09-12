@@ -280,7 +280,55 @@ func researchEntityRelevanceScore(query, title, rawURL, content string) int {
 	return clampResearchScore(score)
 }
 
+func researchExplicitSiblingModelMismatch(query, title, rawURL string) bool {
+	terms := researchEntityTerms(query)
+	if len(terms) == 0 {
+		return false
+	}
+	subject := " " + normalizeResearchText(title+" "+rawURL) + " "
+	for i, number := range terms {
+		if !researchPureNumericModelTerm(number) {
+			continue
+		}
+		anchor := ""
+		for j := i - 1; j >= 0; j-- {
+			if researchTermHasLetter(terms[j]) {
+				anchor = normalizeResearchText(terms[j])
+				break
+			}
+		}
+		if anchor == "" {
+			continue
+		}
+		exact := false
+		for _, candidate := range []string{anchor + number, anchor + " " + number, anchor + " model " + number, anchor + " series " + number, anchor + " รุ่น " + number} {
+			if strings.Contains(subject, candidate) {
+				exact = true
+				break
+			}
+		}
+		if exact {
+			continue
+		}
+		// Search titles/URLs (strong entity identity fields) for the same family
+		// followed by another short model number. Search snippets often mention
+		// related products, so they must not rescue an explicitly sibling page.
+		re := regexp.MustCompile(`(?:^|\s)` + regexp.QuoteMeta(anchor) + `\s*([0-9]{1,3})(?:\s|$)`)
+		for _, match := range re.FindAllStringSubmatch(strings.TrimSpace(subject), -1) {
+			if len(match) > 1 && match[1] != number {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func researchCandidateRelevant(query, title, rawURL, content string) bool {
+	// Comparison queries intentionally accept authoritative evidence for either
+	// side independently; a source about the second model is not sibling drift.
+	if !researchComparisonIntent(query) && researchExplicitSiblingModelMismatch(query, title, rawURL) {
+		return false
+	}
 	return researchRelevanceScore(query, title, rawURL, content) >= 58
 }
 

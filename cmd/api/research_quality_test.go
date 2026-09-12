@@ -140,6 +140,26 @@ func TestProductResearchPlanAvoidsBlindGovernmentSearch(t *testing.T) {
 	}
 }
 
+func TestSiblingModelTitleCannotBeRescuedByRequestedModelInSnippet(t *testing.T) {
+	query := "BYD SEALION 7 ราคาล่าสุด Thailand"
+	cases := []struct {
+		title   string
+		url     string
+		content string
+	}{
+		{title: "โปรโมชั่น BYD SEALION 6 DM-i", url: "https://dealer.example/promotion/byd-sealion6", content: "ดูรุ่นอื่น BYD SEALION 7 ราคา 1,199,900 บาท"},
+		{title: "โปรโมชั่น BYD SEALION 5 DM-i", url: "https://dealer.example/promotion/byd-sealion5", content: "เทียบกับ BYD SEALION 7 ราคา 1,199,900 บาท"},
+	}
+	for _, tc := range cases {
+		if researchCandidateRelevant(query, tc.title, tc.url, tc.content) {
+			t.Fatalf("sibling page leaked through candidate gate: %s %s", tc.title, tc.url)
+		}
+	}
+	if !researchCandidateRelevant(query, "BYD SEALION 7 MY2026 ราคาไทย", "https://dealer.example/byd-sealion7", "Premium 1,199,900 บาท") {
+		t.Fatal("exact requested model must remain relevant")
+	}
+}
+
 func TestLatestPriceResearchUsesOnlyTwoHighValueGoogleQueries(t *testing.T) {
 	prefs := researchPreferences{Region: "TH", Locale: "th-TH", Scope: "local-first", Depth: "deep"}
 	plan := researchSearchPlan("BYD Sealion 7 ราคาล่าสุดเท่าไหร่", prefs)
