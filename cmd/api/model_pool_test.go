@@ -60,3 +60,21 @@ func TestPoolRouteContext(t *testing.T) {
 		t.Fatal("unsupported routes must not activate the pool")
 	}
 }
+
+func TestWeightedPoolOffsetScattersConsecutiveRequests(t *testing.T) {
+	seenBuckets := map[int]bool{}
+	for i := int64(1); i <= 12; i++ {
+		pick := weightedPoolOffset(i, 1000)
+		switch {
+		case pick < 400:
+			seenBuckets[0] = true
+		case pick < 700:
+			seenBuckets[1] = true
+		default:
+			seenBuckets[2] = true
+		}
+	}
+	if len(seenBuckets) < 3 {
+		t.Fatalf("consecutive weighted picks should spread across buckets, got %#v", seenBuckets)
+	}
+}

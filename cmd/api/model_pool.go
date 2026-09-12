@@ -271,6 +271,17 @@ func poolCandidateScore(m store.ProviderModel, health modelPoolHealth, used, cap
 	return score, overPaced
 }
 
+func weightedPoolOffset(counter int64, totalWeight int) int {
+	if totalWeight <= 0 {
+		return 0
+	}
+	// Multiplicative hashing scatters consecutive Redis counters across the whole
+	// weighted range. Using counter%total directly creates long startup streaks in
+	// the first bucket and defeats load spreading when weights are large.
+	x := uint64(counter) * uint64(11400714819323198485)
+	return int(x % uint64(totalWeight))
+}
+
 func (a *app) selectFreePoolModel(ctx context.Context, route, current string, excluded map[string]bool) modelPoolSelection {
 	selection := modelPoolSelection{Route: normalizePoolRoute(route)}
 	if a == nil || a.store == nil || selection.Route == "" {
@@ -350,7 +361,7 @@ func (a *app) selectFreePoolModel(ctx context.Context, route, current string, ex
 			counter, err := a.redis.Incr(ctx, "model:pool:rr:"+selection.Route).Result()
 			if err == nil {
 				_ = a.redis.Expire(ctx, "model:pool:rr:"+selection.Route, 24*time.Hour).Err()
-				pick := int(counter % int64(totalWeight))
+				pick := weightedPoolOffset(counter, totalWeight)
 				for _, candidate := range candidates {
 					if pick < candidate.Weight {
 						chosen = candidate
