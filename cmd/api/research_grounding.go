@@ -94,6 +94,11 @@ func researchUnsupportedClaims(text string, meta researchMetadata) []string {
 	if strings.Contains(lowerText, "ไม่รวมค่าธรรมเนียม") || strings.Contains(lowerText, "ค่าธรรมเนียมอื่น") || strings.Contains(lowerText, "fees not included") || strings.Contains(lowerText, "excluding fees") {
 		add("ค่าธรรมเนียม fees")
 	}
+	for _, marker := range []string{"พิมพ์ผิด", "ข้อมูลผิด", "ปัดเศษ", "typo", "printing error", "rounding error"} {
+		if strings.Contains(lowerText, marker) {
+			add(marker)
+		}
+	}
 	sort.Strings(violations)
 	if len(violations) > 12 {
 		violations = violations[:12]

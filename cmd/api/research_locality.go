@@ -552,14 +552,35 @@ func researchOrigin(raw string) string {
 }
 
 func (a *app) discoverLinkedOfficialSources(ctx context.Context, query string, prefs researchPreferences, rows []searxResult) []researchSource {
-	if len(rows) == 0 || strings.TrimSpace(researchEntityPhrase(query)) == "" {
+	entityPhrase := strings.TrimSpace(researchEntityPhrase(query))
+	if len(rows) == 0 || entityPhrase == "" {
 		return nil
 	}
-	cacheKey := researchEvidenceCacheKey("research:canonical:v1", normalizeResearchText(query)+"\n"+prefs.Region+"\n"+prefs.Scope)
-	if cached := a.cachedResearchSources(ctx, cacheKey, query); len(cached) > 0 {
-		return cached
-	}
+	cacheKey := researchEvidenceCacheKey("research:canonical:v2", normalizeResearchText(entityPhrase)+"\n"+prefs.Region+"\n"+prefs.Scope)
 	client := newPublicWebClient(7 * time.Second)
+	if cached := a.cachedResearchSources(ctx, cacheKey, query); len(cached) > 0 {
+		refreshed := make([]researchSource, 0, len(cached))
+		now := time.Now()
+		for _, source := range cached {
+			if text, err := a.cachedResearchPage(ctx, client, source.URL); err == nil {
+				source.Excerpt = researchFocusedExcerpt(query, text, 6500)
+				if researchSourceRegion(source.Title, source.URL, text, prefs) == "TH" {
+					source.Region = "TH"
+				}
+			}
+			if !researchCandidateRelevant(query, source.Title, source.URL, source.Snippet+" "+source.Excerpt) {
+				continue
+			}
+			scoreResearchSource(query, &source, now)
+			boostResearchSourceForPlan(query, prefs, &source)
+			if source.QualityScore >= 58 {
+				refreshed = append(refreshed, source)
+			}
+		}
+		if len(refreshed) > 0 {
+			return refreshed
+		}
+	}
 	seedRows := append([]searxResult(nil), rows...)
 	seedPriority := func(stage string) int {
 		switch stage {
@@ -691,12 +712,12 @@ func (a *app) discoverLinkedOfficialSources(ctx context.Context, query string, p
 			}
 			out = append(out, source)
 			if len(out) >= 2 {
-				a.storeResearchSourcesCache(ctx, cacheKey, out)
+				a.storeResearchSourcesCache(ctx, cacheKey, out, researchCanonicalCacheTTL)
 				return out
 			}
 		}
 	}
-	a.storeResearchSourcesCache(ctx, cacheKey, out)
+	a.storeResearchSourcesCache(ctx, cacheKey, out, researchCanonicalCacheTTL)
 	return out
 }
 

@@ -420,7 +420,7 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 			b.WriteString("\nDEEP RESEARCH OUTPUT: Produce a polished research report, not a search-result list. Lead with an Executive Summary; briefly state the research approach; organize findings by the user's decision-relevant themes; surface Thailand-specific findings before global context when applicable; compare conflicting evidence; include risks/limitations; and end with a clear recommendation or conclusion when the request supports one. Keep the report readable and avoid ceremonial filler.\n")
 		}
 		if researchPriceOnlyIntent(query, prefs) {
-			b.WriteString("\nPRICE-FOCUSED OUTPUT: The latest user message is asking for current/latest price. Answer only the requested current price/model lineup and keep the response tightly scoped to pricing evidence. Do not add specifications, charging, warranty, insurance, accessories, financing, promotional benefits, or historical/pre-discount/list prices unless the user explicitly asked for them. If current sources genuinely conflict, report the dated conflict without speculating about the cause and prefer the newest applicable primary/local evidence.\n")
+			b.WriteString("\nPRICE-FOCUSED OUTPUT: The latest user message is asking for current/latest price. Answer only the requested current price/model lineup and keep the response tightly scoped to pricing evidence. Do not add specifications, charging, warranty, insurance, accessories, financing, promotional benefits, or historical/pre-discount/list prices unless the user explicitly asked for them. If current sources genuinely conflict, report the dated conflict without speculating about the cause and prefer the newest applicable primary/local evidence. Never label a conflicting value as a typo, printing error, rounding difference, stale data, or other cause unless that cause is explicitly stated in the supplied source text.\n")
 		}
 		if meta.SocialSourceCount > 0 {
 			fmt.Fprintf(&b, "\nSOCIAL RESEARCH: Retrieved %d public/indexed social sources across %s. Treat social posts, comments, videos and community discussions as useful evidence for user experience, sentiment, emerging issues, promotions and firsthand reports, but not as sole proof of hard facts. Corroborate important claims with official/primary or independent web sources whenever possible. Distinguish anecdote from verified fact.\n", meta.SocialSourceCount, strings.Join(meta.SocialPlatforms, ", "))
@@ -678,7 +678,10 @@ func (a *app) durableGoogleResearchEvidence(ctx context.Context, query string) [
 	return researchRowsFromStoredGoogleEvidence(query, payloads)
 }
 
-const researchEvidenceCacheTTL = 10 * time.Minute
+const (
+	researchPageCacheTTL      = 10 * time.Minute
+	researchCanonicalCacheTTL = 30 * time.Minute
+)
 
 func researchEvidenceCacheKey(prefix, value string) string {
 	sum := sha256.Sum256([]byte(value))
@@ -697,7 +700,7 @@ func (a *app) cachedResearchPage(ctx context.Context, client *http.Client, raw s
 	if err != nil {
 		return "", err
 	}
-	_ = a.redis.Set(ctx, key, text, researchEvidenceCacheTTL).Err()
+	_ = a.redis.Set(ctx, key, text, researchPageCacheTTL).Err()
 	return text, nil
 }
 
@@ -723,12 +726,15 @@ func (a *app) cachedResearchSources(ctx context.Context, key, query string) []re
 	return verified
 }
 
-func (a *app) storeResearchSourcesCache(ctx context.Context, key string, sources []researchSource) {
+func (a *app) storeResearchSourcesCache(ctx context.Context, key string, sources []researchSource, ttl time.Duration) {
 	if a.redis == nil || strings.TrimSpace(key) == "" || len(sources) == 0 {
 		return
 	}
+	if ttl <= 0 {
+		ttl = researchCanonicalCacheTTL
+	}
 	if raw, err := json.Marshal(sources); err == nil {
-		_ = a.redis.Set(ctx, key, raw, researchEvidenceCacheTTL).Err()
+		_ = a.redis.Set(ctx, key, raw, ttl).Err()
 	}
 }
 

@@ -50,6 +50,15 @@ func TestResearchGroundingRejectsUnsupportedTaxFeeDisclaimer(t *testing.T) {
 	}
 }
 
+func TestResearchGroundingRejectsUnsupportedConflictCause(t *testing.T) {
+	meta := sealionGroundingMeta()
+	text := "แหล่ง [2] ระบุราคา 1,349,000 บาท ซึ่งเป็นการพิมพ์ผิด แต่ราคา 1,349,900 บาทจาก [1] ถูกต้อง"
+	violations := researchUnsupportedClaims(text, meta)
+	if !strings.Contains(strings.ToLower(strings.Join(violations, " ")), "พิมพ์ผิด") {
+		t.Fatalf("unsupported conflict cause must be rejected: %#v", violations)
+	}
+}
+
 func TestResearchGroundingRejectsUnsupportedManufacturerAttribution(t *testing.T) {
 	meta := sealionGroundingMeta()
 	text := "รถรุ่นนี้ผลิตโดยบริษัท Chery และทำตลาดในชื่อ SEALION 7"
