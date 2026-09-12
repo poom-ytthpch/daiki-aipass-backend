@@ -304,6 +304,7 @@ CREATE TABLE IF NOT EXISTS provider_models (
     itpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (itpm_limit >= 0),
     otpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (otpm_limit >= 0),
     rpm_limit INTEGER NOT NULL DEFAULT 0 CHECK (rpm_limit >= 0),
+    rpd_limit INTEGER NOT NULL DEFAULT 0 CHECK (rpd_limit >= 0),
     timeout_seconds INTEGER NOT NULL DEFAULT 300 CHECK (timeout_seconds > 0 AND timeout_seconds <= 1800),
     stream_timeout_seconds INTEGER NOT NULL DEFAULT 300 CHECK (stream_timeout_seconds > 0 AND stream_timeout_seconds <= 1800),
     max_retries INTEGER NOT NULL DEFAULT 2 CHECK (max_retries >= 0 AND max_retries <= 8),
@@ -324,6 +325,7 @@ ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS tpm_limit INTEGER NOT NULL 
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS itpm_limit INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS otpm_limit INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS rpm_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS rpd_limit INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS timeout_seconds INTEGER NOT NULL DEFAULT 300;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS stream_timeout_seconds INTEGER NOT NULL DEFAULT 300;
 ALTER TABLE provider_models ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 2;

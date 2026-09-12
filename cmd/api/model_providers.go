@@ -35,7 +35,7 @@ func normalizeProviderType(v string) string {
 	switch v {
 	case "vllm", "lmstudio", "ollama", "anthropic", "gemini":
 		return v
-	case "openai-compatible", "openai_compatible", "openai", "groq", "openrouter", "together", "together-ai", "fireworks", "deepinfra", "xai", "mistral", "cerebras", "custom":
+	case "openai-compatible", "openai_compatible", "openai", "groq", "openrouter", "together", "together-ai", "fireworks", "deepinfra", "xai", "mistral", "cerebras", "opencode", "opencodezen", "opencode-zen", "zen", "custom":
 		return "openai-compatible"
 	default:
 		return ""
@@ -62,6 +62,8 @@ func providerTypeDefaultBase(v string) string {
 		return "https://api.mistral.ai/v1"
 	case "cerebras":
 		return "https://api.cerebras.ai/v1"
+	case "opencode", "opencodezen", "opencode-zen", "zen":
+		return "https://opencode.ai/zen/v1"
 	case "anthropic":
 		return "https://api.anthropic.com"
 	case "gemini":
@@ -316,7 +318,7 @@ func (a *app) adminSaveModelProvider(w http.ResponseWriter, r *http.Request) {
 	rawType := strings.ToLower(strings.TrimSpace(in.ProviderType))
 	typ := normalizeProviderType(rawType)
 	if typ == "" {
-		writeJSON(w, 400, map[string]string{"error": "providerType must be vllm, lmstudio, ollama, openai-compatible, anthropic, or gemini"})
+		writeJSON(w, 400, map[string]string{"error": "providerType must be vllm, lmstudio, ollama, openai-compatible, anthropic, gemini, or a supported hosted provider preset"})
 		return
 	}
 	rawBase := strings.TrimSpace(in.BaseURL)
@@ -526,6 +528,7 @@ func (a *app) adminUpdateProviderModel(w http.ResponseWriter, r *http.Request) {
 		ITPMLimit              int    `json:"itpmLimit"`
 		OTPMLimit              int    `json:"otpmLimit"`
 		RPMLimit               int    `json:"rpmLimit"`
+		RPDLimit               int    `json:"rpdLimit"`
 		TimeoutSeconds         int    `json:"timeoutSeconds"`
 		StreamTimeoutSeconds   int    `json:"streamTimeoutSeconds"`
 		MaxRetries             int    `json:"maxRetries"`
@@ -547,6 +550,7 @@ func (a *app) adminUpdateProviderModel(w http.ResponseWriter, r *http.Request) {
 	currentModel.ITPMLimit = in.ITPMLimit
 	currentModel.OTPMLimit = in.OTPMLimit
 	currentModel.RPMLimit = in.RPMLimit
+	currentModel.RPDLimit = in.RPDLimit
 	currentModel.TimeoutSeconds = in.TimeoutSeconds
 	currentModel.StreamTimeoutSeconds = in.StreamTimeoutSeconds
 	currentModel.MaxRetries = in.MaxRetries

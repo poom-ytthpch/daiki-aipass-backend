@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/poom-ytthpch/daiki-ai-passport-backend/internal/store"
 )
@@ -43,6 +44,10 @@ type modelRecoveryMeta struct {
 	AdmissionWaitMS            int64  `json:"admissionWaitMs,omitempty"`
 	AdmissionSpillover         bool   `json:"admissionSpillover,omitempty"`
 	AdmissionTokens            int    `json:"admissionTokens,omitempty"`
+	DailyAdmissionSpillover    bool   `json:"dailyAdmissionSpillover,omitempty"`
+	DailyRequestLimit          int    `json:"dailyRequestLimit,omitempty"`
+	DailyRequestCapacity       int    `json:"dailyRequestCapacity,omitempty"`
+	DailyRequestsUsed          int    `json:"dailyRequestsUsed,omitempty"`
 	RequestedReasoningEffort   string `json:"requestedReasoningEffort,omitempty"`
 	EffectiveReasoningEffort   string `json:"effectiveReasoningEffort,omitempty"`
 	NativeReasoning            bool   `json:"nativeReasoning"`
@@ -57,11 +62,14 @@ type rateLimitObservation struct {
 }
 
 var providerLimitPattern = regexp.MustCompile(`(?i)limit\s+([0-9][0-9,]*)\s*,\s*requested\s+([0-9][0-9,]*)`)
+var providerSimpleLimitPattern = regexp.MustCompile(`(?i)\blimit\s*:\s*([0-9][0-9,]*)`)
+var providerRetryInPattern = regexp.MustCompile(`(?i)(?:retry|try again)\s+in\s+([0-9]+(?:\.[0-9]+)?)s`)
+var providerRetryDelayPattern = regexp.MustCompile(`(?i)"retryDelay"\s*:\s*"([0-9]+(?:\.[0-9]+)?s)"`)
 var providerHTTPStatusPattern = regexp.MustCompile(`(?i)\bHTTP\s+([1-5][0-9]{2})\b`)
 var providerJSONCodePattern = regexp.MustCompile(`(?i)"code"\s*:\s*"?([1-5][0-9]{2})"?`)
 
 func recoverableProviderStatus(status int) bool {
-	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusRequestTimeout || status == http.StatusRequestEntityTooLarge || status == http.StatusTooManyRequests || status >= 500
 }
 
 func providerFailureStatus(raw []byte) int {
@@ -129,6 +137,8 @@ func failureKindForStatus(status int) string {
 		return "provider_model"
 	case http.StatusRequestTimeout:
 		return "provider_timeout"
+	case http.StatusRequestEntityTooLarge:
+		return "provider_payload_too_large"
 	case http.StatusTooManyRequests:
 		return "provider_rate_limit"
 	default:
@@ -161,6 +171,8 @@ func parseRateLimitObservation(status int, body []byte) rateLimitObservation {
 		obs.Kind = "otpm"
 	case strings.Contains(text, "tokens per minute") || strings.Contains(text, "tpm"):
 		obs.Kind = "tpm"
+	case strings.Contains(text, "requests per day") || strings.Contains(text, "requestsperday") || strings.Contains(text, "rpd"):
+		obs.Kind = "rpd"
 	case strings.Contains(text, "requests per minute") || strings.Contains(text, "rpm"):
 		obs.Kind = "rpm"
 	default:
@@ -168,8 +180,25 @@ func parseRateLimitObservation(status int, body []byte) rateLimitObservation {
 	}
 	if m := providerLimitPattern.FindStringSubmatch(string(body)); len(m) == 3 {
 		obs.Limit, obs.Requested = parsePositiveInt(m[1]), parsePositiveInt(m[2])
+	} else if m := providerSimpleLimitPattern.FindStringSubmatch(string(body)); len(m) == 2 {
+		obs.Limit = parsePositiveInt(m[1])
 	}
 	return obs
+}
+
+func providerRetryAfter(body []byte) time.Duration {
+	raw := string(body)
+	if m := providerRetryInPattern.FindStringSubmatch(raw); len(m) == 2 {
+		if seconds, err := strconv.ParseFloat(m[1], 64); err == nil && seconds > 0 {
+			return time.Duration(seconds * float64(time.Second))
+		}
+	}
+	if m := providerRetryDelayPattern.FindStringSubmatch(raw); len(m) == 2 {
+		if d, err := time.ParseDuration(m[1]); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func estimateMessageTokens(v any) int {
@@ -634,6 +663,73 @@ func (a *app) tryModelAdmission(ctx context.Context, model string, body []byte, 
 	return false, time.Duration(waitMS) * time.Millisecond, cost, nil
 }
 
+func modelDailyAdmissionCapacity(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	// Preserve 10% headroom for manual/admin tests, provider-side accounting,
+	// and requests that may bypass this backend instance. A 20 RPD free tier
+	// therefore admits at most 18 automatic requests per Pacific day.
+	return max(1, int(float64(limit)*0.90))
+}
+func pacificAdmissionWindow(now time.Time) (string, time.Duration) {
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		loc = time.FixedZone("PacificFallback", -8*60*60)
+	}
+	local := now.In(loc)
+	next := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, loc)
+	ttl := next.Sub(local)
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	return local.Format("2006-01-02"), ttl
+}
+func (a *app) tryModelDailyAdmission(ctx context.Context, model string, m store.ProviderModel) (bool, int, int, error) {
+	if a.redis == nil || m.RPDLimit <= 0 {
+		return true, 0, 0, nil
+	}
+	capacity := modelDailyAdmissionCapacity(m.RPDLimit)
+	day, ttl := pacificAdmissionWindow(time.Now())
+	key := "model:rpd:" + strings.TrimPrefix(modelCircuitKey(model), "model:circuit:") + ":" + day
+	// Check-and-increment is atomic so concurrent replicas cannot over-admit the
+	// last request. A rejected request does not consume another local slot.
+	script := `local current=tonumber(redis.call('GET',KEYS[1]) or '0'); local cap=tonumber(ARGV[1]); if current>=cap then return -current end; current=redis.call('INCR',KEYS[1]); if current==1 then redis.call('PEXPIRE',KEYS[1],ARGV[2]) end; return current`
+	value, err := a.redis.Eval(ctx, script, []string{key}, capacity, ttl.Milliseconds()).Int64()
+	if err != nil {
+		// RPD admission is an availability optimization. Fail open on Redis errors;
+		// provider 429 recovery remains the final safety net.
+		return true, 0, capacity, nil
+	}
+	if value < 0 {
+		return false, int(-value), capacity, nil
+	}
+	return true, int(value), capacity, nil
+}
+func (a *app) markModelDailyExhausted(ctx context.Context, model string, observedLimit int) {
+	if a == nil || a.redis == nil || observedLimit <= 0 || strings.TrimSpace(model) == "" {
+		return
+	}
+	capacity := modelDailyAdmissionCapacity(observedLimit)
+	day, ttl := pacificAdmissionWindow(time.Now())
+	key := "model:rpd:" + strings.TrimPrefix(modelCircuitKey(model), "model:circuit:") + ":" + day
+	// Provider-observed RPD exhaustion is authoritative even when some of the
+	// day's requests happened outside this backend. Seed the local counter to the
+	// admission capacity so subsequent calls spill to fallback without another 429.
+	_ = a.redis.Set(ctx, key, capacity, ttl).Err()
+}
+func dailyLimitResponse(model string, used, capacity int) *http.Response {
+	raw, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message":  "Daiki provider daily admission limit reached; use configured fallback or retry after the Pacific daily reset",
+			"type":     "daiki_daily_model_limit",
+			"model":    model,
+			"used":     used,
+			"capacity": capacity,
+		},
+	})
+	return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(bytes.NewReader(raw)), ContentLength: int64(len(raw))}
+}
 func shouldSpillModelAdmission(primaryWait, fallbackWait time.Duration) bool {
 	const spillThreshold = 2 * time.Second
 	const meaningfulGain = 500 * time.Millisecond
@@ -732,6 +828,8 @@ func modelCircuitTTL(status int, kind string) time.Duration {
 	switch status {
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
 		return 10 * time.Minute
+	case http.StatusTooManyRequests:
+		return 60 * time.Second
 	case http.StatusRequestTimeout:
 		return 45 * time.Second
 	}
@@ -752,11 +850,32 @@ func (a *app) modelCircuitOpen(ctx context.Context, model string) bool {
 	return err == nil && n > 0
 }
 
-func (a *app) openModelCircuit(ctx context.Context, model string, status int, kind string) {
-	if a == nil || a.redis == nil || strings.TrimSpace(model) == "" || status == http.StatusTooManyRequests {
+func modelCircuitTTLForFailure(status int, kind string, body []byte) time.Duration {
+	ttl := modelCircuitTTL(status, kind)
+	if status != http.StatusTooManyRequests {
+		return ttl
+	}
+	if retry := providerRetryAfter(body); retry > 0 {
+		ttl = retry + 2*time.Second
+		if ttl < 30*time.Second {
+			ttl = 30 * time.Second
+		}
+		if ttl > 15*time.Minute {
+			ttl = 15 * time.Minute
+		}
+	}
+	return ttl
+}
+
+func (a *app) openModelCircuitForFailure(ctx context.Context, model string, status int, kind string, body []byte) {
+	if a == nil || a.redis == nil || strings.TrimSpace(model) == "" {
 		return
 	}
-	_ = a.redis.Set(ctx, modelCircuitKey(model), first(kind, failureKindForStatus(status)), modelCircuitTTL(status, kind)).Err()
+	_ = a.redis.Set(ctx, modelCircuitKey(model), first(kind, failureKindForStatus(status)), modelCircuitTTLForFailure(status, kind, body)).Err()
+}
+
+func (a *app) openModelCircuit(ctx context.Context, model string, status int, kind string) {
+	a.openModelCircuitForFailure(ctx, model, status, kind, nil)
 }
 
 func (a *app) clearModelCircuit(ctx context.Context, model string) {
@@ -834,6 +953,23 @@ func reasoningEffortForModel(model, requested string) (string, bool) {
 			return "low", true
 		case "xhigh", "max", "ultra":
 			return "high", true
+		default:
+			return "", false
+		}
+	}
+	if strings.Contains(model, "gemini-") || strings.Contains(model, "gemini/") {
+		switch requested {
+		case "none":
+			return "", false
+		case "minimal", "low":
+			return "low", true
+		case "medium":
+			return "medium", true
+		case "high", "xhigh", "max", "ultra":
+			// Gemini 3.7/3.8 High repeatedly exceeded the 90s interactive budget in
+			// the live Daiki reasoning benchmark. Preserve the stronger Daiki High
+			// verification prompt while capping provider-native effort at Medium.
+			return "medium", true
 		default:
 			return "", false
 		}
@@ -1010,6 +1146,27 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		} else {
 			meta.AdmissionTokens = admissionTokens
 		}
+		dailyAdmitted, dailyUsed, dailyCapacity, dailyErr := a.tryModelDailyAdmission(ctx, currentModel, m)
+		if dailyErr != nil {
+			return nil, body, currentModel, meta, dailyErr
+		}
+		if m.RPDLimit > 0 {
+			meta.DailyRequestLimit = m.RPDLimit
+			meta.DailyRequestCapacity = dailyCapacity
+			meta.DailyRequestsUsed = dailyUsed
+		}
+		if !dailyAdmitted {
+			meta.FailureKind = "provider_daily_limit"
+			if allowModelFallback && modelCanFallback(m, currentModel, strategy) {
+				body, currentModel, m, overhead, strategy = applyFallbackModel(ctx, a, body, currentModel, profile, m, &meta)
+				meta.DailyAdmissionSpillover = true
+				continue
+			}
+			resp := dailyLimitResponse(currentModel, dailyUsed, dailyCapacity)
+			meta.ObservedHTTPStatus = http.StatusTooManyRequests
+			meta.FinalModel = currentModel
+			return resp, body, currentModel, meta, nil
+		}
 		req, err := makeReq(body)
 		if err != nil {
 			return nil, body, currentModel, meta, err
@@ -1081,10 +1238,13 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		}
 		meta.ObservedHTTPStatus = statusForRecovery
 		meta.FailureKind = failureKindForStatus(statusForRecovery)
-		a.openModelCircuit(ctx, currentModel, statusForRecovery, meta.FailureKind)
+		a.openModelCircuitForFailure(ctx, currentModel, statusForRecovery, meta.FailureKind, errBody)
 		obs := parseRateLimitObservation(statusForRecovery, errBody)
 		if statusForRecovery == http.StatusTooManyRequests {
 			meta.ObservedRateKind, meta.ObservedRateLimit, meta.ObservedRequested = obs.Kind, obs.Limit, obs.Requested
+			if obs.Kind == "rpd" && obs.Limit > 0 {
+				a.markModelDailyExhausted(ctx, currentModel, obs.Limit)
+			}
 		}
 		if attempt >= maxRetries || strategy == "reject" {
 			resp.Body = io.NopCloser(bytes.NewReader(errBody))

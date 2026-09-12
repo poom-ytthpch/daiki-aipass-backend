@@ -121,7 +121,9 @@ func thinkingInstruction(profile thinkingProfile, taskClass string) string {
 		parts = append(parts, thinkingTaskInstruction(taskClass))
 	}
 	parts = append(parts,
-		"Treat the workflow as private scratch work: never reveal hidden chain-of-thought, private deliberation, or internal token-by-token reasoning. Return only the useful answer, concise supporting rationale, and any verification result or uncertainty that materially helps the user.",
+		"Treat the workflow as private scratch work: never reveal hidden chain-of-thought, private deliberation, or internal token-by-token reasoning. Do not spend the visible answer enumerating exhaustive scratch steps unless the user explicitly asks for them. Preserve enough completion budget to always deliver the final answer.",
+		"OUTPUT CONTRACT: explicit user constraints on the final response take priority over explanatory prose. If the user requests ONLY JSON, exact keys, an exact line, no Markdown, a fixed schema, or another unambiguous format, obey it literally; do not add code fences, commentary, preambles, postambles, or clarification questions that violate the requested format.",
+		"Lead with the answer and keep supporting rationale concise. Before finishing, verify that the final answer actually contains every requested result and satisfies the requested format; if the completion budget is becoming tight, stop expanding the scratch analysis and produce the verified final answer immediately.",
 		"The provider receives the matching native reasoning effort when supported; otherwise these reasoning and verification gates remain mandatory prompt-guided behavior.",
 	)
 	return strings.Join(parts, " ")

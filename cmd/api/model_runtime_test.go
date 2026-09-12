@@ -463,3 +463,89 @@ func TestInspectHermesSoftFailureDetectsToolChoiceConflict(t *testing.T) {
 		t.Fatalf("soft failure status=%d body=%s", gotStatus, gotRaw)
 	}
 }
+
+func TestProviderHTTP413IsRecoverableForModelFallback(t *testing.T) {
+	if !recoverableProviderStatus(http.StatusRequestEntityTooLarge) {
+		t.Fatal("HTTP 413 must be recoverable so an adaptive route can use its configured fallback")
+	}
+	if got := failureKindForStatus(http.StatusRequestEntityTooLarge); got != "provider_payload_too_large" {
+		t.Fatalf("HTTP 413 failure kind=%q", got)
+	}
+	raw := []byte(`{"error":{"message":"Request Entity Too Large","code":"413"}}`)
+	if got := providerFailureStatus(raw); got != http.StatusRequestEntityTooLarge {
+		t.Fatalf("provider failure status=%d want 413", got)
+	}
+}
+
+func TestGeminiNativeReasoningCapsHighAtMedium(t *testing.T) {
+	body := []byte(`{"model_options":{"reasoning":{"enabled":true,"effort":"high"}},"messages":[{"role":"user","content":"solve carefully"}]}`)
+	out, effective, native, err := applyReasoningForModel(body, "gemini-gemini-3.7-flash", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !native || effective != "medium" {
+		t.Fatalf("Gemini High must be capped at native Medium, effective=%q native=%t", effective, native)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	options, _ := payload["model_options"].(map[string]any)
+	reasoning, _ := options["reasoning"].(map[string]any)
+	if reasoning["enabled"] != true || reasoning["effort"] != "medium" {
+		t.Fatalf("Gemini native reasoning options=%#v", reasoning)
+	}
+
+	_, effective, native, err = applyReasoningForModel(body, "gemini-gemini-3.5-flash-lite", "off")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if native || effective != "" {
+		t.Fatalf("Gemini Off must disable native reasoning, effective=%q native=%t", effective, native)
+	}
+}
+
+func TestGeminiDailyRateLimitObservationAndCircuitTTL(t *testing.T) {
+	body := []byte(`[{"error":{"code":429,"message":"Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.7-flash\nPlease retry in 43.439227016s.","status":"RESOURCE_EXHAUSTED","details":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"},{"retryDelay":"43s"}]}}]`)
+	obs := parseRateLimitObservation(http.StatusTooManyRequests, body)
+	if obs.Kind != "rpd" || obs.Limit != 20 {
+		t.Fatalf("observation=%#v", obs)
+	}
+	retry := providerRetryAfter(body)
+	if retry < 43*time.Second || retry > 44*time.Second {
+		t.Fatalf("retry=%s", retry)
+	}
+	ttl := modelCircuitTTLForFailure(http.StatusTooManyRequests, "provider_rate_limit", body)
+	if ttl < 45*time.Second || ttl > 46*time.Second {
+		t.Fatalf("ttl=%s", ttl)
+	}
+}
+
+func TestRateLimitCircuitDefaultsWhenProviderHasNoRetryHint(t *testing.T) {
+	if got := modelCircuitTTLForFailure(http.StatusTooManyRequests, "provider_rate_limit", nil); got != 60*time.Second {
+		t.Fatalf("429 circuit ttl=%s want 1m", got)
+	}
+}
+
+func TestModelDailyAdmissionCapacityKeepsHeadroom(t *testing.T) {
+	if got := modelDailyAdmissionCapacity(20); got != 18 {
+		t.Fatalf("20 RPD capacity=%d want=18", got)
+	}
+	if got := modelDailyAdmissionCapacity(1); got != 1 {
+		t.Fatalf("1 RPD capacity=%d want=1", got)
+	}
+	if got := modelDailyAdmissionCapacity(0); got != 0 {
+		t.Fatalf("0 RPD capacity=%d want=0", got)
+	}
+}
+
+func TestPacificAdmissionWindowResetsAtPacificMidnight(t *testing.T) {
+	now := time.Date(2026, time.September, 12, 19, 30, 0, 0, time.UTC) // 12:30 PDT
+	day, ttl := pacificAdmissionWindow(now)
+	if day != "2026-09-12" {
+		t.Fatalf("day=%q want 2026-09-12", day)
+	}
+	if ttl != 11*time.Hour+30*time.Minute {
+		t.Fatalf("ttl=%v want 11h30m", ttl)
+	}
+}

@@ -190,3 +190,19 @@ func TestThinkingHighPolicyIsMateriallyStrongerThanLow(t *testing.T) {
 		}
 	}
 }
+
+func TestThinkingInstructionProtectsFinalAnswerAndStrictOutputContract(t *testing.T) {
+	instruction := thinkingInstruction(thinkingProfileFor("high"), "general")
+	for _, marker := range []string{
+		"Preserve enough completion budget to always deliver the final answer",
+		"OUTPUT CONTRACT",
+		"ONLY JSON",
+		"do not add code fences",
+		"Lead with the answer",
+		"produce the verified final answer immediately",
+	} {
+		if !strings.Contains(instruction, marker) {
+			t.Fatalf("thinking instruction missing %q: %s", marker, instruction)
+		}
+	}
+}

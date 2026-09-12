@@ -103,9 +103,16 @@ func runLiveReasoningCompletion(ctx context.Context, client *http.Client, endpoi
 			{"role": "system", "content": thinkingInstruction(profile, thinkingTaskClass([]byte(fmt.Sprintf(`{"messages":[{"role":"user","content":%q}]}`, prompt))))},
 			{"role": "user", "content": prompt},
 		},
-		"temperature":           0,
-		"max_completion_tokens": completionCap,
-		"stream":                false,
+		"temperature": 0,
+		"stream":      false,
+	}
+	tokenField := strings.TrimSpace(os.Getenv("DAIKI_LIVE_REASONING_TOKEN_FIELD"))
+	if tokenField != "max_tokens" {
+		tokenField = "max_completion_tokens"
+	}
+	requestBody[tokenField] = completionCap
+	if os.Getenv("DAIKI_LIVE_REASONING_NATIVE_REASONING") == "1" && mode != "off" {
+		requestBody["reasoning_effort"] = mode
 	}
 	raw, err := json.Marshal(requestBody)
 	if err != nil {

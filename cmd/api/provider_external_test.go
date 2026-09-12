@@ -8,20 +8,24 @@ import (
 
 func TestExternalProviderAliases(t *testing.T) {
 	cases := map[string]string{
-		"openai":     "openai-compatible",
-		"groq":       "openai-compatible",
-		"openrouter": "openai-compatible",
-		"together":   "openai-compatible",
-		"fireworks":  "openai-compatible",
-		"deepinfra":  "openai-compatible",
-		"xai":        "openai-compatible",
-		"mistral":    "openai-compatible",
-		"cerebras":   "openai-compatible",
-		"anthropic":  "anthropic",
-		"gemini":     "gemini",
-		"vllm":       "vllm",
-		"lmstudio":   "lmstudio",
-		"ollama":     "ollama",
+		"openai":       "openai-compatible",
+		"groq":         "openai-compatible",
+		"openrouter":   "openai-compatible",
+		"together":     "openai-compatible",
+		"fireworks":    "openai-compatible",
+		"deepinfra":    "openai-compatible",
+		"xai":          "openai-compatible",
+		"mistral":      "openai-compatible",
+		"cerebras":     "openai-compatible",
+		"opencode":     "openai-compatible",
+		"opencodezen":  "openai-compatible",
+		"opencode-zen": "openai-compatible",
+		"zen":          "openai-compatible",
+		"anthropic":    "anthropic",
+		"gemini":       "gemini",
+		"vllm":         "vllm",
+		"lmstudio":     "lmstudio",
+		"ollama":       "ollama",
 	}
 	for input, want := range cases {
 		if got := normalizeProviderType(input); got != want {
@@ -34,7 +38,7 @@ func TestExternalProviderAliases(t *testing.T) {
 }
 
 func TestHostedProviderDefaults(t *testing.T) {
-	cases := []string{"openai", "groq", "openrouter", "together", "fireworks", "deepinfra", "xai", "mistral", "cerebras", "anthropic", "gemini"}
+	cases := []string{"openai", "groq", "openrouter", "together", "fireworks", "deepinfra", "xai", "mistral", "cerebras", "opencode", "opencodezen", "opencode-zen", "zen", "anthropic", "gemini"}
 	for _, provider := range cases {
 		if got := providerTypeDefaultBase(provider); got == "" {
 			t.Fatalf("expected default base for %s", provider)
@@ -59,6 +63,13 @@ func TestExternalProviderLiteLLMMapping(t *testing.T) {
 		t.Fatalf("anthropic model mapping=%q", got)
 	}
 
+	opencode := store.ModelProvider{ProviderType: "openai-compatible", BaseURL: "https://opencode.ai/zen/v1"}
+	if got := providerDiscoveryURL(opencode); got != "https://opencode.ai/zen/v1/models" {
+		t.Fatalf("opencode discovery=%q", got)
+	}
+	if got := providerLiteLLMModel(opencode, "nemotron-3-ultra-free"); got != "openai/nemotron-3-ultra-free" {
+		t.Fatalf("opencode model mapping=%q", got)
+	}
 	gemini := store.ModelProvider{ProviderType: "gemini", BaseURL: "https://generativelanguage.googleapis.com/v1beta"}
 	if got := providerDiscoveryURL(gemini); got != "https://generativelanguage.googleapis.com/v1beta/models" {
 		t.Fatalf("gemini discovery=%q", got)
