@@ -692,12 +692,16 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 	}
 	search := func(engine string) ([]searxResult, error) {
 		cacheKey := fmt.Sprintf("research:google:%x", sha256.Sum256([]byte(engine+"\n"+language+"\n"+query)))
+		engineCircuitKey := fmt.Sprintf("research:google:engine-circuit:%x", sha256.Sum256([]byte(engine)))
 		if a.redis != nil {
 			if cached, err := a.redis.Get(ctx, cacheKey).Bytes(); err == nil && len(cached) > 0 {
 				var rows []searxResult
 				if json.Unmarshal(cached, &rows) == nil {
 					return rows, nil
 				}
+			}
+			if reason, err := a.redis.Get(ctx, engineCircuitKey).Result(); err == nil && strings.TrimSpace(reason) != "" {
+				return nil, fmt.Errorf("%s temporarily bypassed: %s", engine, reason)
 			}
 		}
 		u, err := url.Parse(base + "/search")
@@ -734,7 +738,24 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 			for _, row := range found.UnresponsiveEngines {
 				reasons = append(reasons, strings.Join(row, ": "))
 			}
-			return nil, fmt.Errorf("%s unavailable: %s", engine, strings.Join(reasons, "; "))
+			reasonText := strings.Join(reasons, "; ")
+			if a.redis != nil {
+				lowerReason := strings.ToLower(reasonText)
+				ttl := time.Duration(0)
+				switch {
+				case strings.Contains(lowerReason, "captcha"):
+					ttl = 10 * time.Minute
+				case strings.Contains(lowerReason, "rate") || strings.Contains(lowerReason, "too many") || strings.Contains(lowerReason, "429"):
+					ttl = 2 * time.Minute
+				}
+				if ttl > 0 {
+					_ = a.redis.Set(ctx, engineCircuitKey, reasonText, ttl).Err()
+				}
+			}
+			return nil, fmt.Errorf("%s unavailable: %s", engine, reasonText)
+		}
+		if len(found.Results) > 0 && a.redis != nil {
+			_ = a.redis.Del(ctx, engineCircuitKey).Err()
 		}
 		if a.redis != nil {
 			if raw, err := json.Marshal(found.Results); err == nil {

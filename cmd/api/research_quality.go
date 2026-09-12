@@ -67,6 +67,64 @@ func researchEntityTerms(query string) []string {
 func researchEntityPhrase(query string) string {
 	return strings.Join(researchEntityTerms(query), " ")
 }
+func researchComparisonEntities(query string) []string {
+	raw := strings.ToLower(strings.TrimSpace(query))
+	if raw == "" {
+		return nil
+	}
+	raw = strings.NewReplacer(" vs. ", " vs ", " versus ", " vs ", "เทียบกับ", " กับ ", "เปรียบเทียบกับ", " กับ ").Replace(raw)
+	sep := ""
+	for _, candidate := range []string{" vs ", " กับ ", " ต่างจาก ", " compared to "} {
+		if strings.Contains(raw, candidate) {
+			sep = candidate
+			break
+		}
+	}
+	if sep == "" && (strings.Contains(raw, "compare ") || strings.Contains(raw, "comparison") || strings.Contains(raw, "เปรียบเทียบ") || strings.Contains(raw, "แตกต่าง")) {
+		for _, candidate := range []string{" and ", " และ "} {
+			if strings.Contains(raw, candidate) {
+				sep = candidate
+				break
+			}
+		}
+	}
+	if sep == "" {
+		return nil
+	}
+	parts := strings.SplitN(raw, sep, 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	left := researchEntityTerms(parts[0])
+	right := researchEntityTerms(parts[1])
+	if len(left) == 0 || len(right) == 0 {
+		return nil
+	}
+	firstModelToken := func(terms []string) int {
+		for i, term := range terms {
+			for _, r := range term {
+				if r >= '0' && r <= '9' {
+					return i
+				}
+			}
+		}
+		return -1
+	}
+	if idx := firstModelToken(left); idx > 0 && firstModelToken(right) == 0 {
+		prefix := append([]string(nil), left[:idx]...)
+		if len(prefix) > 0 {
+			right = append(prefix, right...)
+		}
+	}
+	leftEntity, rightEntity := strings.Join(left, " "), strings.Join(right, " ")
+	if leftEntity == "" || rightEntity == "" || strings.EqualFold(leftEntity, rightEntity) {
+		return nil
+	}
+	return []string{leftEntity, rightEntity}
+}
+func researchComparisonIntent(query string) bool {
+	return len(researchComparisonEntities(query)) >= 2
+}
 
 func researchTermWeight(term string, hasAlpha bool) int {
 	if term == "" {
@@ -112,6 +170,18 @@ func researchRelevanceScore(query, title, rawURL, content string) int {
 	if !researchResultRelevant(query, title, rawURL, content) {
 		return 0
 	}
+	if entities := researchComparisonEntities(query); len(entities) >= 2 {
+		best := 0
+		for _, entity := range entities {
+			if score := researchEntityRelevanceScore(entity, title, rawURL, content); score > best {
+				best = score
+			}
+		}
+		return best
+	}
+	return researchEntityRelevanceScore(query, title, rawURL, content)
+}
+func researchEntityRelevanceScore(query, title, rawURL, content string) int {
 	terms := researchEntityTerms(query)
 	if len(terms) == 0 {
 		// Thai-only/general queries still use the legacy token rank. The strict
@@ -391,7 +461,21 @@ func researchPrimaryPath(rawURL string) bool {
 		return false
 	}
 	path := strings.ToLower(u.Path)
-	for _, marker := range []string{"/model/", "/models/", "/product/", "/products/", "/vehicle/", "/vehicles/", "/support/", "/newsroom/"} {
+	for _, marker := range []string{"/model/", "/models/", "/product/", "/products/", "/vehicle/", "/vehicles/", "/specs/", "/specifications/", "/technical-specifications/", "/support/", "/newsroom/"} {
+		if strings.Contains(path, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func researchAuthorityPrimaryPath(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	path := strings.ToLower(u.Path)
+	for _, marker := range []string{"/specs/", "/specifications/", "/technical-specifications/", "/newsroom/"} {
 		if strings.Contains(path, marker) {
 			return true
 		}
@@ -415,12 +499,6 @@ func researchHostMatchesEntity(query, rawURL string) bool {
 		}
 		norm := strings.ReplaceAll(normalizeResearchText(term), " ", "")
 		if label == norm {
-			return true
-		}
-		// Allow a distinctive long brand token to be part of the registrable
-		// label (e.g. newbalance), but do not promote short tokens such as BYD
-		// inside dealer domains like bydbdautogroup.com.
-		if len(norm) >= 5 && strings.Contains(label, norm) && len(norm)*100/max(1, len(label)) >= 55 {
 			return true
 		}
 	}
@@ -513,7 +591,7 @@ func researchAuthorityForCandidate(query, title, rawURL, content, stage string, 
 		return "interpretive"
 	}
 	relevance := researchRelevanceScore(query, title, rawURL, content)
-	if relevance >= 85 && strings.Contains(stage, "primary") && (researchHostMatchesEntity(query, rawURL) || researchOfficialDistributorSignal(title, content)) {
+	if relevance >= 85 && strings.Contains(stage, "primary") && (researchHostMatchesEntity(query, rawURL) || researchOfficialDistributorSignal(title, content) || researchAuthorityPrimaryPath(rawURL)) {
 		return "primary"
 	}
 	return "secondary"

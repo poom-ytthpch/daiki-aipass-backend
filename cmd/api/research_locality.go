@@ -264,6 +264,26 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 		add("(site:facebook.com OR site:instagram.com OR site:tiktok.com OR site:youtube.com OR site:reddit.com OR site:pantip.com) "+base, region, locale, stage)
 	}
 
+	if entities := researchComparisonEntities(query); len(entities) >= 2 {
+		// Comparison research needs evidence for each side independently. Treating
+		// "iPhone 18 Pro กับ 17 Pro" as one entity produces the broken query
+		// "iphone 18 pro 17" and later rejects valid single-model official pages.
+		maxQueries = 4
+		left, right := entities[0], entities[1]
+		if prefs.Region == "TH" && prefs.Scope != "global" {
+			add(left+" Thailand official specifications", "TH", "th-TH", "local-primary-comparison-left")
+			add(right+" Thailand official specifications", "TH", "th-TH", "local-primary-comparison-right")
+		}
+		if prefs.Scope != "local-only" {
+			add(left+" official specifications", "GLOBAL", "all", "global-primary-comparison-left")
+			add(right+" official specifications", "GLOBAL", "all", "global-primary-comparison-right")
+		}
+		if len(plan) < maxQueries {
+			add(left+" vs "+right+" comparison", "GLOBAL", "all", "global-comparison")
+		}
+		return plan
+	}
+
 	if prefs.Region == "TH" && prefs.Scope != "global" {
 		if researchRegulatoryIntent(query) {
 			add("site:go.th "+focusQuery, "TH", "th-TH", "local-regulatory")
@@ -785,7 +805,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 		}
 		results = append(results, found...)
 	}
-	if entityPhrase := researchEntityPhrase(query); entityPhrase != "" && len(results) > 0 {
+	if entityPhrase := researchEntityPhrase(query); entityPhrase != "" && len(results) > 0 && !researchComparisonIntent(query) {
 		for _, host := range researchDiscoveredPrimaryHosts(query, results) {
 			primaryQuery := fmt.Sprintf(`site:%s %s %d`, host, entityPhrase, time.Now().Year())
 			found, err := a.searxSearchWithLanguage(ctx, base, primaryQuery, first(prefs.Locale, "all"))
