@@ -179,6 +179,15 @@ func researchSocialIntent(query string) bool {
 	return false
 }
 
+func researchPriceOnlyIntent(query string, prefs researchPreferences) bool {
+	combined := strings.TrimSpace(query + " " + prefs.Focus)
+	return researchPriceIntent(query) &&
+		!researchSpecificationIntent(combined) &&
+		!researchSocialIntent(combined) &&
+		!researchRegulatoryIntent(query) &&
+		!researchAcademicIntent(query)
+}
+
 func researchThailandSource(title, rawURL, content string) bool {
 	host := researchHost(rawURL)
 	if host == "" {
@@ -240,7 +249,7 @@ func researchSearchPlan(query string, prefs researchPreferences) []researchSearc
 	entityPhrase := researchEntityPhrase(query)
 	currentYear := time.Now().Year()
 	maxQueries := 4
-	priceOnly := researchPriceIntent(query) && !researchSpecificationIntent(query+" "+prefs.Focus) && !researchSocialIntent(query+" "+prefs.Focus) && !researchRegulatoryIntent(query) && !researchAcademicIntent(query)
+	priceOnly := researchPriceOnlyIntent(query, prefs)
 	if priceOnly {
 		// Current-price lookups spend Google budget on the canonical local seller
 		// and distributor discovery paths. Broad specs/social/global expansion
@@ -657,10 +666,12 @@ func (a *app) discoverLinkedOfficialSources(ctx context.Context, query string, p
 				stage = "discovered-official-direct"
 			}
 			source := researchSource{
-				Title:      first(researchEntityPhrase(query), candidate.Host) + " — " + candidate.Host,
-				URL:        target,
-				Excerpt:    researchFocusedExcerpt(query, text, 6500),
-				Engine:     "direct-discovery",
+				Title:   first(researchEntityPhrase(query), candidate.Host) + " — " + candidate.Host,
+				URL:     target,
+				Excerpt: researchFocusedExcerpt(query, text, 6500),
+				// Discovery describes how the canonical page was located, not a search
+				// provider. Preserve discovery in Stage and expose direct HTTP provenance.
+				Engine:     "direct",
 				Region:     researchSourceRegion("", target, text, prefs),
 				Authority:  authority,
 				SourceType: "web",
@@ -733,6 +744,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 		prefs.Scope = normalizeResearchScope("", prefs.Region)
 	}
 	plan := researchSearchPlan(query, prefs)
+	priceOnly := researchPriceOnlyIntent(query, prefs)
 	queries := researchPlanQueries(plan)
 	a.publishResearchProgress(ctx, map[string]any{"phase": "planning", "region": prefs.Region, "scope": prefs.Scope, "depth": prefs.Depth, "queries": queries})
 
@@ -864,6 +876,12 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 			continue
 		}
 		source := researchSource{Title: clipText(row.Title, 300), URL: row.URL, Snippet: clipText(row.Content, 1200), Engine: clipText(row.Engine, 80), Region: researchSourceRegion(row.Title, row.URL, row.Content, prefs), Authority: researchAuthorityForCandidate(query, row.Title, row.URL, row.Content, row.Stage, false), SourceType: researchSourceType(row.URL), Platform: researchSocialPlatform(row.URL), Stage: row.Stage}
+		// Social URLs can appear in normal Google result pages even when no social
+		// query was issued. A price-only lookup should spend its evidence budget on
+		// monetary primary/web evidence unless the user explicitly asks for social.
+		if priceOnly && source.SourceType == "social" {
+			continue
+		}
 		// A result discovered by a Thailand-scoped Google query remains local
 		// evidence even when the domain is .com and the short search snippet omits
 		// the word Thailand (common for official local distributor/model pages).
@@ -916,10 +934,16 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 		}
 		if prefs.Depth == "deep" {
 			localWebQuota, localSocialQuota, globalWebQuota := 3, 2, 2
+			if priceOnly {
+				localSocialQuota = 0
+			}
 			if limit <= 5 {
 				// Keep Thailand first, but reserve room for global corroboration even
 				// when the deployment still uses the legacy five-source cap.
-				localWebQuota, localSocialQuota, globalWebQuota = 2, 1, 1
+				localWebQuota, globalWebQuota = 2, 1
+				if !priceOnly {
+					localSocialQuota = 1
+				}
 			}
 			appendRowsN(localWeb, localWebQuota)
 			appendRowsN(localSocial, localSocialQuota)

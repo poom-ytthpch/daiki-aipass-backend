@@ -157,6 +157,20 @@ func TestLatestPriceResearchUsesOnlyTwoHighValueGoogleQueries(t *testing.T) {
 	}
 }
 
+func TestPriceOnlyIntentStaysFocused(t *testing.T) {
+	prefs := researchPreferences{Region: "TH", Locale: "th-TH", Scope: "local-first", Depth: "deep"}
+	if !researchPriceOnlyIntent("BYD Sealion 7 ราคาล่าสุดเท่าไหร่", prefs) {
+		t.Fatal("plain latest-price query must be classified as price-only")
+	}
+	if researchPriceOnlyIntent("BYD Sealion 7 ราคาล่าสุด สเปก", prefs) {
+		t.Fatal("price + specification query must not be classified as price-only")
+	}
+	prefs.Focus = "ราคาและประสบการณ์ผู้ใช้จริง"
+	if researchPriceOnlyIntent("BYD Sealion 7 ราคาล่าสุด", prefs) {
+		t.Fatal("explicit social/user-experience focus must opt out of price-only pruning")
+	}
+}
+
 func TestFreshnessScoringPrefersCurrentEvidence(t *testing.T) {
 	now := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
 	query := "BYD Sealion 7 ราคา ล่าสุด"

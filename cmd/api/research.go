@@ -412,6 +412,9 @@ func (a *app) enrichChatWithResearch(ctx context.Context, body []byte) ([]byte, 
 		if prefs.Depth == "deep" {
 			b.WriteString("\nDEEP RESEARCH OUTPUT: Produce a polished research report, not a search-result list. Lead with an Executive Summary; briefly state the research approach; organize findings by the user's decision-relevant themes; surface Thailand-specific findings before global context when applicable; compare conflicting evidence; include risks/limitations; and end with a clear recommendation or conclusion when the request supports one. Keep the report readable and avoid ceremonial filler.\n")
 		}
+		if researchPriceOnlyIntent(searchQuery, prefs) {
+			b.WriteString("\nPRICE-FOCUSED OUTPUT: The user is asking for current/latest price. Answer the requested price/model lineup first and keep the response tightly scoped to pricing evidence. Do not add specifications, charging, warranty, insurance, accessories, financing, or promotional benefits unless the user explicitly asked for them. Do not speculate about why conflicting prices differ; report the dated conflict and prefer the newest applicable primary/local evidence.\n")
+		}
 		if meta.SocialSourceCount > 0 {
 			fmt.Fprintf(&b, "\nSOCIAL RESEARCH: Retrieved %d public/indexed social sources across %s. Treat social posts, comments, videos and community discussions as useful evidence for user experience, sentiment, emerging issues, promotions and firsthand reports, but not as sole proof of hard facts. Corroborate important claims with official/primary or independent web sources whenever possible. Distinguish anecdote from verified fact.\n", meta.SocialSourceCount, strings.Join(meta.SocialPlatforms, ", "))
 		}
@@ -697,6 +700,11 @@ func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language
 			if cached, err := a.redis.Get(ctx, cacheKey).Bytes(); err == nil && len(cached) > 0 {
 				var rows []searxResult
 				if json.Unmarshal(cached, &rows) == nil {
+					// Cached rows remain Google-derived evidence, but this turn did not
+					// make a fresh Google request. Make the cache hit explicit.
+					for i := range rows {
+						rows[i].Engine = "google-cache"
+					}
 					return rows, nil
 				}
 			}
