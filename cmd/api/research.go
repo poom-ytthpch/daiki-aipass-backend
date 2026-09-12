@@ -678,6 +678,60 @@ func (a *app) durableGoogleResearchEvidence(ctx context.Context, query string) [
 	return researchRowsFromStoredGoogleEvidence(query, payloads)
 }
 
+const researchEvidenceCacheTTL = 10 * time.Minute
+
+func researchEvidenceCacheKey(prefix, value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%s:%x", strings.TrimSuffix(prefix, ":"), sum)
+}
+
+func (a *app) cachedResearchPage(ctx context.Context, client *http.Client, raw string) (string, error) {
+	if a.redis == nil {
+		return fetchPublicPage(ctx, client, raw)
+	}
+	key := researchEvidenceCacheKey("research:page:v1", raw)
+	if cached, err := a.redis.Get(ctx, key).Result(); err == nil && strings.TrimSpace(cached) != "" {
+		return cached, nil
+	}
+	text, err := fetchPublicPage(ctx, client, raw)
+	if err != nil {
+		return "", err
+	}
+	_ = a.redis.Set(ctx, key, text, researchEvidenceCacheTTL).Err()
+	return text, nil
+}
+
+func (a *app) cachedResearchSources(ctx context.Context, key, query string) []researchSource {
+	if a.redis == nil || strings.TrimSpace(key) == "" {
+		return nil
+	}
+	raw, err := a.redis.Get(ctx, key).Bytes()
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var sources []researchSource
+	if json.Unmarshal(raw, &sources) != nil {
+		return nil
+	}
+	verified := make([]researchSource, 0, len(sources))
+	for _, source := range sources {
+		if !isHTTPURL(source.URL) || !researchCandidateRelevant(query, source.Title, source.URL, source.Snippet+" "+source.Excerpt) {
+			continue
+		}
+		verified = append(verified, source)
+	}
+	return verified
+}
+
+func (a *app) storeResearchSourcesCache(ctx context.Context, key string, sources []researchSource) {
+	if a.redis == nil || strings.TrimSpace(key) == "" || len(sources) == 0 {
+		return
+	}
+	if raw, err := json.Marshal(sources); err == nil {
+		_ = a.redis.Set(ctx, key, raw, researchEvidenceCacheTTL).Err()
+	}
+}
+
 func (a *app) searxSearchWithLanguage(ctx context.Context, base, query, language string) ([]searxResult, error) {
 	if strings.TrimSpace(language) == "" {
 		language = "all"

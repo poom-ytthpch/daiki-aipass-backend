@@ -555,6 +555,10 @@ func (a *app) discoverLinkedOfficialSources(ctx context.Context, query string, p
 	if len(rows) == 0 || strings.TrimSpace(researchEntityPhrase(query)) == "" {
 		return nil
 	}
+	cacheKey := researchEvidenceCacheKey("research:canonical:v1", normalizeResearchText(query)+"\n"+prefs.Region+"\n"+prefs.Scope)
+	if cached := a.cachedResearchSources(ctx, cacheKey, query); len(cached) > 0 {
+		return cached
+	}
 	client := newPublicWebClient(7 * time.Second)
 	seedRows := append([]searxResult(nil), rows...)
 	seedPriority := func(stage string) int {
@@ -618,7 +622,7 @@ func (a *app) discoverLinkedOfficialSources(ctx context.Context, query string, p
 			continue
 		}
 		official := candidate.OfficialSignal
-		if homeText, err := fetchPublicPage(ctx, client, origin); err == nil && researchOfficialDistributorSignal(homeText, homeText) {
+		if homeText, err := a.cachedResearchPage(ctx, client, origin); err == nil && researchOfficialDistributorSignal(homeText, homeText) {
 			official = true
 		}
 
@@ -652,7 +656,7 @@ func (a *app) discoverLinkedOfficialSources(ctx context.Context, query string, p
 			targets = append(targets, candidate.URL)
 		}
 		for _, target := range targets {
-			text, err := fetchPublicPage(ctx, client, target)
+			text, err := a.cachedResearchPage(ctx, client, target)
 			if err != nil || !researchCandidateRelevant(query, target, target, text) {
 				continue
 			}
@@ -687,10 +691,12 @@ func (a *app) discoverLinkedOfficialSources(ctx context.Context, query string, p
 			}
 			out = append(out, source)
 			if len(out) >= 2 {
+				a.storeResearchSourcesCache(ctx, cacheKey, out)
 				return out
 			}
 		}
 	}
+	a.storeResearchSourcesCache(ctx, cacheKey, out)
 	return out
 }
 
@@ -1023,7 +1029,7 @@ func (a *app) webResearchWithPreferences(ctx context.Context, query string, pref
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			if text, err := fetchPublicPage(ctx, client, sources[idx].URL); err == nil {
+			if text, err := a.cachedResearchPage(ctx, client, sources[idx].URL); err == nil {
 				sources[idx].Excerpt = researchFocusedExcerpt(query, text, 6500)
 				if sources[idx].Region != "TH" && researchSourceRegion(sources[idx].Title, sources[idx].URL, text, prefs) == "TH" {
 					sources[idx].Region = "TH"
