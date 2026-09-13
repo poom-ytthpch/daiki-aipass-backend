@@ -17,6 +17,12 @@ const responseLanguageSystemPrefix = "DAIKI RESPONSE LANGUAGE:"
 
 func isAutomaticAttachmentPrompt(text string) bool {
 	n := strings.ToLower(strings.TrimSpace(text))
+	// Attachment expansion appends an internal evidence block to the synthetic
+	// frontend review sentence. Only strip that Daiki-owned block; genuine user
+	// English remains language-bearing.
+	if idx := strings.Index(n, "--- daiki attachment context ---"); idx >= 0 {
+		n = strings.TrimSpace(n[:idx])
+	}
 	n = strings.TrimSuffix(n, ".")
 	switch n {
 	case "please review the attached content", "please review the attached file", "please review the attached image", "review the attached content", "review attached content":

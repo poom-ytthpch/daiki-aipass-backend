@@ -40,6 +40,21 @@ func TestResponseLanguageKeepsThaiAcrossAutomaticAttachmentPrompt(t *testing.T) 
 	}
 }
 
+func TestResponseLanguageKeepsThaiAfterExpandedAttachmentContext(t *testing.T) {
+	body := languageBody(t,
+		map[string]any{"role": "user", "content": "ตอนนี้เราคุยกันเป็นภาษาไทย ช่วยตอบภาษาไทย"},
+		map[string]any{"role": "assistant", "content": "ได้ครับ ผมจะตอบเป็นภาษาไทย"},
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "Please review the attached content."},
+			map[string]any{"type": "text", "text": "\n\n--- Daiki attachment context ---\nFile: marker.txt\nContent excerpt:\nDOCUMENT-ALPHA-7319"},
+		}},
+	)
+	pref := resolveResponseLanguage(body)
+	if pref.Code != "th-TH" {
+		t.Fatalf("pref=%+v", pref)
+	}
+}
+
 func TestResponseLanguageExplicitSwitchWins(t *testing.T) {
 	body := languageBody(t,
 		map[string]any{"role": "user", "content": "คุยภาษาไทยก่อน"},

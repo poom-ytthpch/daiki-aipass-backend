@@ -24,13 +24,151 @@ import (
 var generatedImageDataRE = regexp.MustCompile(`data:(image/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)`)
 var errImageProviderAuth = errors.New("image provider authentication failed")
 
-const defaultOpenRouterImageModel = "google/gemini-3.1-flash-lite-image"
+func firstError(primary, fallback error) error {
+	if primary != nil {
+		return primary
+	}
+	return fallback
+}
+
+const (
+	defaultOpenRouterImageModel = "google/gemini-3.1-flash-lite-image"
+	defaultGeminiImageModel     = "gemini-3.1-flash-image"
+)
 
 type openRouterImageResponse struct {
 	Data []struct {
 		B64JSON   string `json:"b64_json"`
 		MediaType string `json:"media_type"`
 	} `json:"data"`
+}
+
+func decodeGeminiImageResponse(body []byte) ([]byte, string, error) {
+	var payload struct {
+		OutputImage *struct {
+			Data     string `json:"data"`
+			MimeType string `json:"mime_type"`
+		} `json:"output_image"`
+		Steps []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type     string `json:"type"`
+				Data     string `json:"data"`
+				MimeType string `json:"mime_type"`
+			} `json:"content"`
+		} `json:"steps"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, "", errors.New("Gemini image provider returned invalid JSON")
+	}
+	decode := func(encoded, mediaType string) ([]byte, string, error) {
+		encoded = strings.TrimSpace(encoded)
+		if encoded == "" {
+			return nil, "", errors.New("Gemini image provider returned empty image")
+		}
+		data, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil || len(data) == 0 {
+			return nil, "", errors.New("Gemini image provider returned invalid base64")
+		}
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(mediaType)), "image/") {
+			mediaType = "image/png"
+		}
+		return data, mediaType, nil
+	}
+	if payload.OutputImage != nil && strings.TrimSpace(payload.OutputImage.Data) != "" {
+		return decode(payload.OutputImage.Data, payload.OutputImage.MimeType)
+	}
+	for i := len(payload.Steps) - 1; i >= 0; i-- {
+		if payload.Steps[i].Type != "model_output" {
+			continue
+		}
+		for j := len(payload.Steps[i].Content) - 1; j >= 0; j-- {
+			block := payload.Steps[i].Content[j]
+			if block.Type == "image" && strings.TrimSpace(block.Data) != "" {
+				return decode(block.Data, block.MimeType)
+			}
+		}
+	}
+	return nil, "", errors.New("Gemini image provider returned no image")
+}
+
+func (a *app) generateImageViaGemini(ctx context.Context, prompt string) ([]byte, string, string, error) {
+	providers, err := a.store.ModelProviders(ctx)
+	if err != nil {
+		return nil, "", "", err
+	}
+	var lastErr error
+	for _, provider := range providers {
+		baseLower := strings.ToLower(provider.BaseURL)
+		if !provider.Enabled || !provider.HasAPIKey || (provider.ProviderType != "gemini" && !strings.Contains(baseLower, "generativelanguage.googleapis.com")) {
+			continue
+		}
+		key, keyErr := a.providerAPIKey(provider)
+		if keyErr != nil || strings.TrimSpace(key) == "" {
+			lastErr = firstError(keyErr, errors.New("Gemini image provider API key unavailable"))
+			continue
+		}
+		base := strings.TrimRight(provider.BaseURL, "/")
+		base = strings.TrimSuffix(base, "/openai")
+		endpoint := base + "/interactions"
+		client, clientErr := safeProviderHTTPClient(ctx, endpoint)
+		if clientErr != nil {
+			lastErr = clientErr
+			continue
+		}
+		client.Timeout = 90 * time.Second
+		model := strings.TrimSpace(os.Getenv("GEMINI_IMAGE_MODEL"))
+		if model == "" {
+			model = defaultGeminiImageModel
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"model":           model,
+			"input":           []map[string]any{{"type": "text", "text": strings.TrimSpace(prompt)}},
+			"response_format": map[string]any{"type": "image", "mime_type": "image/png", "aspect_ratio": "1:1", "image_size": "1K"},
+		})
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
+		if reqErr != nil {
+			lastErr = reqErr
+			continue
+		}
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("x-goog-api-key", key)
+		resp, callErr := client.Do(req)
+		if callErr != nil {
+			lastErr = callErr
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		upstream := "gemini-images:" + model
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			detail := strings.TrimSpace(string(body))
+			if len(detail) > 2048 {
+				detail = detail[:2048]
+			}
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				_ = a.store.SetProviderTest(ctx, provider.ID, "error", "Gemini image generation provider authentication failed")
+				lastErr = fmt.Errorf("%w: Gemini status %d", errImageProviderAuth, resp.StatusCode)
+			} else {
+				lastErr = fmt.Errorf("Gemini image provider returned status %d: %s", resp.StatusCode, detail)
+			}
+			continue
+		}
+		data, mediaType, decodeErr := decodeGeminiImageResponse(body)
+		if decodeErr != nil {
+			lastErr = decodeErr
+			continue
+		}
+		return data, mediaType, upstream, nil
+	}
+	if lastErr != nil {
+		return nil, "", "gemini-images", lastErr
+	}
+	return nil, "", "gemini-images", errors.New("no Gemini image provider configured")
 }
 
 func decodeOpenRouterImageResponse(body []byte) ([]byte, string, error) {
@@ -443,17 +581,33 @@ func (a *app) guestGenerateImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prompt := strings.TrimSpace(body.Prompt)
-	data, mediaType, upstream, err := a.generateImageViaOpenRouter(r.Context(), prompt)
-	if err != nil && !errors.Is(err, errImageProviderAuth) {
-		// Preserve Hermes as a secondary path for installations that configure an
-		// image_gen provider such as FAL/OpenAI. match-infra currently has an
-		// OpenRouter provider, so normal traffic uses the dedicated Images API.
+	// Gemini is the primary Daiki provider and its native Interactions API can
+	// generate images without relying on the separately-configured OpenRouter key.
+	data, mediaType, upstream, err := a.generateImageViaGemini(r.Context(), prompt)
+	if err != nil {
+		if fallbackData, fallbackType, fallbackUpstream, fallbackErr := a.generateImageViaOpenRouter(r.Context(), prompt); fallbackErr == nil {
+			data, mediaType, upstream, err = fallbackData, fallbackType, fallbackUpstream, nil
+		} else {
+			err = errors.Join(err, fallbackErr)
+			if upstream == "" {
+				upstream = fallbackUpstream
+			}
+		}
+	}
+	if err != nil {
+		// Last-resort capability path for installations where Hermes has a working
+		// image tool/provider. An auth failure in one provider must not block a
+		// healthy provider configured elsewhere.
 		hermesPrompt := "Generate an image for this request using the image_generate capability and return the generated image. Request: " + prompt
 		responseBody, hermesUpstream, hermesErr := a.runGuestCoreGeneration(r.Context(), identity, p, "image-generation", "guest-media", hermesPrompt)
 		if hermesErr == nil {
 			if decoded, detectedType, decodeErr := decodeGeneratedImageFromChatCompletion(responseBody); decodeErr == nil {
 				data, mediaType, upstream, err = decoded, detectedType, hermesUpstream, nil
+			} else {
+				err = errors.Join(err, decodeErr)
 			}
+		} else {
+			err = errors.Join(err, hermesErr)
 		}
 	}
 	if err != nil || len(data) == 0 {
