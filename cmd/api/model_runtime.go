@@ -1022,6 +1022,22 @@ func applyReasoningForModel(body []byte, model, requested string) ([]byte, strin
 	return out, effective, native, err
 }
 
+func profileRequiresProviderTools(profile string) bool {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "skills", "guest-skills", "agent", "guest-media", "vision":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerToolCompatibilityFailure(body []byte) bool {
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "tool calling is not supported with this model") ||
+		strings.Contains(text, "`tool calling` is not supported with this model") ||
+		(strings.Contains(text, "tool call validation failed") && strings.Contains(text, "not in request.tools"))
+}
+
 func modelCanFallback(m store.ProviderModel, currentModel, strategy string) bool {
 	return (strategy == "adaptive" || strategy == "fallback") && strings.TrimSpace(m.FallbackModelName) != "" && m.FallbackModelName != currentModel
 }
@@ -1224,6 +1240,16 @@ func (a *app) doModelRequestWithRecovery(ctx context.Context, body []byte, model
 		if statusForRecovery == http.StatusBadRequest {
 			errBody, _ = io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 			_ = resp.Body.Close()
+			if profileRequiresProviderTools(profile) && providerToolCompatibilityFailure(errBody) {
+				// Tool-capable Hermes profiles must remain tool-capable. If a pool
+				// candidate cannot accept custom tools (or emits an invalid tool name),
+				// rotate to the next healthy free-pool model instead of stripping tools.
+				meta.FailureKind = "provider_tool_compatibility"
+				if allowModelFallback && attempt < maxRetries && strategy != "reject" && modelCanFallback(m, currentModel, strategy) {
+					body, currentModel, m, overhead, strategy = applyFallbackModel(ctx, a, body, currentModel, profile, m, &meta)
+					continue
+				}
+			}
 			if unexpectedBlockedToolCall(errBody) && !compatibilityRetried {
 				// LiteLLM/Groq may reject a completion when the model emits a hidden
 				// tool call despite tool_choice=none. HTTP 400 is normally terminal,

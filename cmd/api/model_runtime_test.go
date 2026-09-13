@@ -334,6 +334,30 @@ func TestRuntimeAgentOverheadUsesLeanVisionBudget(t *testing.T) {
 	}
 }
 
+func TestProviderToolCompatibilityFailure(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"error":{"message":"tool calling is not supported with this model"}}`, true},
+		{`{"error":{"message":"Tool call validation failed: attempted to call tool 'read_file' which was not in request.tools"}}`, true},
+		{`{"error":{"message":"ordinary bad request"}}`, false},
+	}
+	for _, tc := range cases {
+		if got := providerToolCompatibilityFailure([]byte(tc.body)); got != tc.want {
+			t.Fatalf("providerToolCompatibilityFailure(%q)=%v want %v", tc.body, got, tc.want)
+		}
+	}
+	for _, profile := range []string{"skills", "guest-skills", "agent", "guest-media", "vision"} {
+		if !profileRequiresProviderTools(profile) {
+			t.Fatalf("profile %q must require provider tools", profile)
+		}
+	}
+	if profileRequiresProviderTools("user") || profileRequiresProviderTools("research-direct") {
+		t.Fatal("plain/research-direct profiles must not require provider tools")
+	}
+}
+
 func TestReasoningEffortForModel(t *testing.T) {
 	cases := []struct {
 		model, requested, want string

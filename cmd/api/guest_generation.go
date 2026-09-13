@@ -124,7 +124,7 @@ func (a *app) generateImageViaGemini(ctx context.Context, prompt string) ([]byte
 		payload, _ := json.Marshal(map[string]any{
 			"model":           model,
 			"input":           []map[string]any{{"type": "text", "text": strings.TrimSpace(prompt)}},
-			"response_format": map[string]any{"type": "image", "mime_type": "image/png", "aspect_ratio": "1:1", "image_size": "1K"},
+			"response_format": map[string]any{"type": "image", "mime_type": "image/jpeg", "aspect_ratio": "1:1", "image_size": "1K"},
 		})
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
 		if reqErr != nil {
